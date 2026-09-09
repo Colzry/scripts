@@ -1,0 +1,6 @@
+# 默认按纯文本自动处理换行
+* text=auto
+
+# 针对所有 shell 脚本，强制使用 Linux 的 LF 换行符
+*.sh text eol=lf
+*.bash text eol=lf
