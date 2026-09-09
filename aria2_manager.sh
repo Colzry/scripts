@@ -282,12 +282,13 @@ install_ariang() {
     ensure_caddy
     install_packages curl wget unzip
 
-    echo ">> 正在从 GitHub 探测 AriaNg 最新版本..."
-    ARIANG_API="https://gitpy.223327.xyz/https://api.github.com/repos/mayswind/AriaNg/releases/latest"
+    # 直接访问 GitHub 官方 API（不走反代）
+    echo ">> 正在从 GitHub 官方 API 探测 AriaNg 最新版本..."
+    ARIANG_API="https://api.github.com/repos/mayswind/AriaNg/releases/latest"
     ARIANG_TAG=$(curl -sSL "${ARIANG_API}" | grep -Po '"tag_name":\s*"\K[^"]*' || true)
 
     if [ -z "$ARIANG_TAG" ]; then
-        echo ">> 提示: 获取最新版本号超时或受限，自动启用兜底版本 1.3.14"
+        echo ">> 提示: 获取官方 API 失败或受速率限制，启用兜底版本 1.3.14"
         ARIANG_TAG="1.3.14"
     else
         echo ">> 成功获取到最新版本: ${ARIANG_TAG}"
@@ -297,6 +298,7 @@ install_ariang() {
     mkdir -p "${ARIANG_DIR}"
     chmod o+rx "${USER_HOME}" "${USER_HOME}/.aria2" "${ARIANG_DIR}" 2>/dev/null || true
 
+    # 实际下载文件时走反代
     ARIANG_DL_URL="${GH_PROXY}/mayswind/AriaNg/releases/download/${ARIANG_TAG}/AriaNg-${ARIANG_TAG}-AllInOne.zip"
     TMP_ARIANG=$(mktemp -d)
     wget -q --show-progress -O "${TMP_ARIANG}/ariang.zip" "${ARIANG_DL_URL}"
@@ -360,7 +362,6 @@ uninstall_ariang() {
     ${SUDO_CMD} rm -f /etc/caddy/Caddyfile
     rm -rf "${ARIANG_DIR}"
 
-    # 询问是否卸载 Caddy 软件包（默认 N）
     remove_caddy_package
 
     echo ">> AriaNg 前端卸载流程已完成。"
@@ -419,7 +420,6 @@ uninstall_all() {
         fi
     fi
 
-    # 询问是否卸载 Caddy 软件包（默认 N）
     remove_caddy_package
 
     echo ""
