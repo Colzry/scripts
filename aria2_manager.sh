@@ -64,6 +64,34 @@ ensure_caddy() {
     fi
 }
 
+# ==================== 卸载 Caddy 软件包 ====================
+remove_caddy_package() {
+    if ! command -v caddy &>/dev/null; then
+        return 0
+    fi
+
+    echo ""
+    read -rp "是否彻底卸载系统中的 Caddy 软件包及软件源? [y/N 默认: N]: " PURGE_CADDY
+    PURGE_CADDY="${PURGE_CADDY:-N}"
+
+    if [[ "$PURGE_CADDY" =~ ^[Yy]$ ]]; then
+        echo ">> 正在彻底卸载 Caddy..."
+        if command -v apt-get &>/dev/null; then
+            ${SUDO_CMD} apt-get purge -y caddy || true
+            ${SUDO_CMD} apt-get autoremove -y || true
+            ${SUDO_CMD} rm -f /etc/apt/sources.list.d/caddy-stable.list
+            ${SUDO_CMD} rm -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+        elif command -v pacman &>/dev/null; then
+            ${SUDO_CMD} pacman -Rns --noconfirm caddy || true
+        elif command -v dnf &>/dev/null; then
+            ${SUDO_CMD} dnf remove -y caddy || true
+        fi
+        echo ">> Caddy 软件包及源已彻底清除。"
+    else
+        echo ">> 已保留 Caddy 软件包及系统源。"
+    fi
+}
+
 # ==================== 模块 1: 安装 Aria2 后端 ====================
 install_aria2() {
     echo ""
@@ -86,7 +114,8 @@ install_aria2() {
     done
 
     echo ""
-    read -rp "是否顺带安装 AriaNg Web 前端 (Caddy 反代模式)? (y/N): " WITH_ARIANG
+    read -rp "是否顺带安装 AriaNg Web 前端 (Caddy 反代模式)? [y/N 默认: N]: " WITH_ARIANG
+    WITH_ARIANG="${WITH_ARIANG:-N}"
 
     echo ""
     echo "=== Aria2 配置概要 ==="
@@ -96,13 +125,13 @@ install_aria2() {
     echo "RPC 密钥: ${RPC_SECRET}"
     echo "顺带安装 AriaNg: $([[ "$WITH_ARIANG" =~ ^[Yy]$ ]] && echo "是" || echo "否")"
     echo "======================"
-    read -rp "确认开始安装 Aria2? (y/N): " CONFIRM
+    read -rp "确认开始安装 Aria2? [y/N 默认: N]: " CONFIRM
+    CONFIRM="${CONFIRM:-N}"
     if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
         echo "已取消安装。"
         return 0
     fi
 
-    # 安装依赖与二进制文件
     install_packages curl wget tar
     echo ">> 正在下载 Aria2 增强版..."
     ARIA2_URL="${GH_PROXY}/P3TERX/Aria2-Pro-Core/releases/download/1.36.0_2021.08.22/aria2-1.36.0-static-linux-amd64.tar.gz"
@@ -115,7 +144,6 @@ install_aria2() {
     ${SUDO_CMD} chmod +x /usr/bin/aria2c
     rm -rf "${TMP_DIR}"
 
-    # 创建必要目录与配置
     mkdir -p "${DOWNLOAD_DIR}"
     mkdir -p "${USER_HOME}/.aria2/scripts"
     touch "${USER_HOME}/.aria2/aria2.session"
@@ -151,7 +179,6 @@ rpc-secret=${RPC_SECRET}
 bt-tracker=
 EOF
 
-    # Tracker 脚本
     cat > "${USER_HOME}/.aria2/scripts/update_tracker.sh" <<EOF
 #!/usr/bin/env bash
 CONF_FILE="${USER_HOME}/.aria2/aria2.conf"
@@ -172,7 +199,6 @@ ${SYSTEMCTL_CMD} restart aria2.service
 EOF
     chmod +x "${USER_HOME}/.aria2/scripts/update_tracker.sh"
 
-    # 注册 Systemd 服务
     [ "$IS_ROOT" = false ] && mkdir -p "${SYSTEMD_DIR}"
 
     ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2.service'" <<EOF
@@ -212,12 +238,10 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
-    # 启动与使能
     ${SYSTEMCTL_CMD} daemon-reload
     ${SYSTEMCTL_CMD} enable --now aria2.service
     ${SYSTEMCTL_CMD} enable --now aria2-update-tracker.timer
 
-    # 首次尝试拉取 Tracker
     bash "${USER_HOME}/.aria2/scripts/update_tracker.sh" 2>/dev/null || true
 
     if [ "$IS_ROOT" = false ] && command -v loginctl &>/dev/null; then
@@ -229,22 +253,20 @@ EOF
     echo "   RPC 端口: ${RPC_PORT}"
     echo "   RPC 密钥: ${RPC_SECRET}"
 
-    # 级联安装前端
     if [[ "$WITH_ARIANG" =~ ^[Yy]$ ]]; then
         install_ariang "${RPC_PORT}"
     fi
 }
 
-# ==================== 模块 2: 单独安装/配置 AriaNg (使用 Caddy) ====================
+# ==================== 模块 2: 单独安装/更新 AriaNg (使用 Caddy) ====================
 install_ariang() {
     local target_rpc_port="$1"
 
     echo ""
     echo "=========================================="
-    echo "     安装 / 配置 AriaNg 前端 (Caddy 反代)  "
+    echo "     安装 / 更新 AriaNg 前端 (Caddy 反代)  "
     echo "=========================================="
 
-    # 如果没有传入端口，则从配置文件读取或交互询问
     if [ -z "$target_rpc_port" ]; then
         if [ -f "${USER_HOME}/.aria2/aria2.conf" ]; then
             target_rpc_port=$(grep -E "^rpc-listen-port=" "${USER_HOME}/.aria2/aria2.conf" | cut -d'=' -f2 | tr -d ' \r')
@@ -260,27 +282,36 @@ install_ariang() {
     ensure_caddy
     install_packages curl wget unzip
 
-    echo ">> 正在下载 AriaNg (All-In-One)..."
+    echo ">> 正在从 GitHub 探测 AriaNg 最新版本..."
+    ARIANG_API="https://gitpy.223327.xyz/https://api.github.com/repos/mayswind/AriaNg/releases/latest"
+    ARIANG_TAG=$(curl -sSL "${ARIANG_API}" | grep -Po '"tag_name":\s*"\K[^"]*' || true)
+
+    if [ -z "$ARIANG_TAG" ]; then
+        echo ">> 提示: 获取最新版本号超时或受限，自动启用兜底版本 1.3.14"
+        ARIANG_TAG="1.3.14"
+    else
+        echo ">> 成功获取到最新版本: ${ARIANG_TAG}"
+    fi
+
+    echo ">> 正在下载 AriaNg (${ARIANG_TAG} All-In-One)..."
     mkdir -p "${ARIANG_DIR}"
-    # 确保 Caddy 服务用户（通常为 caddy 或 www-data）有读取静态文件的目录权限
     chmod o+rx "${USER_HOME}" "${USER_HOME}/.aria2" "${ARIANG_DIR}" 2>/dev/null || true
 
-    ARIANG_DL_URL="${GH_PROXY}/mayswind/AriaNg/releases/download/1.3.7/AriaNg-1.3.7-AllInOne.zip"
+    ARIANG_DL_URL="${GH_PROXY}/mayswind/AriaNg/releases/download/${ARIANG_TAG}/AriaNg-${ARIANG_TAG}-AllInOne.zip"
     TMP_ARIANG=$(mktemp -d)
     wget -q --show-progress -O "${TMP_ARIANG}/ariang.zip" "${ARIANG_DL_URL}"
     unzip -qo "${TMP_ARIANG}/ariang.zip" -d "${ARIANG_DIR}"
     chmod -R o+r "${ARIANG_DIR}"
     rm -rf "${TMP_ARIANG}"
 
-    echo ">> 配置 Caddyfile (端口: ${ARIANG_PORT} -> RPC: ${target_rpc_port})..."
+    echo ">> 配置 Caddyfile (route 优先反代: :${ARIANG_PORT} -> RPC: ${target_rpc_port})..."
     ${SUDO_CMD} mkdir -p /etc/caddy
     ${SUDO_CMD} bash -c "cat > /etc/caddy/Caddyfile" <<EOF
 :${ARIANG_PORT} {
-    root * ${ARIANG_DIR}
-    file_server
-
-    handle /jsonrpc* {
-        reverse_proxy 127.0.0.1:${target_rpc_port}
+    route {
+        reverse_proxy /jsonrpc* 127.0.0.1:${target_rpc_port}
+        root * ${ARIANG_DIR}
+        file_server
     }
 }
 EOF
@@ -291,27 +322,31 @@ EOF
     ${SUDO_CMD} systemctl restart caddy
 
     echo ""
-    echo ">> AriaNg (Caddy 反代) 配置完成并已启动！"
+    echo ">> AriaNg (${ARIANG_TAG}) 配置完成并已启动！"
     echo "=========================================="
-    echo "单端口 SSH 隧道映射方式:"
-    echo "  只需在本地电脑执行这一条命令:"
-    echo "  ssh -L ${ARIANG_PORT}:localhost:${ARIANG_PORT} ${CURRENT_USER}@<你的服务器IP>"
+    echo "单端口 SSH 隧道建立命令 (本地电脑执行):"
+    echo "  ssh -L 127.0.0.1:${ARIANG_PORT}:127.0.0.1:${ARIANG_PORT} ${CURRENT_USER}@<你的服务器IP>"
     echo ""
     echo "本地浏览器设置方式:"
-    echo "  1. 打开 http://localhost:${ARIANG_PORT}"
-    echo "  2. 点击左侧 [AriaNg 设置] -> 顶部 [RPC (localhost:6800)] 标签"
-    echo "  3. 修改以下项:"
-    echo "     - Aria2 RPC 地址:      localhost"
+    echo "  1. 打开 http://127.0.0.1:${ARIANG_PORT}"
+    echo "  2. 点击左侧 [AriaNg 设置] -> 切换到 [RPC (localhost:6800)] 标签页"
+    echo "  3. 修改项:"
+    echo "     - Aria2 RPC 地址:      127.0.0.1 (或 localhost)"
     echo "     - Aria2 RPC 端口:      ${ARIANG_PORT}  (务必改成 ${ARIANG_PORT}，非 6800)"
     echo "     - Aria2 RPC 请求路径:  jsonrpc"
     echo "     - Aria2 RPC 密钥:      输入你在 aria2.conf 中设置的 rpc-secret"
+    echo "  4. 刷新页面，即可成功连接！"
     echo "=========================================="
 }
 
 # ==================== 模块 3: 单独卸载 AriaNg ====================
 uninstall_ariang() {
     echo ""
-    read -rp "确定要卸载 AriaNg 前端与停止 Caddy 吗? (y/N): " CONFIRM
+    echo "=========================================="
+    echo "            卸载 AriaNg 前端              "
+    echo "=========================================="
+    read -rp "确定要卸载 AriaNg 前端吗? [y/N 默认: N]: " CONFIRM
+    CONFIRM="${CONFIRM:-N}"
     if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
         echo "已取消。"
         return 0
@@ -321,11 +356,14 @@ uninstall_ariang() {
     ${SUDO_CMD} systemctl stop caddy 2>/dev/null || true
     ${SUDO_CMD} systemctl disable caddy 2>/dev/null || true
 
-    echo ">> 正在清理 Caddyfile 与 AriaNg 静态目录..."
+    echo ">> 正在清理 Caddyfile 与 AriaNg 静态文件..."
     ${SUDO_CMD} rm -f /etc/caddy/Caddyfile
     rm -rf "${ARIANG_DIR}"
 
-    echo ">> AriaNg 前端已完全卸载。"
+    # 询问是否卸载 Caddy 软件包（默认 N）
+    remove_caddy_package
+
+    echo ">> AriaNg 前端卸载流程已完成。"
 }
 
 # ==================== 模块 4: 完整卸载 (全部组件) ====================
@@ -334,7 +372,8 @@ uninstall_all() {
     echo "=========================================="
     echo "        卸载 Aria2 与 AriaNg 全部组件     "
     echo "=========================================="
-    read -rp "确定要卸载所有相关服务吗? (y/N): " CONFIRM_UNINSTALL
+    read -rp "确定要卸载所有相关服务吗? [y/N 默认: N]: " CONFIRM_UNINSTALL
+    CONFIRM_UNINSTALL="${CONFIRM_UNINSTALL:-N}"
     if [[ ! "$CONFIRM_UNINSTALL" =~ ^[Yy]$ ]]; then
         echo "已取消卸载。"
         return 0
@@ -363,13 +402,15 @@ uninstall_all() {
         ${SUDO_CMD} rm -f /usr/bin/aria2c
     fi
 
-    read -rp "是否删除配置及脚本目录 (${USER_HOME}/.aria2)? (y/N): " DEL_CONFIG
+    read -rp "是否删除配置及脚本目录 (${USER_HOME}/.aria2)? [y/N 默认: N]: " DEL_CONFIG
+    DEL_CONFIG="${DEL_CONFIG:-N}"
     if [[ "$DEL_CONFIG" =~ ^[Yy]$ ]]; then
         rm -rf "${USER_HOME}/.aria2"
         echo "已清理配置目录: ${USER_HOME}/.aria2"
     fi
 
-    read -rp "是否清理下载目录? (强烈建议输入 n 保留已有文件) (y/N): " DEL_DOWNLOADS
+    read -rp "是否清理下载目录? (强烈建议保留) [y/N 默认: N]: " DEL_DOWNLOADS
+    DEL_DOWNLOADS="${DEL_DOWNLOADS:-N}"
     if [[ "$DEL_DOWNLOADS" =~ ^[Yy]$ ]]; then
         read -rp "请输入要清空的下载目录绝对路径: " TARGET_DL_DIR
         if [ -n "$TARGET_DL_DIR" ] && [ -d "$TARGET_DL_DIR" ] && [ "$TARGET_DL_DIR" != "/" ] && [ "$TARGET_DL_DIR" != "$USER_HOME" ]; then
@@ -377,6 +418,9 @@ uninstall_all() {
             echo "已删除: ${TARGET_DL_DIR}"
         fi
     fi
+
+    # 询问是否卸载 Caddy 软件包（默认 N）
+    remove_caddy_package
 
     echo ""
     echo ">> 所有组件卸载完成。"
