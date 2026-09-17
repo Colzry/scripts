@@ -22,6 +22,7 @@ ARIA2_CONF_DIR="${USER_HOME}/.aria2"
 CONF_FILE="${ARIA2_CONF_DIR}/aria2.conf"
 SESSION_FILE="${ARIA2_CONF_DIR}/aria2.session"
 TRACKER_SCRIPT="${ARIA2_CONF_DIR}/scripts/update_tracker.sh"
+EXCLUDE_SCRIPT="${ARIA2_CONF_DIR}/scripts/update_exclude_tracker.sh"
 DEFAULT_DOWNLOAD_DIR="${USER_HOME}/Downloads"
 DEFAULT_PORT="6800"
 DEFAULT_ARIANG_PORT="6880"
@@ -118,23 +119,49 @@ TRACKER_URL1="https://bitbucket.org/xiu2/trackerslistcollection/raw/master/all.t
 TRACKER_URL2="https://cdn.jsdelivr.net/gh/ngosang/trackerslist@master/trackers_all.txt"
 
 echo "正在从多源获取最新 Tracker 列表..."
-list=\$( (curl -sSL --connect-timeout 10 -m 30 "\${TRACKER_URL1}"; echo ""; curl -sSL --connect-timeout 10 -m 30 "\${TRACKER_URL2}") | tr -d '\r' | sed '/^$/d' | sort -u | paste -sd "," - )
+tracker_list=\$( (curl -sSL --connect-timeout 10 -m 30 "\${TRACKER_URL1}"; echo ""; curl -sSL --connect-timeout 10 -m 30 "\${TRACKER_URL2}") | tr -d '\r' | sed '/^$/d' | sort -u | paste -sd "," - )
 
-if [ -z "\$list" ]; then
-    echo "获取失败，列表为空。"
+if [ -n "\$tracker_list" ]; then
+    if grep -q "^bt-tracker=" "\$CONF_FILE"; then
+        sed -i "s|^bt-tracker=.*|bt-tracker=\${tracker_list}|g" "\$CONF_FILE"
+    else
+        echo "bt-tracker=\${tracker_list}" >> "\$CONF_FILE"
+    fi
+    echo "Tracker 列表更新成功！"
+    ${SYSTEMCTL_CMD} restart aria2.service
+else
+    echo "警告: Tracker 列表获取为空，跳过更新。"
     exit 1
 fi
-
-if grep -q "^bt-tracker=" "\$CONF_FILE"; then
-    sed -i "s|^bt-tracker=.*|bt-tracker=\${list}|g" "\$CONF_FILE"
-else
-    echo "bt-tracker=\${list}" >> "\$CONF_FILE"
-fi
-
-echo "Tracker 更新成功！已自动去重合并。"
-${SYSTEMCTL_CMD} restart aria2.service
 EOF
     chmod +x "${TRACKER_SCRIPT}"
+}
+
+# ==================== 生成 排除服务器 更新脚本 ====================
+ensure_exclude_script() {
+    mkdir -p "${ARIA2_CONF_DIR}/scripts"
+    cat > "${EXCLUDE_SCRIPT}" <<EOF
+#!/usr/bin/env bash
+CONF_FILE="${CONF_FILE}"
+EXCLUDE_URL="https://bcr.pbh-btn.com/combine/all.txt"
+
+echo "正在获取最新 BT 排除服务器列表..."
+exclude_list=\$(curl -sSL --connect-timeout 10 -m 30 "\${EXCLUDE_URL}" | tr -d '\r' | sed '/^$/d' | sort -u | paste -sd "," - )
+
+if [ -n "\$exclude_list" ]; then
+    if grep -q "^bt-exclude-tracker=" "\$CONF_FILE"; then
+        sed -i "s|^bt-exclude-tracker=.*|bt-exclude-tracker=\${exclude_list}|g" "\$CONF_FILE"
+    else
+        echo "bt-exclude-tracker=\${exclude_list}" >> "\$CONF_FILE"
+    fi
+    echo "BT 排除服务器列表更新成功！"
+    ${SYSTEMCTL_CMD} restart aria2.service
+else
+    echo "警告: 排除服务器列表获取为空，跳过更新。"
+    exit 1
+fi
+EOF
+    chmod +x "${EXCLUDE_SCRIPT}"
 }
 
 # ==================== 模块 1: 安装 Aria2 后端 ====================
@@ -170,7 +197,8 @@ install_aria2() {
     echo "RPC 端口: ${RPC_PORT}"
     echo "RPC 密钥: ${RPC_SECRET}"
     echo "顺带安装 AriaNg: $([[ "$WITH_ARIANG" =~ ^[Yy]$ ]] && echo "是" || echo "否")"
-    echo "Tracker 自动更新: 默认开启 (每日定时)"
+    echo "Trackers 自动更新: 默认开启 (独立每日定时)"
+    echo "排除服务器自动更新: 默认开启 (独立每日定时)"
     echo "种子文件保留: 默认关闭 (下载后自动删除种子)"
     echo "======================"
     read -rp "确认开始安装 Aria2? [Y/n 默认: Y]: " CONFIRM
@@ -227,12 +255,15 @@ rpc-secret=${RPC_SECRET}
 bt-save-metadata=false
 follow-torrent=mem
 bt-tracker=
+bt-exclude-tracker=
 EOF
 
     ensure_tracker_script
+    ensure_exclude_script
 
     [ "$IS_ROOT" = false ] && mkdir -p "${SYSTEMD_DIR}"
 
+    # 1. Aria2 主服务
     ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2.service'" <<EOF
 [Unit]
 Description=Aria2c Download Manager
@@ -247,6 +278,7 @@ Restart=on-failure
 WantedBy=default.target
 EOF
 
+    # 2. Trackers 独立定时器
     ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2-update-tracker.service'" <<EOF
 [Unit]
 Description=Update Aria2 BT Trackers
@@ -259,7 +291,7 @@ EOF
 
     ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2-update-tracker.timer'" <<EOF
 [Unit]
-Description=Run Aria2 Tracker Update Daily
+Description=Run Aria2 Trackers Update Daily
 
 [Timer]
 OnBootSec=10min
@@ -270,11 +302,38 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
+    # 3. 排除服务器 独立定时器
+    ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2-update-exclude-tracker.service'" <<EOF
+[Unit]
+Description=Update Aria2 BT Exclude Trackers
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=${EXCLUDE_SCRIPT}
+EOF
+
+    ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2-update-exclude-tracker.timer'" <<EOF
+[Unit]
+Description=Run Aria2 BT Exclude List Update Daily
+
+[Timer]
+OnBootSec=12min
+OnUnitActiveSec=24h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
     ${SYSTEMCTL_CMD} daemon-reload
     ${SYSTEMCTL_CMD} enable --now aria2.service
     ${SYSTEMCTL_CMD} enable --now aria2-update-tracker.timer
+    ${SYSTEMCTL_CMD} enable --now aria2-update-exclude-tracker.timer
 
+    echo ">> 正在初始化 Trackers 与 排除列表..."
     bash "${TRACKER_SCRIPT}" 2>/dev/null || true
+    bash "${EXCLUDE_SCRIPT}" 2>/dev/null || true
 
     if [ "$IS_ROOT" = false ] && command -v loginctl &>/dev/null; then
         sudo loginctl enable-linger "${CURRENT_USER}" 2>/dev/null || true
@@ -284,7 +343,8 @@ EOF
     echo ">> Aria2 后端已部署成功！"
     echo "   RPC 端口: ${RPC_PORT}"
     echo "   RPC 密钥: ${RPC_SECRET}"
-    echo "   Tracker 自动更新定时器已就绪并开机启动。"
+    echo "   Trackers 自动更新定时器已启用 (aria2-update-tracker.timer)"
+    echo "   排除服务器自动更新定时器已启用 (aria2-update-exclude-tracker.timer)"
     echo "   BT 种子自动清理配置已生效。"
 
     if [[ "$WITH_ARIANG" =~ ^[Yy]$ ]]; then
@@ -384,7 +444,7 @@ update_trackers_menu() {
     fi
 }
 
-# ==================== 模块 4: 自动更新 Trackers 开关管理 ====================
+# ==================== 模块 4: Trackers 自动更新定时器管理 ====================
 manage_tracker_timer() {
     echo ""
     echo "=========================================="
@@ -396,7 +456,7 @@ manage_tracker_timer() {
         IS_ACTIVE=true
     fi
 
-    echo -n "当前自动更新定时器状态: "
+    echo -n "当前 Trackers 自动更新定时器状态: "
     if [ "$IS_ACTIVE" = true ]; then
         echo -e "\033[32m已启用 (Active)\033[0m"
     else
@@ -427,7 +487,7 @@ EOF
 
             ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2-update-tracker.timer'" <<EOF
 [Unit]
-Description=Run Aria2 Tracker Update Daily
+Description=Run Aria2 Trackers Update Daily
 
 [Timer]
 OnBootSec=10min
@@ -440,13 +500,13 @@ EOF
 
             ${SYSTEMCTL_CMD} daemon-reload
             ${SYSTEMCTL_CMD} enable --now aria2-update-tracker.timer
-            echo ">> 自动更新定时器已成功启用！"
+            echo ">> Trackers 自动更新定时器已成功启用！"
             ;;
         2)
-            echo ">> 正在停止并禁用定时器..."
+            echo ">> 正在停止并禁用 Trackers 定时器..."
             ${SYSTEMCTL_CMD} stop aria2-update-tracker.timer 2>/dev/null || true
             ${SYSTEMCTL_CMD} disable aria2-update-tracker.timer 2>/dev/null || true
-            echo ">> 自动更新定时器已停用。"
+            echo ">> Trackers 自动更新定时器已停用。"
             ;;
         3)
             echo ""
@@ -461,7 +521,136 @@ EOF
     esac
 }
 
-# ==================== 模块 5: 迁移下载任务 ====================
+# ==================== 模块 5: 单独设置/更新 排除服务器 ====================
+update_exclude_trackers_menu() {
+    echo ""
+    echo "=========================================="
+    echo "      手动更新 / 设置 BT 排除服务器       "
+    echo "=========================================="
+
+    if [ ! -f "${CONF_FILE}" ]; then
+        echo "未检测到配置文件: ${CONF_FILE}，请先安装 Aria2！"
+        return 1
+    fi
+
+    echo "请选择操作:"
+    echo " 1. 立即从网络自动拉取最新 BT 排除服务器列表 (https://bcr.pbh-btn.com/combine/all.txt)"
+    echo " 2. 手动自定义输入 BT 排除服务器列表"
+    read -rp "请选择 [1-2 默认: 1]: " EXCLUDE_CHOICE
+    EXCLUDE_CHOICE="${EXCLUDE_CHOICE:-1}"
+
+    if [ "$EXCLUDE_CHOICE" == "1" ]; then
+        ensure_exclude_script
+        echo ">> 正在执行排除服务器更新脚本..."
+        bash "${EXCLUDE_SCRIPT}"
+    elif [ "$EXCLUDE_CHOICE" == "2" ]; then
+        echo ""
+        echo "请输入或粘贴 BT 排除服务器列表 (可为逗号分隔，也可为多行粘贴，输入完成后在新行输入 EOF 并回车结束):"
+        USER_EXCLUDES=""
+        while IFS= read -r line; do
+            [ "$line" = "EOF" ] && break
+            USER_EXCLUDES="${USER_EXCLUDES}${line},"
+        done
+        
+        formatted_excludes=$(echo "${USER_EXCLUDES}" | tr -d '\r' | tr '\n' ',' | sed 's/,,*/,/g; s/^,//; s/,$//')
+
+        if [ -z "$formatted_excludes" ]; then
+            echo "输入内容为空，未做任何修改。"
+            return 0
+        fi
+
+        if grep -q "^bt-exclude-tracker=" "${CONF_FILE}"; then
+            sed -i "s|^bt-exclude-tracker=.*|bt-exclude-tracker=${formatted_excludes}|g" "${CONF_FILE}"
+        else
+            echo "bt-exclude-tracker=${formatted_excludes}" >> "${CONF_FILE}"
+        fi
+
+        ${SYSTEMCTL_CMD} restart aria2.service
+        echo ">> 自定义 BT 排除服务器列表已成功写入并重启 Aria2 服务！"
+    else
+        echo "无效选项。"
+        return 1
+    fi
+}
+
+# ==================== 模块 6: 排除服务器 自动更新定时器管理 ====================
+manage_exclude_tracker_timer() {
+    echo ""
+    echo "=========================================="
+    echo "    BT 排除服务器 自动更新 定时器管理     "
+    echo "=========================================="
+
+    IS_ACTIVE=false
+    if ${SYSTEMCTL_CMD} is-active --quiet aria2-update-exclude-tracker.timer 2>/dev/null; then
+        IS_ACTIVE=true
+    fi
+
+    echo -n "当前排除服务器自动更新定时器状态: "
+    if [ "$IS_ACTIVE" = true ]; then
+        echo -e "\033[32m已启用 (Active)\033[0m"
+    else
+        echo -e "\033[31m未启用 (Inactive / Stopped)\033[0m"
+    fi
+    echo ""
+
+    echo " 1. 启用并开启开机自启 (Enable & Start)"
+    echo " 2. 停用并关闭开机自启 (Disable & Stop)"
+    echo " 3. 查看定时器运行与下次触发时间"
+    echo " 0. 返回上级菜单"
+    read -rp "请选择操作 [0-3]: " TIMER_CHOICE
+
+    case "$TIMER_CHOICE" in
+        1)
+            ensure_exclude_script
+            [ "$IS_ROOT" = false ] && mkdir -p "${SYSTEMD_DIR}"
+
+            ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2-update-exclude-tracker.service'" <<EOF
+[Unit]
+Description=Update Aria2 BT Exclude Trackers
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=${EXCLUDE_SCRIPT}
+EOF
+
+            ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2-update-exclude-tracker.timer'" <<EOF
+[Unit]
+Description=Run Aria2 BT Exclude List Update Daily
+
+[Timer]
+OnBootSec=12min
+OnUnitActiveSec=24h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+            ${SYSTEMCTL_CMD} daemon-reload
+            ${SYSTEMCTL_CMD} enable --now aria2-update-exclude-tracker.timer
+            echo ">> 排除服务器自动更新定时器已成功启用！"
+            ;;
+        2)
+            echo ">> 正在停止并禁用排除服务器定时器..."
+            ${SYSTEMCTL_CMD} stop aria2-update-exclude-tracker.timer 2>/dev/null || true
+            ${SYSTEMCTL_CMD} disable aria2-update-exclude-tracker.timer 2>/dev/null || true
+            echo ">> 排除服务器自动更新定时器已停用。"
+            ;;
+        3)
+            echo ""
+            ${SYSTEMCTL_CMD} list-timers aria2-update-exclude-tracker.timer || true
+            ;;
+        0)
+            return 0
+            ;;
+        *)
+            echo "无效选项。"
+            ;;
+    esac
+}
+
+# ==================== 模块 7: 迁移下载任务 ====================
 migrate_downloads() {
     echo ""
     echo "=========================================="
@@ -475,7 +664,6 @@ migrate_downloads() {
 
     install_packages rsync findutils
 
-    # 1. 优先选择迁移范围
     echo "请先选择迁移范围:"
     echo " 1. 仅迁移未完成的下载任务 (自动识别 .aria2 校验块、数据与种子元数据)"
     echo " 2. 迁移整个下载目录的所有数据 (包含已完成与未完成，自动识别元数据)"
@@ -492,7 +680,6 @@ migrate_downloads() {
         fi
     fi
 
-    # 2. 再配置迁移路径
     CURRENT_DIR=$(grep -E "^dir=" "${CONF_FILE}" | cut -d'=' -f2 | tr -d '\r')
     echo ""
     echo "当前默认下载目录为: ${CURRENT_DIR}"
@@ -514,7 +701,6 @@ migrate_downloads() {
         echo "目标路径不能为空，请重新输入！"
     done
 
-    # 3. 严格安全停机，防止进程写回覆盖 session
     stop_aria2_safely
 
     mkdir -p "${DEST_DIR}"
@@ -542,24 +728,20 @@ migrate_downloads() {
                 dest_subdir=$(dirname "${DEST_DIR}/${rel_ctl}")
                 mkdir -p "${dest_subdir}"
 
-                # 同步控制文件
                 rsync -avP "${ctl}" "${dest_subdir}/"
                 MIGRATED_FILES+=("${ctl}")
 
-                # 同步数据本体
                 if [ -e "${data_target}" ]; then
                     rsync -avP "${data_target}" "${dest_subdir}/"
                     MIGRATED_FILES+=("${data_target}")
                 fi
 
-                # 同步同名 .torrent
                 if [ -f "${data_target}.torrent" ]; then
                     rsync -avP "${data_target}.torrent" "${dest_subdir}/"
                     MIGRATED_FILES+=("${data_target}.torrent")
                 fi
             done
 
-            # 抓取源目录下关联的所有 .torrent 文件并同步
             while IFS= read -r tor; do
                 if [ -f "$tor" ]; then
                     rsync -avP "$tor" "${DEST_DIR}/"
@@ -588,12 +770,10 @@ migrate_downloads() {
                 rsync -avP "${item}" "${dest_subdir}/"
                 MIGRATED_FILES+=("${item}")
 
-                # 自动识别关联的 .aria2 控制文件
                 if [ -f "${item}.aria2" ]; then
                     rsync -avP "${item}.aria2" "${dest_subdir}/"
                     MIGRATED_FILES+=("${item}.aria2")
                 fi
-                # 自动识别关联的 .torrent 种子文件
                 if [ -f "${item}.torrent" ]; then
                     rsync -avP "${item}.torrent" "${dest_subdir}/"
                     MIGRATED_FILES+=("${item}.torrent")
@@ -614,7 +794,6 @@ migrate_downloads() {
             ;;
     esac
 
-    # 4. 全面替换 session 会话文件中的路径映射
     if [ -f "${SESSION_FILE}" ] && [ -s "${SESSION_FILE}" ]; then
         echo ">> 正在更新会话文件 (${SESSION_FILE}) 中的路径映射..."
         cp "${SESSION_FILE}" "${SESSION_FILE}.bak"
@@ -629,7 +808,6 @@ migrate_downloads() {
         echo ">> 已更新 aria2.conf 默认下载目录为: ${DEST_DIR}"
     fi
 
-    # 5. 重新启动服务
     echo ">> 正在启动 Aria2 服务恢复下载..."
     ${SYSTEMCTL_CMD} start aria2.service
 
@@ -637,7 +815,6 @@ migrate_downloads() {
     echo ">> 迁移完成！Aria2 已重新载入元数据并开始自检校验断点。"
     echo ""
 
-    # 6. 安全清理源磁盘旧数据
     if [ "$MIGRATE_TYPE" == "1" ] || [ "$MIGRATE_TYPE" == "3" ]; then
         read -rp "是否删除源磁盘上对应的旧数据 (含数据、.aria2 及种子) 以释放空间? [Y/n 默认: Y]: " CLEAN_OLD
         CLEAN_OLD="${CLEAN_OLD:-Y}"
@@ -669,7 +846,7 @@ migrate_downloads() {
     fi
 }
 
-# ==================== 模块 6: 扫描并恢复未完成种子任务 ====================
+# ==================== 模块 8: 扫描并恢复未完成种子任务 ====================
 scan_and_resume_torrents() {
     echo ""
     echo "=========================================="
@@ -683,12 +860,10 @@ scan_and_resume_torrents() {
 
     install_packages curl
 
-    # 提取当前 RPC 端口与 Secret
     RPC_PORT=$(grep -E "^rpc-listen-port=" "${CONF_FILE}" | cut -d'=' -f2 | tr -d ' \r')
     RPC_PORT="${RPC_PORT:-$DEFAULT_PORT}"
     RPC_SECRET=$(grep -E "^rpc-secret=" "${CONF_FILE}" | cut -d'=' -f2 | tr -d ' \r')
 
-    # 确认 Aria2 进程已在运行
     if ! ${SYSTEMCTL_CMD} is-active --quiet aria2.service 2>/dev/null; then
         echo ">> 检测到 Aria2 服务未运行，正在启动..."
         ${SYSTEMCTL_CMD} start aria2.service
@@ -718,15 +893,9 @@ scan_and_resume_torrents() {
 
     local resumed_count=0
     for tor in "${TORRENT_FILES[@]}"; do
-        base_name="${tor%.torrent}"
-        # 只要存在同名 .aria2 校验文件，或者对应数据文件/目录存在且未完工
-        # 即使被改名，通过 RPC 重新注入种子也会自动匹配当前目录下的同名文件进行分块校验
         echo ">> 正在推送种子: $(basename "$tor")..."
-        
-        # 将种子转换成 base64
         tor_b64=$(base64 -w 0 "$tor" 2>/dev/null || base64 "$tor" | tr -d '\r\n')
         
-        # 构建 RPC 请求体 (aria2.addTorrent)
         if [ -n "$RPC_SECRET" ]; then
             payload=$(cat <<EOF
 {
@@ -758,7 +927,6 @@ EOF
 )
         fi
 
-        # 发送 RPC 调用
         resp=$(curl -s -m 10 -X POST "http://127.0.0.1:${RPC_PORT}/jsonrpc" -d "${payload}" || true)
         
         if echo "$resp" | grep -q '"result"'; then
@@ -774,7 +942,7 @@ EOF
     echo ">> 请打开 AriaNg 查看任务列表，任务会先进行“检查中 (Checking)”，自检完成后将自动断点续传。"
 }
 
-# ==================== 模块 7: 单独安装/更新 AriaNg (使用 Caddy) ====================
+# ==================== 模块 9: 单独安装/更新 AriaNg (使用 Caddy) ====================
 install_ariang() {
     local target_rpc_port="$1"
 
@@ -855,7 +1023,7 @@ EOF
     echo "=========================================="
 }
 
-# ==================== 模块 8: 单独卸载 AriaNg ====================
+# ==================== 模块 10: 单独卸载 AriaNg ====================
 uninstall_ariang() {
     echo ""
     echo "=========================================="
@@ -881,7 +1049,7 @@ uninstall_ariang() {
     echo ">> AriaNg 前端卸载流程已完成。"
 }
 
-# ==================== 模块 9: 完整卸载 (全部组件) ====================
+# ==================== 模块 11: 完整卸载 (全部组件) ====================
 uninstall_all() {
     echo ""
     echo "=========================================="
@@ -894,21 +1062,27 @@ uninstall_all() {
         return 0
     fi
 
-    echo ">> 正在停止并禁用 Aria2 与 Caddy 服务..."
+    echo ">> 正在停止并禁用 Aria2、定时器 与 Caddy 服务..."
     ${SYSTEMCTL_CMD} stop aria2.service 2>/dev/null || true
     ${SYSTEMCTL_CMD} stop aria2-update-tracker.timer 2>/dev/null || true
     ${SYSTEMCTL_CMD} stop aria2-update-tracker.service 2>/dev/null || true
+    ${SYSTEMCTL_CMD} stop aria2-update-exclude-tracker.timer 2>/dev/null || true
+    ${SYSTEMCTL_CMD} stop aria2-update-exclude-tracker.service 2>/dev/null || true
     ${SUDO_CMD} systemctl stop caddy 2>/dev/null || true
 
     ${SYSTEMCTL_CMD} disable aria2.service 2>/dev/null || true
     ${SYSTEMCTL_CMD} disable aria2-update-tracker.timer 2>/dev/null || true
     ${SYSTEMCTL_CMD} disable aria2-update-tracker.service 2>/dev/null || true
+    ${SYSTEMCTL_CMD} disable aria2-update-exclude-tracker.timer 2>/dev/null || true
+    ${SYSTEMCTL_CMD} disable aria2-update-exclude-tracker.service 2>/dev/null || true
     ${SUDO_CMD} systemctl disable caddy 2>/dev/null || true
 
     echo ">> 正在删除 systemd 服务配置文件..."
     ${SUDO_CMD} rm -f "${SYSTEMD_DIR}/aria2.service"
     ${SUDO_CMD} rm -f "${SYSTEMD_DIR}/aria2-update-tracker.service"
     ${SUDO_CMD} rm -f "${SYSTEMD_DIR}/aria2-update-tracker.timer"
+    ${SUDO_CMD} rm -f "${SYSTEMD_DIR}/aria2-update-exclude-tracker.service"
+    ${SUDO_CMD} rm -f "${SYSTEMD_DIR}/aria2-update-exclude-tracker.timer"
     ${SUDO_CMD} rm -f /etc/caddy/Caddyfile
     ${SYSTEMCTL_CMD} daemon-reload
 
@@ -947,29 +1121,33 @@ while true; do
     echo "          Aria2 & AriaNg 综合管理          "
     echo "  当前用户: ${CURRENT_USER} ($([ "$IS_ROOT" = true ] && echo "Root 模式" || echo "普通用户模式"))"
     echo "=========================================="
-    echo " 1. 安装 / 重新配置 Aria2 后端 (默认启用 Tracker 自动更新)"
+    echo " 1. 安装 / 重新配置 Aria2 后端 (默认启用 Trackers & 排除服务器自动更新)"
     echo " 2. 单独修改下载目录"
     echo " 3. 手动更新 / 设置 BT Trackers (双源拉取 / 自定义)"
     echo " 4. 启用 / 停用 Trackers 自动更新 (定时器管理)"
-    echo " 5. 迁移下载任务到新磁盘"
-    echo " 6. 扫描目录并恢复未完成种子断点下载"
-    echo " 7. 单独安装 / 更新 AriaNg 前端 (Caddy 反代模式)"
-    echo " 8. 单独卸载 AriaNg 前端"
-    echo " 9. 完整卸载 (Aria2 + AriaNg + 服务全部清除)"
+    echo " 5. 手动更新 / 设置 BT 排除服务器 (在线拉取 / 自定义)"
+    echo " 6. 启用 / 停用 排除服务器 自动更新 (定时器管理)"
+    echo " 7. 迁移下载任务到新磁盘"
+    echo " 8. 扫描目录并恢复未完成种子断点下载"
+    echo " 9. 单独安装 / 更新 AriaNg 前端 (Caddy 反代模式)"
+    echo " 10. 单独卸载 AriaNg 前端"
+    echo " 11. 完整卸载 (Aria2 + AriaNg + 定时器 + 服务全部清除)"
     echo " 0. 退出"
     echo "=========================================="
-    read -rp "请选择操作 [0-9]: " MENU_CHOICE
+    read -rp "请选择操作 [0-11]: " MENU_CHOICE
 
     case "$MENU_CHOICE" in
         1) install_aria2 ;;
         2) modify_download_dir ;;
         3) update_trackers_menu ;;
         4) manage_tracker_timer ;;
-        5) migrate_downloads ;;
-        6) scan_and_resume_torrents ;;
-        7) install_ariang ;;
-        8) uninstall_ariang ;;
-        9) uninstall_all; break ;;
+        5) update_exclude_trackers_menu ;;
+        6) manage_exclude_tracker_timer ;;
+        7) migrate_downloads ;;
+        8) scan_and_resume_torrents ;;
+        9) install_ariang ;;
+        10) uninstall_ariang ;;
+        11) uninstall_all; break ;;
         0) echo "已退出。"; exit 0 ;;
         *) echo "无效选项，请重新选择。" ;;
     esac
