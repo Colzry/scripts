@@ -19,6 +19,7 @@ else
 fi
 
 CONF_FILE="${USER_HOME}/.aria2/aria2.conf"
+SESSION_FILE="${USER_HOME}/.aria2/aria2.session"
 DEFAULT_DOWNLOAD_DIR="${USER_HOME}/Downloads"
 DEFAULT_PORT="6800"
 DEFAULT_ARIANG_PORT="6880"
@@ -147,7 +148,7 @@ install_aria2() {
 
     mkdir -p "${DOWNLOAD_DIR}"
     mkdir -p "${USER_HOME}/.aria2/scripts"
-    touch "${USER_HOME}/.aria2/aria2.session"
+    touch "${SESSION_FILE}"
 
     echo ">> 写入 aria2.conf..."
     cat > "${CONF_FILE}" <<EOF
@@ -165,8 +166,8 @@ split=64
 disable-ipv6=true
 
 ## 进度保存设置 ##
-input-file=${USER_HOME}/.aria2/aria2.session
-save-session=${USER_HOME}/.aria2/aria2.session
+input-file=${SESSION_FILE}
+save-session=${SESSION_FILE}
 save-session-interval=60
 
 ## RPC 设置 ##
@@ -276,9 +277,8 @@ modify_download_dir() {
         return 1
     fi
 
-    # 获取当前配置中的下载目录
     CURRENT_DIR=$(grep -E "^dir=" "${CONF_FILE}" | cut -d'=' -f2 | tr -d '\r')
-    echo "当前下载目录: ${CURRENT_DIR:-未设置}"
+    echo "当前默认下载目录: ${CURRENT_DIR:-未设置}"
     echo ""
 
     read -rp "请输入新的下载目录绝对路径 [留空取消]: " NEW_DIR
@@ -287,11 +287,9 @@ modify_download_dir() {
         return 0
     fi
 
-    # 创建新目录
     echo ">> 正在检查并创建目录: ${NEW_DIR}..."
     mkdir -p "${NEW_DIR}"
 
-    # 替换配置文件中的路径
     if grep -q "^dir=" "${CONF_FILE}"; then
         sed -i "s|^dir=.*|dir=${NEW_DIR}|g" "${CONF_FILE}"
     else
@@ -302,11 +300,163 @@ modify_download_dir() {
     ${SYSTEMCTL_CMD} restart aria2.service
 
     echo ""
-    echo ">> 下载目录已成功修改为: ${NEW_DIR}"
+    echo ">> 默认下载目录已成功修改为: ${NEW_DIR}"
     echo ">> Aria2 服务重启完成。"
 }
 
-# ==================== 模块 3: 单独安装/更新 AriaNg (使用 Caddy) ====================
+# ==================== 模块 3: 迁移未完成下载任务 ====================
+migrate_downloads() {
+    echo ""
+    echo "=========================================="
+    echo "       迁移 Aria2 下载任务到新磁盘        "
+    echo "=========================================="
+
+    if [ ! -f "${CONF_FILE}" ]; then
+        echo "错误: 未找到配置文件 ${CONF_FILE}，请确认 Aria2 是否已安装。"
+        return 1
+    fi
+
+    install_packages rsync findutils
+
+    CURRENT_DIR=$(grep -E "^dir=" "${CONF_FILE}" | cut -d'=' -f2 | tr -d '\r')
+    echo "当前默认下载目录为: ${CURRENT_DIR}"
+    read -rp "请输入源下载目录 [默认: ${CURRENT_DIR}]: " SRC_DIR
+    SRC_DIR="${SRC_DIR:-$CURRENT_DIR}"
+
+    if [ ! -d "${SRC_DIR}" ]; then
+        echo "错误: 源目录 ${SRC_DIR} 不存在！"
+        return 1
+    fi
+
+    while true; do
+        read -rp "请输入目标新磁盘目录绝对路径 (例如: /mnt/disk2/Downloads): " DEST_DIR
+        if [ -n "$DEST_DIR" ]; then
+            break
+        fi
+        echo "目标路径不能为空，请重新输入！"
+    done
+
+    echo ""
+    echo "请选择迁移范围:"
+    echo " 1. 仅迁移未完成的下载任务 (自动识别 .aria2 校验文件及其数据)"
+    echo " 2. 迁移整个下载目录的所有数据 (包含已完成与未完成)"
+    echo " 3. 仅迁移指定文件/任务 (按关键词匹配)"
+    read -rp "请选择 [1-3 默认: 1]: " MIGRATE_TYPE
+    MIGRATE_TYPE="${MIGRATE_TYPE:-1}"
+
+    # 1. 暂停服务防止数据写入损坏控制文件
+    echo ">> 正在停止 Aria2 服务，保护进度与控制文件..."
+    ${SYSTEMCTL_CMD} stop aria2.service
+
+    mkdir -p "${DEST_DIR}"
+
+    declare -a MIGRATED_ITEMS=()
+
+    # 2. 按选定范围同步数据
+    case "$MIGRATE_TYPE" in
+        1)
+            echo ">> 正在检索未完成任务 (*.aria2)..."
+            mapfile -t ARIA2_CONTROL_FILES < <(find "${SRC_DIR}" -name "*.aria2")
+            if [ ${#ARIA2_CONTROL_FILES[@]} -eq 0 ]; then
+                echo "提示: 在源目录下未找到任何未完成的任务 (*.aria2 文件)。"
+                ${SYSTEMCTL_CMD} start aria2.service
+                return 0
+            fi
+
+            echo ">> 发现 ${#ARIA2_CONTROL_FILES[@]} 个未完成任务，开始同步对应文件及校验数据..."
+            for ctl in "${ARIA2_CONTROL_FILES[@]}"; do
+                data_target="${ctl%.aria2}"
+                # 记录相对路径以支持子目录
+                rel_ctl="${ctl#"${SRC_DIR}/"}"
+                rel_data="${data_target#"${SRC_DIR}/"}"
+
+                # 创建目标子目录
+                dest_subdir=$(dirname "${DEST_DIR}/${rel_ctl}")
+                mkdir -p "${dest_subdir}"
+
+                # 同步控制文件
+                rsync -avP "${ctl}" "${dest_subdir}/"
+                # 同步数据文件或数据文件夹
+                if [ -e "${data_target}" ]; then
+                    rsync -avP "${data_target}" "${dest_subdir}/"
+                fi
+
+                MIGRATED_ITEMS+=("${ctl}" "${data_target}")
+            done
+            ;;
+        2)
+            echo ">> 正在完整同步下载目录下的所有数据..."
+            rsync -avP "${SRC_DIR}/" "${DEST_DIR}/"
+            ;;
+        3)
+            read -rp "请输入要迁移的文件名关键字 (例如: debian.iso): " FILE_KEYWORD
+            if [ -z "$FILE_KEYWORD" ]; then
+                echo "关键字为空，操作中止并恢复 Aria2 服务。"
+                ${SYSTEMCTL_CMD} start aria2.service
+                return 1
+            fi
+            echo ">> 正在同步匹配文件与 .aria2 校验文件..."
+            rsync -avP "${SRC_DIR}/${FILE_KEYWORD}"* "${DEST_DIR}/" || true
+            ;;
+        *)
+            echo "无效选项，恢复服务并退出。"
+            ${SYSTEMCTL_CMD} start aria2.service
+            return 1
+            ;;
+    esac
+
+    # 3. 替换 session 会话文件中的路径映射
+    if [ -f "${SESSION_FILE}" ]; then
+        echo ">> 正在更新会话文件 (${SESSION_FILE}) 中的路径映射..."
+        ESCAPED_SRC=$(echo "${SRC_DIR}" | sed 's/\//\\\//g')
+        ESCAPED_DEST=$(echo "${DEST_DIR}" | sed 's/\//\\\//g')
+        sed -i "s/${ESCAPED_SRC}/${ESCAPED_DEST}/g" "${SESSION_FILE}"
+    fi
+
+    # 4. 询问是否修改后续全局默认下载目录
+    echo ""
+    read -rp "是否将未来默认下载目录也同步修改为新路径? [y/N 默认: y]: " SYNC_DEFAULT
+    SYNC_DEFAULT="${SYNC_DEFAULT:-Y}"
+    if [[ "$SYNC_DEFAULT" =~ ^[Yy]$ ]]; then
+        sed -i "s|^dir=.*|dir=${DEST_DIR}|g" "${CONF_FILE}"
+        echo ">> 已更新 aria2.conf 默认下载目录为: ${DEST_DIR}"
+    fi
+
+    # 5. 恢复服务
+    echo ">> 正在重新启动 Aria2 服务..."
+    ${SYSTEMCTL_CMD} start aria2.service
+
+    echo ""
+    echo ">> 迁移完成！Aria2 将自动在新磁盘上自检分片并恢复下载。"
+    echo ""
+
+    # 6. 安全清理旧盘空间
+    read -rp "是否删除源磁盘上对应的旧数据以释放空间? [y/N 默认: N]: " CLEAN_OLD
+    CLEAN_OLD="${CLEAN_OLD:-N}"
+    if [[ "$CLEAN_OLD" =~ ^[Yy]$ ]]; then
+        if [ "$MIGRATE_TYPE" == "1" ]; then
+            echo ">> 正在清理已迁移的未完成任务原文件..."
+            for item in "${MIGRATED_ITEMS[@]}"; do
+                rm -rf "${item}"
+            done
+            echo ">> 原磁盘未完成任务数据已清理。"
+        elif [ "$MIGRATE_TYPE" == "2" ]; then
+            read -rp "警告: 即将清空目录 ${SRC_DIR} 下的所有文件，确认继续? [y/N 默认: N]: " CONFIRM_CLEAN
+            CONFIRM_CLEAN="${CONFIRM_CLEAN:-N}"
+            if [[ "$CONFIRM_CLEAN" =~ ^[Yy]$ ]]; then
+                rm -rf "${SRC_DIR:?}"/*
+                echo ">> 原磁盘目录内容已清空。"
+            fi
+        elif [ "$MIGRATE_TYPE" == "3" ]; then
+            rm -rf "${SRC_DIR}/${FILE_KEYWORD}"*
+            echo ">> 原磁盘匹配文件已清理。"
+        fi
+    else
+        echo ">> 已保留原磁盘上的文件。"
+    fi
+}
+
+# ==================== 模块 4: 单独安装/更新 AriaNg (使用 Caddy) ====================
 install_ariang() {
     local target_rpc_port="$1"
 
@@ -387,7 +537,7 @@ EOF
     echo "=========================================="
 }
 
-# ==================== 模块 4: 单独卸载 AriaNg ====================
+# ==================== 模块 5: 单独卸载 AriaNg ====================
 uninstall_ariang() {
     echo ""
     echo "=========================================="
@@ -413,7 +563,7 @@ uninstall_ariang() {
     echo ">> AriaNg 前端卸载流程已完成。"
 }
 
-# ==================== 模块 5: 完整卸载 (全部组件) ====================
+# ==================== 模块 6: 完整卸载 (全部组件) ====================
 uninstall_all() {
     echo ""
     echo "=========================================="
@@ -479,12 +629,13 @@ echo "  当前用户: ${CURRENT_USER} ($([ "$IS_ROOT" = true ] && echo "Root 模
 echo "=========================================="
 echo " 1. 安装 / 重新配置 Aria2 后端 (可选是否带前端)"
 echo " 2. 单独修改下载目录"
-echo " 3. 单独安装 / 更新 AriaNg 前端 (Caddy 反代模式)"
-echo " 4. 单独卸载 AriaNg 前端"
-echo " 5. 完整卸载 (Aria2 + AriaNg + 服务全部清除)"
+echo " 3. 迁移下载任务到新磁盘"
+echo " 4. 单独安装 / 更新 AriaNg 前端 (Caddy 反代模式)"
+echo " 5. 单独卸载 AriaNg 前端"
+echo " 6. 完整卸载 (Aria2 + AriaNg + 服务全部清除)"
 echo " 0. 退出"
 echo "=========================================="
-read -rp "请选择操作 [0-5]: " MENU_CHOICE
+read -rp "请选择操作 [0-6]: " MENU_CHOICE
 
 case "$MENU_CHOICE" in
     1)
@@ -494,12 +645,15 @@ case "$MENU_CHOICE" in
         modify_download_dir
         ;;
     3)
-        install_ariang
+        migrate_downloads
         ;;
     4)
-        uninstall_ariang
+        install_ariang
         ;;
     5)
+        uninstall_ariang
+        ;;
+    6)
         uninstall_all
         ;;
     0)
