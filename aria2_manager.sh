@@ -475,7 +475,26 @@ migrate_downloads() {
 
     install_packages rsync findutils
 
+    # 1. 优先选择迁移范围
+    echo "请先选择迁移范围:"
+    echo " 1. 仅迁移未完成的下载任务 (自动识别 .aria2 校验块、数据与种子元数据)"
+    echo " 2. 迁移整个下载目录的所有数据 (包含已完成与未完成，自动识别元数据)"
+    echo " 3. 仅迁移指定文件/任务 (按关键词匹配，自动识别元数据)"
+    read -rp "请选择 [1-3 默认: 1]: " MIGRATE_TYPE
+    MIGRATE_TYPE="${MIGRATE_TYPE:-1}"
+
+    FILE_KEYWORD=""
+    if [ "$MIGRATE_TYPE" == "3" ]; then
+        read -rp "请输入要迁移的文件名关键字 (例如: debian.iso): " FILE_KEYWORD
+        if [ -z "$FILE_KEYWORD" ]; then
+            echo "关键字不能为空，已取消迁移。"
+            return 1
+        fi
+    fi
+
+    # 2. 再配置迁移路径
     CURRENT_DIR=$(grep -E "^dir=" "${CONF_FILE}" | cut -d'=' -f2 | tr -d '\r')
+    echo ""
     echo "当前默认下载目录为: ${CURRENT_DIR}"
     read -rp "请输入源下载目录 [默认: ${CURRENT_DIR}]: " SRC_DIR
     SRC_DIR="${SRC_DIR:-$CURRENT_DIR}"
@@ -495,15 +514,7 @@ migrate_downloads() {
         echo "目标路径不能为空，请重新输入！"
     done
 
-    echo ""
-    echo "请选择迁移范围:"
-    echo " 1. 仅迁移未完成的下载任务 (自动识别 .aria2 校验块、数据与种子元数据)"
-    echo " 2. 迁移整个下载目录的所有数据 (包含已完成与未完成)"
-    echo " 3. 仅迁移指定文件/任务 (按关键词匹配)"
-    read -rp "请选择 [1-3 默认: 1]: " MIGRATE_TYPE
-    MIGRATE_TYPE="${MIGRATE_TYPE:-1}"
-
-    # 1. 严格停机与等待，防止进程反向写回旧 session
+    # 3. 严格安全停机，防止进程写回覆盖 session
     stop_aria2_safely
 
     mkdir -p "${DEST_DIR}"
@@ -512,7 +523,7 @@ migrate_downloads() {
     fi
     chmod 755 "${DEST_DIR}" 2>/dev/null || true
 
-    declare -a MIGRATED_ITEMS=()
+    declare -a MIGRATED_FILES=()
 
     case "$MIGRATE_TYPE" in
         1)
@@ -524,57 +535,90 @@ migrate_downloads() {
                 return 0
             fi
 
-            echo ">> 发现 ${#ARIA2_CONTROL_FILES[@]} 个未完成任务，开始同步对应数据、控制文件与种子元数据..."
+            echo ">> 发现 ${#ARIA2_CONTROL_FILES[@]} 个未完成任务，正在同步数据文件、控制文件与种子元数据..."
             for ctl in "${ARIA2_CONTROL_FILES[@]}"; do
                 data_target="${ctl%.aria2}"
                 rel_ctl="${ctl#"${SRC_DIR}/"}"
-
                 dest_subdir=$(dirname "${DEST_DIR}/${rel_ctl}")
                 mkdir -p "${dest_subdir}"
 
-                # 1. 同步控制文件
+                # 同步控制文件
                 rsync -avP "${ctl}" "${dest_subdir}/"
-                # 2. 同步数据文件或目录
+                MIGRATED_FILES+=("${ctl}")
+
+                # 同步数据本体
                 if [ -e "${data_target}" ]; then
                     rsync -avP "${data_target}" "${dest_subdir}/"
+                    MIGRATED_FILES+=("${data_target}")
                 fi
-                # 3. 核心修复：同步对应的 .torrent 种子文件（若存在）
+
+                # 同步同名 .torrent
                 if [ -f "${data_target}.torrent" ]; then
                     rsync -avP "${data_target}.torrent" "${dest_subdir}/"
-                    MIGRATED_ITEMS+=("${data_target}.torrent")
+                    MIGRATED_FILES+=("${data_target}.torrent")
                 fi
-
-                MIGRATED_ITEMS+=("${ctl}" "${data_target}")
             done
 
-            # 补充同步：将源目录下存在的 .torrent 种子文件一并同步到新目标目录，防止任务因丢失元数据被丢弃
-            echo ">> 正在补充同步源目录下的所有种子元数据 (*.torrent)..."
-            find "${SRC_DIR}" -maxdepth 1 -name "*.torrent" -exec rsync -avP {} "${DEST_DIR}/" \; 2>/dev/null || true
+            # 抓取源目录下关联的所有 .torrent 文件并同步
+            while IFS= read -r tor; do
+                if [ -f "$tor" ]; then
+                    rsync -avP "$tor" "${DEST_DIR}/"
+                    MIGRATED_FILES+=("$tor")
+                fi
+            done < <(find "${SRC_DIR}" -maxdepth 1 -name "*.torrent")
             ;;
+
         2)
-            echo ">> 正在完整同步下载目录下的所有数据..."
+            echo ">> 正在完整同步下载目录下全部数据、控制文件与种子元数据..."
             rsync -avP "${SRC_DIR}/" "${DEST_DIR}/"
+            # 记录所有顶层条目便于后续完整清理
+            while IFS= read -r item; do
+                [ -e "$item" ] && MIGRATED_FILES+=("$item")
+            done < <(find "${SRC_DIR}" -mindepth 1 -maxdepth 1)
             ;;
+
         3)
-            read -rp "请输入要迁移的文件名关键字 (例如: debian.iso): " FILE_KEYWORD
-            if [ -z "$FILE_KEYWORD" ]; then
-                echo "关键字为空，操作中止并恢复 Aria2 服务。"
+            echo ">> 正在根据关键字 [${FILE_KEYWORD}] 匹配任务并同步..."
+            MATCH_FOUND=false
+            while IFS= read -r item; do
+                MATCH_FOUND=true
+                rel_item="${item#"${SRC_DIR}/"}"
+                dest_subdir=$(dirname "${DEST_DIR}/${rel_item}")
+                mkdir -p "${dest_subdir}"
+
+                rsync -avP "${item}" "${dest_subdir}/"
+                MIGRATED_FILES+=("${item}")
+
+                # 自动识别关联的 .aria2 控制文件
+                if [ -f "${item}.aria2" ]; then
+                    rsync -avP "${item}.aria2" "${dest_subdir}/"
+                    MIGRATED_FILES+=("${item}.aria2")
+                fi
+                # 自动识别关联的 .torrent 种子文件
+                if [ -f "${item}.torrent" ]; then
+                    rsync -avP "${item}.torrent" "${dest_subdir}/"
+                    MIGRATED_FILES+=("${item}.torrent")
+                fi
+            done < <(find "${SRC_DIR}" -name "*${FILE_KEYWORD}*" ! -name "*.aria2" ! -name "*.torrent")
+
+            # 匹配直接以关键字命名的种子或控制文件
+            while IFS= read -r ext_file; do
+                MATCH_FOUND=true
+                rsync -avP "${ext_file}" "${DEST_DIR}/"
+                MIGRATED_FILES+=("${ext_file}")
+            done < <(find "${SRC_DIR}" -maxdepth 1 -name "*${FILE_KEYWORD}*.torrent" -o -name "*${FILE_KEYWORD}*.aria2")
+
+            if [ "$MATCH_FOUND" = false ]; then
+                echo "未匹配到任何包含关键字 [${FILE_KEYWORD}] 的文件。"
                 ${SYSTEMCTL_CMD} start aria2.service
-                return 1
+                return 0
             fi
-            echo ">> 正在同步匹配文件、校验文件与种子元数据..."
-            rsync -avP "${SRC_DIR}/${FILE_KEYWORD}"* "${DEST_DIR}/" || true
-            ;;
-        *)
-            echo "无效选项，恢复服务并退出。"
-            ${SYSTEMCTL_CMD} start aria2.service
-            return 1
             ;;
     esac
 
-    # 3. 核心修复：全面更新 session 文件中的所有旧路径（包含首行的 .torrent 路径和 dir= 路径）
+    # 4. 全面替换 session 会话文件中的路径映射（包含首行种子文件路径与 dir= 路径）
     if [ -f "${SESSION_FILE}" ] && [ -s "${SESSION_FILE}" ]; then
-        echo ">> 正在更新会话文件 (${SESSION_FILE}) 中的全部路径映射..."
+        echo ">> 正在更新会话文件 (${SESSION_FILE}) 中的路径映射..."
         cp "${SESSION_FILE}" "${SESSION_FILE}.bak"
         sed -i "s|${SRC_DIR}|${DEST_DIR}|g" "${SESSION_FILE}"
     fi
@@ -587,18 +631,17 @@ migrate_downloads() {
         echo ">> 已更新 aria2.conf 默认下载目录为: ${DEST_DIR}"
     fi
 
-    # 4. 恢复服务
+    # 5. 重新启动服务
     echo ">> 正在启动 Aria2 服务恢复下载..."
     ${SYSTEMCTL_CMD} start aria2.service
 
     echo ""
     echo ">> 迁移完成！Aria2 已重新载入元数据并开始自检校验断点。"
-    echo ">> 提示: 若在 AriaNg 中任务显示为“暂停”，只需手动点击“开始”即可立即恢复传输。"
     echo ""
 
-    # 5. 清理旧盘空间
+    # 6. 安全清理源磁盘旧数据
     if [ "$MIGRATE_TYPE" == "1" ] || [ "$MIGRATE_TYPE" == "3" ]; then
-        read -rp "是否删除源磁盘上对应的旧数据以释放空间? [Y/n 默认: Y]: " CLEAN_OLD
+        read -rp "是否删除源磁盘上对应的旧数据 (含数据、.aria2 及种子) 以释放空间? [Y/n 默认: Y]: " CLEAN_OLD
         CLEAN_OLD="${CLEAN_OLD:-Y}"
     else
         read -rp "是否清空源下载目录的所有文件以释放空间? [y/N 默认: N]: " CLEAN_OLD
@@ -606,22 +649,23 @@ migrate_downloads() {
     fi
 
     if [[ "$CLEAN_OLD" =~ ^[Yy]$ ]]; then
-        if [ "$MIGRATE_TYPE" == "1" ]; then
-            echo ">> 正在清理已迁移的未完成任务原文件..."
-            for item in "${MIGRATED_ITEMS[@]}"; do
-                rm -rf "${item}"
-            done
-            echo ">> 原磁盘未完成任务数据已清理。"
-        elif [ "$MIGRATE_TYPE" == "2" ]; then
+        if [ "$MIGRATE_TYPE" == "2" ]; then
             read -rp "警告: 即将清空目录 ${SRC_DIR} 下的所有文件，确认继续? [y/N 默认: N]: " CONFIRM_CLEAN
             CONFIRM_CLEAN="${CONFIRM_CLEAN:-N}"
             if [[ "$CONFIRM_CLEAN" =~ ^[Yy]$ ]]; then
                 rm -rf "${SRC_DIR:?}"/*
-                echo ">> 原磁盘目录内容已清空。"
+                echo ">> 原磁盘目录内容已完全清空。"
             fi
-        elif [ "$MIGRATE_TYPE" == "3" ]; then
-            rm -rf "${SRC_DIR}/${FILE_KEYWORD}"*
-            echo ">> 原磁盘匹配文件已清理。"
+        else
+            echo ">> 正在清理已迁移的原文件、校验文件及关联种子文件..."
+            # 数组去重并清理
+            eval "UNIQUE_FILES=($(printf "%q\n" "${MIGRATED_FILES[@]}" | sort -u))"
+            for f in "${UNIQUE_FILES[@]}"; do
+                if [ -e "$f" ]; then
+                    rm -rf "$f"
+                fi
+            done
+            echo ">> 原磁盘相关数据已彻底清理完毕。"
         fi
     else
         echo ">> 已保留原磁盘上的文件。"
