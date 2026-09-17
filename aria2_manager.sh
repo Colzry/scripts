@@ -18,13 +18,15 @@ else
     SYSTEMCTL_CMD="systemctl --user"
 fi
 
-CONF_FILE="${USER_HOME}/.aria2/aria2.conf"
-SESSION_FILE="${USER_HOME}/.aria2/aria2.session"
+ARIA2_CONF_DIR="${USER_HOME}/.aria2"
+CONF_FILE="${ARIA2_CONF_DIR}/aria2.conf"
+SESSION_FILE="${ARIA2_CONF_DIR}/aria2.session"
+TRACKER_SCRIPT="${ARIA2_CONF_DIR}/scripts/update_tracker.sh"
 DEFAULT_DOWNLOAD_DIR="${USER_HOME}/Downloads"
 DEFAULT_PORT="6800"
 DEFAULT_ARIANG_PORT="6880"
 GH_PROXY="https://gitpy.223327.xyz/https://github.com"
-ARIANG_DIR="${USER_HOME}/.aria2/ariang"
+ARIANG_DIR="${ARIA2_CONF_DIR}/ariang"
 
 # ==================== 基础依赖检测 ====================
 install_packages() {
@@ -39,6 +41,19 @@ install_packages() {
     fi
 }
 
+# ==================== 进程安全停机与等待 ====================
+stop_aria2_safely() {
+    echo ">> 正在平稳停止 Aria2 服务以刷新保存 session..."
+    ${SYSTEMCTL_CMD} stop aria2.service 2>/dev/null || true
+    
+    # 轮询等待进程彻底退出，避免写盘竞态覆盖
+    local timeout=10
+    while pgrep -u "$CURRENT_USER" -x aria2c &>/dev/null && [ $timeout -gt 0 ]; do
+        sleep 0.5
+        ((timeout--))
+    done
+}
+
 # ==================== 安装 Caddy ====================
 ensure_caddy() {
     if command -v caddy &>/dev/null; then
@@ -50,8 +65,8 @@ ensure_caddy() {
     if command -v apt-get &>/dev/null; then
         ${SUDO_CMD} apt-get update -y
         ${SUDO_CMD} apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gpg
-        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | ${SUDO_CMD} gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | ${SUDO_CMD} tee /etc/apt/sources.list.d/caddy-stable.list
+        curl -1sLf --connect-timeout 10 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | ${SUDO_CMD} gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+        curl -1sLf --connect-timeout 10 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | ${SUDO_CMD} tee /etc/apt/sources.list.d/caddy-stable.list
         ${SUDO_CMD} apt-get update -y
         ${SUDO_CMD} apt-get install -y caddy
     elif command -v pacman &>/dev/null; then
@@ -96,15 +111,15 @@ remove_caddy_package() {
 
 # ==================== 生成 Tracker 更新脚本 ====================
 ensure_tracker_script() {
-    mkdir -p "${USER_HOME}/.aria2/scripts"
-    cat > "${USER_HOME}/.aria2/scripts/update_tracker.sh" <<EOF
+    mkdir -p "${ARIA2_CONF_DIR}/scripts"
+    cat > "${TRACKER_SCRIPT}" <<EOF
 #!/usr/bin/env bash
 CONF_FILE="${CONF_FILE}"
 TRACKER_URL1="https://bitbucket.org/xiu2/trackerslistcollection/raw/master/all.txt"
 TRACKER_URL2="https://cdn.jsdelivr.net/gh/ngosang/trackerslist@master/trackers_all.txt"
 
 echo "正在从多源获取最新 Tracker 列表..."
-list=\$( (curl -sSL "\${TRACKER_URL1}"; echo ""; curl -sSL "\${TRACKER_URL2}") | tr -d '\r' | sed '/^$/d' | sort -u | paste -sd "," - )
+list=\$( (curl -sSL --connect-timeout 10 -m 30 "\${TRACKER_URL1}"; echo ""; curl -sSL --connect-timeout 10 -m 30 "\${TRACKER_URL2}") | tr -d '\r' | sed '/^$/d' | sort -u | paste -sd "," - )
 
 if [ -z "\$list" ]; then
     echo "获取失败，列表为空。"
@@ -120,7 +135,7 @@ fi
 echo "Tracker 更新成功！已自动去重合并。"
 ${SYSTEMCTL_CMD} restart aria2.service
 EOF
-    chmod +x "${USER_HOME}/.aria2/scripts/update_tracker.sh"
+    chmod +x "${TRACKER_SCRIPT}"
 }
 
 # ==================== 模块 1: 安装 Aria2 后端 ====================
@@ -132,6 +147,7 @@ install_aria2() {
 
     read -rp "请输入下载目录路径 [默认: ${DEFAULT_DOWNLOAD_DIR}]: " INPUT_DIR
     DOWNLOAD_DIR="${INPUT_DIR:-$DEFAULT_DOWNLOAD_DIR}"
+    DOWNLOAD_DIR="${DOWNLOAD_DIR%/}"
 
     read -rp "请输入 Aria2 RPC 监听端口 [默认: ${DEFAULT_PORT}]: " INPUT_PORT
     RPC_PORT="${INPUT_PORT:-$DEFAULT_PORT}"
@@ -156,6 +172,7 @@ install_aria2() {
     echo "RPC 密钥: ${RPC_SECRET}"
     echo "顺带安装 AriaNg: $([[ "$WITH_ARIANG" =~ ^[Yy]$ ]] && echo "是" || echo "否")"
     echo "Tracker 自动更新: 默认开启 (每日定时)"
+    echo "种子文件保留: 默认关闭 (下载后自动删除种子)"
     echo "======================"
     read -rp "确认开始安装 Aria2? [Y/n 默认: Y]: " CONFIRM
     CONFIRM="${CONFIRM:-Y}"
@@ -176,8 +193,9 @@ install_aria2() {
     ${SUDO_CMD} chmod +x /usr/bin/aria2c
     rm -rf "${TMP_DIR}"
 
+    # 预先创建配置与下载目录
     mkdir -p "${DOWNLOAD_DIR}"
-    mkdir -p "${USER_HOME}/.aria2"
+    mkdir -p "${ARIA2_CONF_DIR}"
     touch "${SESSION_FILE}"
 
     echo ">> 写入 aria2.conf..."
@@ -208,6 +226,8 @@ rpc-listen-port=${RPC_PORT}
 rpc-secret=${RPC_SECRET}
 
 ## BT/PT 设置 ##
+bt-save-metadata=false
+follow-torrent=mem
 bt-tracker=
 EOF
 
@@ -222,7 +242,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/aria2c --conf-path=${USER_HOME}/.aria2/aria2.conf
+ExecStart=/usr/bin/aria2c --conf-path=${CONF_FILE}
 Restart=on-failure
 
 [Install]
@@ -236,7 +256,7 @@ After=network.target
 
 [Service]
 Type=oneshot
-ExecStart=${USER_HOME}/.aria2/scripts/update_tracker.sh
+ExecStart=${TRACKER_SCRIPT}
 EOF
 
     ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2-update-tracker.timer'" <<EOF
@@ -256,7 +276,7 @@ EOF
     ${SYSTEMCTL_CMD} enable --now aria2.service
     ${SYSTEMCTL_CMD} enable --now aria2-update-tracker.timer
 
-    bash "${USER_HOME}/.aria2/scripts/update_tracker.sh" 2>/dev/null || true
+    bash "${TRACKER_SCRIPT}" 2>/dev/null || true
 
     if [ "$IS_ROOT" = false ] && command -v loginctl &>/dev/null; then
         sudo loginctl enable-linger "${CURRENT_USER}" 2>/dev/null || true
@@ -267,6 +287,7 @@ EOF
     echo "   RPC 端口: ${RPC_PORT}"
     echo "   RPC 密钥: ${RPC_SECRET}"
     echo "   Tracker 自动更新定时器已就绪并开机启动。"
+    echo "   BT 种子自动清理配置已生效。"
 
     if [[ "$WITH_ARIANG" =~ ^[Yy]$ ]]; then
         install_ariang "${RPC_PORT}"
@@ -294,6 +315,7 @@ modify_download_dir() {
         echo "输入为空，未做任何修改。"
         return 0
     fi
+    NEW_DIR="${NEW_DIR%/}"
 
     echo ">> 正在检查并创建目录: ${NEW_DIR}..."
     mkdir -p "${NEW_DIR}"
@@ -333,7 +355,7 @@ update_trackers_menu() {
     if [ "$TRACKER_CHOICE" == "1" ]; then
         ensure_tracker_script
         echo ">> 正在执行 Tracker 更新脚本..."
-        bash "${USER_HOME}/.aria2/scripts/update_tracker.sh"
+        bash "${TRACKER_SCRIPT}"
     elif [ "$TRACKER_CHOICE" == "2" ]; then
         echo ""
         echo "请输入或粘贴 Tracker 列表 (可为逗号分隔，也可为多行粘贴，输入完成后在新行输入 EOF 并回车结束):"
@@ -402,7 +424,7 @@ After=network.target
 
 [Service]
 Type=oneshot
-ExecStart=${USER_HOME}/.aria2/scripts/update_tracker.sh
+ExecStart=${TRACKER_SCRIPT}
 EOF
 
             ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2-update-tracker.timer'" <<EOF
@@ -459,6 +481,7 @@ migrate_downloads() {
     echo "当前默认下载目录为: ${CURRENT_DIR}"
     read -rp "请输入源下载目录 [默认: ${CURRENT_DIR}]: " SRC_DIR
     SRC_DIR="${SRC_DIR:-$CURRENT_DIR}"
+    SRC_DIR="${SRC_DIR%/}"
 
     if [ ! -d "${SRC_DIR}" ]; then
         echo "错误: 源目录 ${SRC_DIR} 不存在！"
@@ -468,6 +491,7 @@ migrate_downloads() {
     while true; do
         read -rp "请输入目标新磁盘目录绝对路径 (例如: /mnt/disk2/Downloads): " DEST_DIR
         if [ -n "$DEST_DIR" ]; then
+            DEST_DIR="${DEST_DIR%/}"
             break
         fi
         echo "目标路径不能为空，请重新输入！"
@@ -481,10 +505,15 @@ migrate_downloads() {
     read -rp "请选择 [1-3 默认: 1]: " MIGRATE_TYPE
     MIGRATE_TYPE="${MIGRATE_TYPE:-1}"
 
-    echo ">> 正在停止 Aria2 服务，保护进度与控制文件..."
-    ${SYSTEMCTL_CMD} stop aria2.service
+    # 1. 严格停机与等待，防止进程反向覆盖 session
+    stop_aria2_safely
 
     mkdir -p "${DEST_DIR}"
+    # 确保新磁盘权限对当前用户可读写
+    if [ "$IS_ROOT" = false ]; then
+        ${SUDO_CMD} chown -R "${CURRENT_USER}:${CURRENT_USER}" "${DEST_DIR}" 2>/dev/null || true
+    fi
+    chmod 755 "${DEST_DIR}" 2>/dev/null || true
 
     declare -a MIGRATED_ITEMS=()
 
@@ -502,7 +531,6 @@ migrate_downloads() {
             for ctl in "${ARIA2_CONTROL_FILES[@]}"; do
                 data_target="${ctl%.aria2}"
                 rel_ctl="${ctl#"${SRC_DIR}/"}"
-                rel_data="${data_target#"${SRC_DIR}/"}"
 
                 dest_subdir=$(dirname "${DEST_DIR}/${rel_ctl}")
                 mkdir -p "${dest_subdir}"
@@ -536,29 +564,31 @@ migrate_downloads() {
             ;;
     esac
 
-    if [ -f "${SESSION_FILE}" ]; then
+    # 3. 安全更新 session 路径映射（备份原文件）
+    if [ -f "${SESSION_FILE}" ] && [ -s "${SESSION_FILE}" ]; then
         echo ">> 正在更新会话文件 (${SESSION_FILE}) 中的路径映射..."
-        ESCAPED_SRC=$(echo "${SRC_DIR}" | sed 's/\//\\\//g')
-        ESCAPED_DEST=$(echo "${DEST_DIR}" | sed 's/\//\\\//g')
-        sed -i "s/${ESCAPED_SRC}/${ESCAPED_DEST}/g" "${SESSION_FILE}"
+        cp "${SESSION_FILE}" "${SESSION_FILE}.bak"
+        # 使用管道符精确匹配替换，避免斜杠冲突
+        sed -i "s|${SRC_DIR}|${DEST_DIR}|g" "${SESSION_FILE}"
     fi
 
     echo ""
-    read -rp "是否将未来默认下载目录也同步修改为新路径? [y/N 默认: y]: " SYNC_DEFAULT
+    read -rp "是否将未来默认下载目录也同步修改为新路径? [Y/n 默认: Y]: " SYNC_DEFAULT
     SYNC_DEFAULT="${SYNC_DEFAULT:-Y}"
     if [[ "$SYNC_DEFAULT" =~ ^[Yy]$ ]]; then
         sed -i "s|^dir=.*|dir=${DEST_DIR}|g" "${CONF_FILE}"
         echo ">> 已更新 aria2.conf 默认下载目录为: ${DEST_DIR}"
     fi
 
-    echo ">> 正在重新启动 Aria2 服务..."
+    # 4. 恢复服务
+    echo ">> 正在启动 Aria2 服务恢复下载..."
     ${SYSTEMCTL_CMD} start aria2.service
 
     echo ""
-    echo ">> 迁移完成！Aria2 将自动在新磁盘上自检分片并恢复下载。"
+    echo ">> 迁移完成！Aria2 将自动在新磁盘上自检分片并在 AriaNg 中继续显示进度。"
     echo ""
 
-    # 1 和 3 默认删除旧数据释放空间；2 仍安全默认保留
+    # 5. 清理旧盘空间
     if [ "$MIGRATE_TYPE" == "1" ] || [ "$MIGRATE_TYPE" == "3" ]; then
         read -rp "是否删除源磁盘上对应的旧数据以释放空间? [Y/n 默认: Y]: " CLEAN_OLD
         CLEAN_OLD="${CLEAN_OLD:-Y}"
@@ -616,7 +646,7 @@ install_ariang() {
 
     echo ">> 正在从 GitHub 官方 API 探测 AriaNg 最新版本..."
     ARIANG_API="https://api.github.com/repos/mayswind/AriaNg/releases/latest"
-    ARIANG_TAG=$(curl -sSL "${ARIANG_API}" | grep -Po '"tag_name":\s*"\K[^"]*' || true)
+    ARIANG_TAG=$(curl -sSL --connect-timeout 10 -m 20 "${ARIANG_API}" | grep -Po '"tag_name":\s*"\K[^"]*' || true)
 
     if [ -z "$ARIANG_TAG" ]; then
         echo ">> 提示: 获取官方 API 失败或受速率限制，启用兜底版本 1.3.14"
@@ -627,7 +657,7 @@ install_ariang() {
 
     echo ">> 正在下载 AriaNg (${ARIANG_TAG} All-In-One)..."
     mkdir -p "${ARIANG_DIR}"
-    chmod o+rx "${USER_HOME}" "${USER_HOME}/.aria2" "${ARIANG_DIR}" 2>/dev/null || true
+    chmod o+rx "${USER_HOME}" "${ARIA2_CONF_DIR}" "${ARIANG_DIR}" 2>/dev/null || true
 
     ARIANG_DL_URL="${GH_PROXY}/mayswind/AriaNg/releases/download/${ARIANG_TAG}/AriaNg-${ARIANG_TAG}-AllInOne.zip"
     TMP_ARIANG=$(mktemp -d)
@@ -733,11 +763,11 @@ uninstall_all() {
         ${SUDO_CMD} rm -f /usr/bin/aria2c
     fi
 
-    read -rp "是否删除配置及脚本目录 (${USER_HOME}/.aria2)? [y/N 默认: N]: " DEL_CONFIG
+    read -rp "是否删除配置及脚本目录 (${ARIA2_CONF_DIR})? [y/N 默认: N]: " DEL_CONFIG
     DEL_CONFIG="${DEL_CONFIG:-N}"
     if [[ "$DEL_CONFIG" =~ ^[Yy]$ ]]; then
-        rm -rf "${USER_HOME}/.aria2"
-        echo "已清理配置目录: ${USER_HOME}/.aria2"
+        rm -rf "${ARIA2_CONF_DIR}"
+        echo "已清理配置目录: ${ARIA2_CONF_DIR}"
     fi
 
     read -rp "是否清理下载目录? (强烈建议保留) [y/N 默认: N]: " DEL_DOWNLOADS
@@ -756,54 +786,35 @@ uninstall_all() {
     echo ">> 所有组件卸载完成。"
 }
 
-# ==================== 主入口菜单 ====================
-echo "=========================================="
-echo "          Aria2 & AriaNg 综合管理          "
-echo "  当前用户: ${CURRENT_USER} ($([ "$IS_ROOT" = true ] && echo "Root 模式" || echo "普通用户模式"))"
-echo "=========================================="
-echo " 1. 安装 / 重新配置 Aria2 后端 (默认启用 Tracker 自动更新)"
-echo " 2. 单独修改下载目录"
-echo " 3. 手动更新 / 设置 BT Trackers (双源拉取 / 自定义)"
-echo " 4. 启用 / 停用 Trackers 自动更新 (定时器管理)"
-echo " 5. 迁移下载任务到新磁盘"
-echo " 6. 单独安装 / 更新 AriaNg 前端 (Caddy 反代模式)"
-echo " 7. 单独卸载 AriaNg 前端"
-echo " 8. 完整卸载 (Aria2 + AriaNg + 服务全部清除)"
-echo " 0. 退出"
-echo "=========================================="
-read -rp "请选择操作 [0-8]: " MENU_CHOICE
+# ==================== 主入口循环菜单 ====================
+while true; do
+    echo ""
+    echo "=========================================="
+    echo "          Aria2 & AriaNg 综合管理          "
+    echo "  当前用户: ${CURRENT_USER} ($([ "$IS_ROOT" = true ] && echo "Root 模式" || echo "普通用户模式"))"
+    echo "=========================================="
+    echo " 1. 安装 / 重新配置 Aria2 后端 (默认启用 Tracker 自动更新)"
+    echo " 2. 单独修改下载目录"
+    echo " 3. 手动更新 / 设置 BT Trackers (双源拉取 / 自定义)"
+    echo " 4. 启用 / 停用 Trackers 自动更新 (定时器管理)"
+    echo " 5. 迁移下载任务到新磁盘"
+    echo " 6. 单独安装 / 更新 AriaNg 前端 (Caddy 反代模式)"
+    echo " 7. 单独卸载 AriaNg 前端"
+    echo " 8. 完整卸载 (Aria2 + AriaNg + 服务全部清除)"
+    echo " 0. 退出"
+    echo "=========================================="
+    read -rp "请选择操作 [0-8]: " MENU_CHOICE
 
-case "$MENU_CHOICE" in
-    1)
-        install_aria2
-        ;;
-    2)
-        modify_download_dir
-        ;;
-    3)
-        update_trackers_menu
-        ;;
-    4)
-        manage_tracker_timer
-        ;;
-    5)
-        migrate_downloads
-        ;;
-    6)
-        install_ariang
-        ;;
-    7)
-        uninstall_ariang
-        ;;
-    8)
-        uninstall_all
-        ;;
-    0)
-        echo "已退出。"
-        exit 0
-        ;;
-    *)
-        echo "无效选项，已退出。"
-        exit 1
-        ;;
-esac
+    case "$MENU_CHOICE" in
+        1) install_aria2 ;;
+        2) modify_download_dir ;;
+        3) update_trackers_menu ;;
+        4) manage_tracker_timer ;;
+        5) migrate_downloads ;;
+        6) install_ariang ;;
+        7) uninstall_ariang ;;
+        8) uninstall_all; break ;;
+        0) echo "已退出。"; exit 0 ;;
+        *) echo "无效选项，请重新选择。" ;;
+    esac
+done
