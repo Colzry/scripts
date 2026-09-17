@@ -18,6 +18,7 @@ else
     SYSTEMCTL_CMD="systemctl --user"
 fi
 
+CONF_FILE="${USER_HOME}/.aria2/aria2.conf"
 DEFAULT_DOWNLOAD_DIR="${USER_HOME}/Downloads"
 DEFAULT_PORT="6800"
 DEFAULT_ARIANG_PORT="6880"
@@ -149,7 +150,7 @@ install_aria2() {
     touch "${USER_HOME}/.aria2/aria2.session"
 
     echo ">> 写入 aria2.conf..."
-    cat > "${USER_HOME}/.aria2/aria2.conf" <<EOF
+    cat > "${CONF_FILE}" <<EOF
 ## 文件保存设置 ##
 dir=${DOWNLOAD_DIR}
 disk-cache=64M
@@ -181,11 +182,15 @@ EOF
 
     cat > "${USER_HOME}/.aria2/scripts/update_tracker.sh" <<EOF
 #!/usr/bin/env bash
-CONF_FILE="${USER_HOME}/.aria2/aria2.conf"
-TRACKER_URL="https://bitbucket.org/xiu2/trackerslistcollection/raw/master/best.txt"
+CONF_FILE="${CONF_FILE}"
+TRACKER_URL1="https://bitbucket.org/xiu2/trackerslistcollection/raw/master/all.txt"
+TRACKER_URL2="https://cdn.jsdelivr.net/gh/ngosang/trackerslist@master/trackers_all.txt"
 
-list=\$(curl -sSL "\${TRACKER_URL}" | sed '/^$/d' | paste -sd "," -)
+echo "正在从多源获取最新 Tracker 列表..."
+list=\$( (curl -sSL "\${TRACKER_URL1}"; echo ""; curl -sSL "\${TRACKER_URL2}") | tr -d '\r' | sed '/^$/d' | sort -u | paste -sd "," - )
+
 if [ -z "\$list" ]; then
+    echo "获取失败，列表为空。"
     exit 1
 fi
 
@@ -195,6 +200,7 @@ else
     echo "bt-tracker=\${list}" >> "\$CONF_FILE"
 fi
 
+echo "Tracker 更新成功！已自动去重合并。"
 ${SYSTEMCTL_CMD} restart aria2.service
 EOF
     chmod +x "${USER_HOME}/.aria2/scripts/update_tracker.sh"
@@ -258,7 +264,49 @@ EOF
     fi
 }
 
-# ==================== 模块 2: 单独安装/更新 AriaNg (使用 Caddy) ====================
+# ==================== 模块 2: 单独修改下载目录 ====================
+modify_download_dir() {
+    echo ""
+    echo "=========================================="
+    echo "         单独配置 Aria2 下载目录          "
+    echo "=========================================="
+
+    if [ ! -f "${CONF_FILE}" ]; then
+        echo "未检测到配置文件: ${CONF_FILE}，请先执行安装 Aria2！"
+        return 1
+    fi
+
+    # 获取当前配置中的下载目录
+    CURRENT_DIR=$(grep -E "^dir=" "${CONF_FILE}" | cut -d'=' -f2 | tr -d '\r')
+    echo "当前下载目录: ${CURRENT_DIR:-未设置}"
+    echo ""
+
+    read -rp "请输入新的下载目录绝对路径 [留空取消]: " NEW_DIR
+    if [ -z "$NEW_DIR" ]; then
+        echo "输入为空，未做任何修改。"
+        return 0
+    fi
+
+    # 创建新目录
+    echo ">> 正在检查并创建目录: ${NEW_DIR}..."
+    mkdir -p "${NEW_DIR}"
+
+    # 替换配置文件中的路径
+    if grep -q "^dir=" "${CONF_FILE}"; then
+        sed -i "s|^dir=.*|dir=${NEW_DIR}|g" "${CONF_FILE}"
+    else
+        echo "dir=${NEW_DIR}" >> "${CONF_FILE}"
+    fi
+
+    echo ">> 正在重启 Aria2 服务以应用新路径..."
+    ${SYSTEMCTL_CMD} restart aria2.service
+
+    echo ""
+    echo ">> 下载目录已成功修改为: ${NEW_DIR}"
+    echo ">> Aria2 服务重启完成。"
+}
+
+# ==================== 模块 3: 单独安装/更新 AriaNg (使用 Caddy) ====================
 install_ariang() {
     local target_rpc_port="$1"
 
@@ -268,8 +316,8 @@ install_ariang() {
     echo "=========================================="
 
     if [ -z "$target_rpc_port" ]; then
-        if [ -f "${USER_HOME}/.aria2/aria2.conf" ]; then
-            target_rpc_port=$(grep -E "^rpc-listen-port=" "${USER_HOME}/.aria2/aria2.conf" | cut -d'=' -f2 | tr -d ' \r')
+        if [ -f "${CONF_FILE}" ]; then
+            target_rpc_port=$(grep -E "^rpc-listen-port=" "${CONF_FILE}" | cut -d'=' -f2 | tr -d ' \r')
         fi
         target_rpc_port="${target_rpc_port:-$DEFAULT_PORT}"
         read -rp "请输入后端的 Aria2 RPC 端口 [默认: ${target_rpc_port}]: " INPUT_TARGET_PORT
@@ -282,7 +330,6 @@ install_ariang() {
     ensure_caddy
     install_packages curl wget unzip
 
-    # 直接访问 GitHub 官方 API（不走反代）
     echo ">> 正在从 GitHub 官方 API 探测 AriaNg 最新版本..."
     ARIANG_API="https://api.github.com/repos/mayswind/AriaNg/releases/latest"
     ARIANG_TAG=$(curl -sSL "${ARIANG_API}" | grep -Po '"tag_name":\s*"\K[^"]*' || true)
@@ -298,7 +345,6 @@ install_ariang() {
     mkdir -p "${ARIANG_DIR}"
     chmod o+rx "${USER_HOME}" "${USER_HOME}/.aria2" "${ARIANG_DIR}" 2>/dev/null || true
 
-    # 实际下载文件时走反代
     ARIANG_DL_URL="${GH_PROXY}/mayswind/AriaNg/releases/download/${ARIANG_TAG}/AriaNg-${ARIANG_TAG}-AllInOne.zip"
     TMP_ARIANG=$(mktemp -d)
     wget -q --show-progress -O "${TMP_ARIANG}/ariang.zip" "${ARIANG_DL_URL}"
@@ -341,7 +387,7 @@ EOF
     echo "=========================================="
 }
 
-# ==================== 模块 3: 单独卸载 AriaNg ====================
+# ==================== 模块 4: 单独卸载 AriaNg ====================
 uninstall_ariang() {
     echo ""
     echo "=========================================="
@@ -367,7 +413,7 @@ uninstall_ariang() {
     echo ">> AriaNg 前端卸载流程已完成。"
 }
 
-# ==================== 模块 4: 完整卸载 (全部组件) ====================
+# ==================== 模块 5: 完整卸载 (全部组件) ====================
 uninstall_all() {
     echo ""
     echo "=========================================="
@@ -432,24 +478,28 @@ echo "          Aria2 & AriaNg 综合管理          "
 echo "  当前用户: ${CURRENT_USER} ($([ "$IS_ROOT" = true ] && echo "Root 模式" || echo "普通用户模式"))"
 echo "=========================================="
 echo " 1. 安装 / 重新配置 Aria2 后端 (可选是否带前端)"
-echo " 2. 单独安装 / 更新 AriaNg 前端 (Caddy 反代模式)"
-echo " 3. 单独卸载 AriaNg 前端"
-echo " 4. 完整卸载 (Aria2 + AriaNg + 服务全部清除)"
+echo " 2. 单独修改下载目录"
+echo " 3. 单独安装 / 更新 AriaNg 前端 (Caddy 反代模式)"
+echo " 4. 单独卸载 AriaNg 前端"
+echo " 5. 完整卸载 (Aria2 + AriaNg + 服务全部清除)"
 echo " 0. 退出"
 echo "=========================================="
-read -rp "请选择操作 [0-4]: " MENU_CHOICE
+read -rp "请选择操作 [0-5]: " MENU_CHOICE
 
 case "$MENU_CHOICE" in
     1)
         install_aria2
         ;;
     2)
-        install_ariang
+        modify_download_dir
         ;;
     3)
-        uninstall_ariang
+        install_ariang
         ;;
     4)
+        uninstall_ariang
+        ;;
+    5)
         uninstall_all
         ;;
     0)
