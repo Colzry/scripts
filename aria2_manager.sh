@@ -571,7 +571,6 @@ migrate_downloads() {
         2)
             echo ">> 正在完整同步下载目录下全部数据、控制文件与种子元数据..."
             rsync -avP "${SRC_DIR}/" "${DEST_DIR}/"
-            # 记录所有顶层条目便于后续完整清理
             while IFS= read -r item; do
                 [ -e "$item" ] && MIGRATED_FILES+=("$item")
             done < <(find "${SRC_DIR}" -mindepth 1 -maxdepth 1)
@@ -601,7 +600,6 @@ migrate_downloads() {
                 fi
             done < <(find "${SRC_DIR}" -name "*${FILE_KEYWORD}*" ! -name "*.aria2" ! -name "*.torrent")
 
-            # 匹配直接以关键字命名的种子或控制文件
             while IFS= read -r ext_file; do
                 MATCH_FOUND=true
                 rsync -avP "${ext_file}" "${DEST_DIR}/"
@@ -616,7 +614,7 @@ migrate_downloads() {
             ;;
     esac
 
-    # 4. 全面替换 session 会话文件中的路径映射（包含首行种子文件路径与 dir= 路径）
+    # 4. 全面替换 session 会话文件中的路径映射
     if [ -f "${SESSION_FILE}" ] && [ -s "${SESSION_FILE}" ]; then
         echo ">> 正在更新会话文件 (${SESSION_FILE}) 中的路径映射..."
         cp "${SESSION_FILE}" "${SESSION_FILE}.bak"
@@ -658,7 +656,6 @@ migrate_downloads() {
             fi
         else
             echo ">> 正在清理已迁移的原文件、校验文件及关联种子文件..."
-            # 数组去重并清理
             eval "UNIQUE_FILES=($(printf "%q\n" "${MIGRATED_FILES[@]}" | sort -u))"
             for f in "${UNIQUE_FILES[@]}"; do
                 if [ -e "$f" ]; then
@@ -672,7 +669,112 @@ migrate_downloads() {
     fi
 }
 
-# ==================== 模块 6: 单独安装/更新 AriaNg (使用 Caddy) ====================
+# ==================== 模块 6: 扫描并恢复未完成种子任务 ====================
+scan_and_resume_torrents() {
+    echo ""
+    echo "=========================================="
+    echo "    扫描目录并恢复未完成种子断点下载      "
+    echo "=========================================="
+
+    if [ ! -f "${CONF_FILE}" ]; then
+        echo "错误: 未找到配置文件 ${CONF_FILE}，请先确认 Aria2 是否已安装。"
+        return 1
+    fi
+
+    install_packages curl
+
+    # 提取当前 RPC 端口与 Secret
+    RPC_PORT=$(grep -E "^rpc-listen-port=" "${CONF_FILE}" | cut -d'=' -f2 | tr -d ' \r')
+    RPC_PORT="${RPC_PORT:-$DEFAULT_PORT}"
+    RPC_SECRET=$(grep -E "^rpc-secret=" "${CONF_FILE}" | cut -d'=' -f2 | tr -d ' \r')
+
+    # 确认 Aria2 进程已在运行
+    if ! ${SYSTEMCTL_CMD} is-active --quiet aria2.service 2>/dev/null; then
+        echo ">> 检测到 Aria2 服务未运行，正在启动..."
+        ${SYSTEMCTL_CMD} start aria2.service
+        sleep 1
+    fi
+
+    CURRENT_DIR=$(grep -E "^dir=" "${CONF_FILE}" | cut -d'=' -f2 | tr -d '\r')
+    read -rp "请输入要扫描的种子所在目录 [默认: ${CURRENT_DIR:-$DEFAULT_DOWNLOAD_DIR}]: " TARGET_SCAN_DIR
+    TARGET_SCAN_DIR="${TARGET_SCAN_DIR:-$CURRENT_DIR}"
+    TARGET_SCAN_DIR="${TARGET_SCAN_DIR:-$DEFAULT_DOWNLOAD_DIR}"
+    TARGET_SCAN_DIR="${TARGET_SCAN_DIR%/}"
+
+    if [ ! -d "${TARGET_SCAN_DIR}" ]; then
+        echo "错误: 目录 ${TARGET_SCAN_DIR} 不存在！"
+        return 1
+    fi
+
+    echo ">> 正在扫描 ${TARGET_SCAN_DIR} 下的 .torrent 种子文件..."
+    mapfile -t TORRENT_FILES < <(find "${TARGET_SCAN_DIR}" -maxdepth 2 -name "*.torrent")
+
+    if [ ${#TORRENT_FILES[@]} -eq 0 ]; then
+        echo "提示: 在该目录下未找到任何 .torrent 文件。"
+        return 0
+    fi
+
+    echo ">> 找到 ${#TORRENT_FILES[@]} 个种子文件，正在校验未完成状态并注入 Aria2..."
+
+    local resumed_count=0
+    for tor in "${TORRENT_FILES[@]}"; do
+        base_name="${tor%.torrent}"
+        # 只要存在同名 .aria2 校验文件，或者对应数据文件/目录存在且未完工
+        # 即使被改名，通过 RPC 重新注入种子也会自动匹配当前目录下的同名文件进行分块校验
+        echo ">> 正在推送种子: $(basename "$tor")..."
+        
+        # 将种子转换成 base64
+        tor_b64=$(base64 -w 0 "$tor" 2>/dev/null || base64 "$tor" | tr -d '\r\n')
+        
+        # 构建 RPC 请求体 (aria2.addTorrent)
+        if [ -n "$RPC_SECRET" ]; then
+            payload=$(cat <<EOF
+{
+  "jsonrpc": "2.0",
+  "id": "resume_task",
+  "method": "aria2.addTorrent",
+  "params": [
+    "token:${RPC_SECRET}",
+    "${tor_b64}",
+    [],
+    {"dir": "${TARGET_SCAN_DIR}"}
+  ]
+}
+EOF
+)
+        else
+            payload=$(cat <<EOF
+{
+  "jsonrpc": "2.0",
+  "id": "resume_task",
+  "method": "aria2.addTorrent",
+  "params": [
+    "${tor_b64}",
+    [],
+    {"dir": "${TARGET_SCAN_DIR}"}
+  ]
+}
+EOF
+)
+        fi
+
+        # 发送 RPC 调用
+        resp=$(curl -s -m 10 -X POST "http://127.0.0.1:${RPC_PORT}/jsonrpc" -d "${payload}" || true)
+        
+        if echo "$resp" | grep -q '"result"'; then
+            echo "   [成功] 任务已载入，已自动在目录 ${TARGET_SCAN_DIR} 开始哈希校验！"
+            ((resumed_count++))
+        else
+            echo "   [失败] 注入失败，RPC 响应: ${resp}"
+        fi
+    done
+
+    echo ""
+    echo ">> 处理完毕！共成功推送并激活 ${resumed_count} 个未完成任务。"
+    echo ">> 请打开 AriaNg 查看任务列表，任务会先进行“检查中 (Checking)”，自检完成后将自动断点续传。"
+}
+
+# ==================== 模块 7: 单独安装/更新 AriaNg (使用 Caddy) ====================
 install_ariang() {
     local target_rpc_port="$1"
 
@@ -753,7 +855,7 @@ EOF
     echo "=========================================="
 }
 
-# ==================== 模块 7: 单独卸载 AriaNg ====================
+# ==================== 模块 8: 单独卸载 AriaNg ====================
 uninstall_ariang() {
     echo ""
     echo "=========================================="
@@ -779,7 +881,7 @@ uninstall_ariang() {
     echo ">> AriaNg 前端卸载流程已完成。"
 }
 
-# ==================== 模块 8: 完整卸载 (全部组件) ====================
+# ==================== 模块 9: 完整卸载 (全部组件) ====================
 uninstall_all() {
     echo ""
     echo "=========================================="
@@ -850,12 +952,13 @@ while true; do
     echo " 3. 手动更新 / 设置 BT Trackers (双源拉取 / 自定义)"
     echo " 4. 启用 / 停用 Trackers 自动更新 (定时器管理)"
     echo " 5. 迁移下载任务到新磁盘"
-    echo " 6. 单独安装 / 更新 AriaNg 前端 (Caddy 反代模式)"
-    echo " 7. 单独卸载 AriaNg 前端"
-    echo " 8. 完整卸载 (Aria2 + AriaNg + 服务全部清除)"
+    echo " 6. 扫描目录并恢复未完成种子断点下载"
+    echo " 7. 单独安装 / 更新 AriaNg 前端 (Caddy 反代模式)"
+    echo " 8. 单独卸载 AriaNg 前端"
+    echo " 9. 完整卸载 (Aria2 + AriaNg + 服务全部清除)"
     echo " 0. 退出"
     echo "=========================================="
-    read -rp "请选择操作 [0-8]: " MENU_CHOICE
+    read -rp "请选择操作 [0-9]: " MENU_CHOICE
 
     case "$MENU_CHOICE" in
         1) install_aria2 ;;
@@ -863,9 +966,10 @@ while true; do
         3) update_trackers_menu ;;
         4) manage_tracker_timer ;;
         5) migrate_downloads ;;
-        6) install_ariang ;;
-        7) uninstall_ariang ;;
-        8) uninstall_all; break ;;
+        6) scan_and_resume_torrents ;;
+        7) install_ariang ;;
+        8) uninstall_ariang ;;
+        9) uninstall_all; break ;;
         0) echo "已退出。"; exit 0 ;;
         *) echo "无效选项，请重新选择。" ;;
     esac
