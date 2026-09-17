@@ -176,7 +176,6 @@ install_aria2() {
     ${SUDO_CMD} chmod +x /usr/bin/aria2c
     rm -rf "${TMP_DIR}"
 
-    # 预先创建配置与下载目录
     mkdir -p "${DOWNLOAD_DIR}"
     mkdir -p "${USER_HOME}/.aria2"
     touch "${SESSION_FILE}"
@@ -559,8 +558,15 @@ migrate_downloads() {
     echo ">> 迁移完成！Aria2 将自动在新磁盘上自检分片并恢复下载。"
     echo ""
 
-    read -rp "是否删除源磁盘上对应的旧数据以释放空间? [y/N 默认: N]: " CLEAN_OLD
-    CLEAN_OLD="${CLEAN_OLD:-N}"
+    # 1 和 3 默认删除旧数据释放空间；2 仍安全默认保留
+    if [ "$MIGRATE_TYPE" == "1" ] || [ "$MIGRATE_TYPE" == "3" ]; then
+        read -rp "是否删除源磁盘上对应的旧数据以释放空间? [Y/n 默认: Y]: " CLEAN_OLD
+        CLEAN_OLD="${CLEAN_OLD:-Y}"
+    else
+        read -rp "是否清空源下载目录的所有文件以释放空间? [y/N 默认: N]: " CLEAN_OLD
+        CLEAN_OLD="${CLEAN_OLD:-N}"
+    fi
+
     if [[ "$CLEAN_OLD" =~ ^[Yy]$ ]]; then
         if [ "$MIGRATE_TYPE" == "1" ]; then
             echo ">> 正在清理已迁移的未完成任务原文件..."
