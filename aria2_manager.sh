@@ -22,7 +22,7 @@ ARIA2_CONF_DIR="${USER_HOME}/.aria2"
 CONF_FILE="${ARIA2_CONF_DIR}/aria2.conf"
 SESSION_FILE="${ARIA2_CONF_DIR}/aria2.session"
 TRACKER_SCRIPT="${ARIA2_CONF_DIR}/scripts/update_tracker.sh"
-EXCLUDE_SCRIPT="${ARIA2_CONF_DIR}/scripts/update_exclude_tracker.sh"
+BLOCKER_SCRIPT="${ARIA2_CONF_DIR}/scripts/block_peers.sh"
 DEFAULT_DOWNLOAD_DIR="${USER_HOME}/Downloads"
 DEFAULT_PORT="6800"
 DEFAULT_ARIANG_PORT="6880"
@@ -119,7 +119,7 @@ TRACKER_URL1="https://bitbucket.org/xiu2/trackerslistcollection/raw/master/all.t
 TRACKER_URL2="https://cdn.jsdelivr.net/gh/ngosang/trackerslist@master/trackers_all.txt"
 
 echo "正在从多源获取最新 Tracker 列表..."
-tracker_list=\$( (curl -sSL --connect-timeout 10 -m 30 "\${TRACKER_URL1}"; echo ""; curl -sSL --connect-timeout 10 -m 30 "\${TRACKER_URL2}") | tr -d '\r' | sed '/^$/d' | sort -u | paste -sd "," - )
+tracker_list=\$( (curl -sSL --connect-timeout 10 -m 30 "\${TRACKER_URL1}"; echo ""; curl -sSL --connect-timeout 10 -m 30 "\${TRACKER_URL2}") | tr -d '\r' | sed '/^[[:space:]]*#/d; /^[[:space:]]*\$/d' | sort -u | paste -sd "," - )
 
 if [ -n "\$tracker_list" ]; then
     if grep -q "^bt-tracker=" "\$CONF_FILE"; then
@@ -137,31 +137,59 @@ EOF
     chmod +x "${TRACKER_SCRIPT}"
 }
 
-# ==================== 生成 排除服务器 更新脚本 ====================
-ensure_exclude_script() {
+# ==================== 生成 内核级吸血 Peer 拦截更新脚本 ====================
+ensure_blocker_script() {
     mkdir -p "${ARIA2_CONF_DIR}/scripts"
-    cat > "${EXCLUDE_SCRIPT}" <<EOF
+    cat > "${BLOCKER_SCRIPT}" <<'EOF'
 #!/usr/bin/env bash
-CONF_FILE="${CONF_FILE}"
-EXCLUDE_URL="https://bcr.pbh-btn.com/combine/all.txt"
+set -e
 
-echo "正在获取最新 BT 排除服务器列表..."
-exclude_list=\$(curl -sSL --connect-timeout 10 -m 30 "\${EXCLUDE_URL}" | tr -d '\r' | sed '/^$/d' | sort -u | paste -sd "," - )
+BLOCK_LIST_URL="https://bcr.pbh-btn.com/combine/all.txt"
+SUDO_EXEC=""
+[ "$EUID" -ne 0 ] && SUDO_EXEC="sudo"
 
-if [ -n "\$exclude_list" ]; then
-    if grep -q "^bt-exclude-tracker=" "\$CONF_FILE"; then
-        sed -i "s|^bt-exclude-tracker=.*|bt-exclude-tracker=\${exclude_list}|g" "\$CONF_FILE"
-    else
-        echo "bt-exclude-tracker=\${exclude_list}" >> "\$CONF_FILE"
-    fi
-    echo "BT 排除服务器列表更新成功！"
-    ${SYSTEMCTL_CMD} restart aria2.service
-else
-    echo "警告: 排除服务器列表获取为空，跳过更新。"
+echo ">> 正在从远程源获取吸血 Peer 黑名单..."
+raw_content=$(curl -sSL --connect-timeout 15 -m 60 "${BLOCK_LIST_URL}" | tr -d '\r' | sed '/^[[:space:]]*#/d; /^[[:space:]]*$/d')
+
+if [ -z "$raw_content" ]; then
+    echo "警告: 拉取黑名单为空，终止更新。"
     exit 1
 fi
+
+echo ">> 正在刷新 Linux 内核 ipset 集合..."
+$SUDO_EXEC ipset create aria2_ban_v4 hash:net family inet -exist
+$SUDO_EXEC ipset create aria2_ban_v6 hash:net family inet6 -exist
+
+$SUDO_EXEC ipset flush aria2_ban_v4
+$SUDO_EXEC ipset flush aria2_ban_v6
+
+v4_count=0
+v6_count=0
+
+# 分类导入 IPv4 / IPv6
+while IFS= read -r ip; do
+    [ -z "$ip" ] && continue
+    if [[ "$ip" =~ : ]]; then
+        $SUDO_EXEC ipset add aria2_ban_v6 "$ip" -exist
+        ((v6_count++)) || true
+    else
+        $SUDO_EXEC ipset add aria2_ban_v4 "$ip" -exist
+        ((v4_count++)) || true
+    fi
+done <<< "$raw_content"
+
+echo ">> 正在挂载 iptables 丢弃规则..."
+$SUDO_EXEC iptables -C INPUT -m set --match-set aria2_ban_v4 src -j DROP 2>/dev/null || \
+$SUDO_EXEC iptables -I INPUT -m set --match-set aria2_ban_v4 src -j DROP
+
+if command -v ip6tables &>/dev/null; then
+    $SUDO_EXEC ip6tables -C INPUT -m set --match-set aria2_ban_v6 src -j DROP 2>/dev/null || \
+    $SUDO_EXEC ip6tables -I INPUT -m set --match-set aria2_ban_v6 src -j DROP 2>/dev/null || true
+fi
+
+echo ">> 吸血 Peer 黑名单更新完毕！已成功注入 IPv4 规则 ${v4_count} 条，IPv6 规则 ${v6_count} 条。"
 EOF
-    chmod +x "${EXCLUDE_SCRIPT}"
+    chmod +x "${BLOCKER_SCRIPT}"
 }
 
 # ==================== 模块 1: 安装 Aria2 后端 ====================
@@ -197,8 +225,8 @@ install_aria2() {
     echo "RPC 端口: ${RPC_PORT}"
     echo "RPC 密钥: ${RPC_SECRET}"
     echo "顺带安装 AriaNg: $([[ "$WITH_ARIANG" =~ ^[Yy]$ ]] && echo "是" || echo "否")"
-    echo "Trackers 自动更新: 默认开启 (独立每日定时)"
-    echo "排除服务器自动更新: 默认开启 (独立每日定时)"
+    echo "Trackers 自动更新: 默认开启 (每日定时)"
+    echo "吸血 Peer 防火墙: 默认不开启 (可在主菜单按需启用)"
     echo "种子文件保留: 默认关闭 (下载后自动删除种子)"
     echo "======================"
     read -rp "确认开始安装 Aria2? [Y/n 默认: Y]: " CONFIRM
@@ -255,15 +283,12 @@ rpc-secret=${RPC_SECRET}
 bt-save-metadata=false
 follow-torrent=mem
 bt-tracker=
-bt-exclude-tracker=
 EOF
 
     ensure_tracker_script
-    ensure_exclude_script
 
     [ "$IS_ROOT" = false ] && mkdir -p "${SYSTEMD_DIR}"
 
-    # 1. Aria2 主服务
     ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2.service'" <<EOF
 [Unit]
 Description=Aria2c Download Manager
@@ -278,7 +303,6 @@ Restart=on-failure
 WantedBy=default.target
 EOF
 
-    # 2. Trackers 独立定时器
     ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2-update-tracker.service'" <<EOF
 [Unit]
 Description=Update Aria2 BT Trackers
@@ -302,38 +326,12 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
-    # 3. 排除服务器 独立定时器
-    ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2-update-exclude-tracker.service'" <<EOF
-[Unit]
-Description=Update Aria2 BT Exclude Trackers
-After=network.target
-
-[Service]
-Type=oneshot
-ExecStart=${EXCLUDE_SCRIPT}
-EOF
-
-    ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2-update-exclude-tracker.timer'" <<EOF
-[Unit]
-Description=Run Aria2 BT Exclude List Update Daily
-
-[Timer]
-OnBootSec=12min
-OnUnitActiveSec=24h
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
-
     ${SYSTEMCTL_CMD} daemon-reload
     ${SYSTEMCTL_CMD} enable --now aria2.service
     ${SYSTEMCTL_CMD} enable --now aria2-update-tracker.timer
-    ${SYSTEMCTL_CMD} enable --now aria2-update-exclude-tracker.timer
 
-    echo ">> 正在初始化 Trackers 与 排除列表..."
+    echo ">> 正在初始化 Trackers 列表..."
     bash "${TRACKER_SCRIPT}" 2>/dev/null || true
-    bash "${EXCLUDE_SCRIPT}" 2>/dev/null || true
 
     if [ "$IS_ROOT" = false ] && command -v loginctl &>/dev/null; then
         sudo loginctl enable-linger "${CURRENT_USER}" 2>/dev/null || true
@@ -343,9 +341,8 @@ EOF
     echo ">> Aria2 后端已部署成功！"
     echo "   RPC 端口: ${RPC_PORT}"
     echo "   RPC 密钥: ${RPC_SECRET}"
-    echo "   Trackers 自动更新定时器已启用 (aria2-update-tracker.timer)"
-    echo "   排除服务器自动更新定时器已启用 (aria2-update-exclude-tracker.timer)"
-    echo "   BT 种子自动清理配置已生效。"
+    echo "   Trackers 自动更新定时器已就绪。"
+    echo "   吸血 Peer 拦截防火墙当前未开启，可在主菜单选项 5 随时开启。"
 
     if [[ "$WITH_ARIANG" =~ ^[Yy]$ ]]; then
         install_ariang "${RPC_PORT}"
@@ -423,7 +420,7 @@ update_trackers_menu() {
             USER_TRACKERS="${USER_TRACKERS}${line},"
         done
         
-        formatted_trackers=$(echo "${USER_TRACKERS}" | tr -d '\r' | tr '\n' ',' | sed 's/,,*/,/g; s/^,//; s/,$//')
+        formatted_trackers=$(echo "${USER_TRACKERS}" | tr -d '\r' | sed 's/#.*//g' | tr '\n' ',' | sed 's/,,*/,/g; s/^,//; s/,$//')
 
         if [ -z "$formatted_trackers" ]; then
             echo "输入内容为空，未做任何修改。"
@@ -521,105 +518,56 @@ EOF
     esac
 }
 
-# ==================== 模块 5: 单独设置/更新 排除服务器 ====================
-update_exclude_trackers_menu() {
+# ==================== 模块 5: 内核级吸血 Peer 拦截管理 (ipset + iptables) ====================
+manage_peer_blocker() {
     echo ""
     echo "=========================================="
-    echo "      手动更新 / 设置 BT 排除服务器       "
+    echo "    BT 吸血 Peer 防火墙拦截 (ipset + iptables)  "
     echo "=========================================="
 
-    if [ ! -f "${CONF_FILE}" ]; then
-        echo "未检测到配置文件: ${CONF_FILE}，请先安装 Aria2！"
-        return 1
+    # 检查系统服务运行状态（系统级定时器）
+    IS_BLOCKER_ACTIVE=false
+    if systemctl is-active --quiet aria2-peer-blocker.timer 2>/dev/null; then
+        IS_BLOCKER_ACTIVE=true
     fi
 
-    echo "请选择操作:"
-    echo " 1. 立即从网络自动拉取最新 BT 排除服务器列表 (https://bcr.pbh-btn.com/combine/all.txt)"
-    echo " 2. 手动自定义输入 BT 排除服务器列表"
-    read -rp "请选择 [1-2 默认: 1]: " EXCLUDE_CHOICE
-    EXCLUDE_CHOICE="${EXCLUDE_CHOICE:-1}"
-
-    if [ "$EXCLUDE_CHOICE" == "1" ]; then
-        ensure_exclude_script
-        echo ">> 正在执行排除服务器更新脚本..."
-        bash "${EXCLUDE_SCRIPT}"
-    elif [ "$EXCLUDE_CHOICE" == "2" ]; then
-        echo ""
-        echo "请输入或粘贴 BT 排除服务器列表 (可为逗号分隔，也可为多行粘贴，输入完成后在新行输入 EOF 并回车结束):"
-        USER_EXCLUDES=""
-        while IFS= read -r line; do
-            [ "$line" = "EOF" ] && break
-            USER_EXCLUDES="${USER_EXCLUDES}${line},"
-        done
-        
-        formatted_excludes=$(echo "${USER_EXCLUDES}" | tr -d '\r' | tr '\n' ',' | sed 's/,,*/,/g; s/^,//; s/,$//')
-
-        if [ -z "$formatted_excludes" ]; then
-            echo "输入内容为空，未做任何修改。"
-            return 0
-        fi
-
-        if grep -q "^bt-exclude-tracker=" "${CONF_FILE}"; then
-            sed -i "s|^bt-exclude-tracker=.*|bt-exclude-tracker=${formatted_excludes}|g" "${CONF_FILE}"
-        else
-            echo "bt-exclude-tracker=${formatted_excludes}" >> "${CONF_FILE}"
-        fi
-
-        ${SYSTEMCTL_CMD} restart aria2.service
-        echo ">> 自定义 BT 排除服务器列表已成功写入并重启 Aria2 服务！"
+    echo -n "当前吸血 Peer 防火墙状态: "
+    if [ "$IS_BLOCKER_ACTIVE" = true ]; then
+        echo -e "\033[32m已开启 (每日定时更新拦截库)\033[0m"
     else
-        echo "无效选项。"
-        return 1
-    fi
-}
-
-# ==================== 模块 6: 排除服务器 自动更新定时器管理 ====================
-manage_exclude_tracker_timer() {
-    echo ""
-    echo "=========================================="
-    echo "    BT 排除服务器 自动更新 定时器管理     "
-    echo "=========================================="
-
-    IS_ACTIVE=false
-    if ${SYSTEMCTL_CMD} is-active --quiet aria2-update-exclude-tracker.timer 2>/dev/null; then
-        IS_ACTIVE=true
-    fi
-
-    echo -n "当前排除服务器自动更新定时器状态: "
-    if [ "$IS_ACTIVE" = true ]; then
-        echo -e "\033[32m已启用 (Active)\033[0m"
-    else
-        echo -e "\033[31m未启用 (Inactive / Stopped)\033[0m"
+        echo -e "\033[31m未开启 (Inactive)\033[0m"
     fi
     echo ""
 
-    echo " 1. 启用并开启开机自启 (Enable & Start)"
-    echo " 2. 停用并关闭开机自启 (Disable & Stop)"
-    echo " 3. 查看定时器运行与下次触发时间"
+    echo " 1. 开启防火墙拦截 (安装依赖、立即载入黑名单并启用每日定时更新)"
+    echo " 2. 关闭防火墙拦截 (清除 iptables 拦截规则、清空 ipset 集合并停用更新)"
+    echo " 3. 立即手动执行一次更新"
+    echo " 4. 查看当前拦截规则与定时任务状态"
     echo " 0. 返回上级菜单"
-    read -rp "请选择操作 [0-3]: " TIMER_CHOICE
+    read -rp "请选择操作 [0-4]: " PEER_CHOICE
 
-    case "$TIMER_CHOICE" in
+    case "$PEER_CHOICE" in
         1)
-            ensure_exclude_script
-            [ "$IS_ROOT" = false ] && mkdir -p "${SYSTEMD_DIR}"
+            install_packages ipset iptables
+            ensure_blocker_script
 
-            ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2-update-exclude-tracker.service'" <<EOF
+            echo ">> 正在配置系统级每日定时更新服务..."
+            ${SUDO_CMD} bash -c "cat > /etc/systemd/system/aria2-peer-blocker.service" <<EOF
 [Unit]
-Description=Update Aria2 BT Exclude Trackers
+Description=Update Aria2 Peer Blacklist to Linux Firewall (ipset)
 After=network.target
 
 [Service]
 Type=oneshot
-ExecStart=${EXCLUDE_SCRIPT}
+ExecStart=${BLOCKER_SCRIPT}
 EOF
 
-            ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2-update-exclude-tracker.timer'" <<EOF
+            ${SUDO_CMD} bash -c "cat > /etc/systemd/system/aria2-peer-blocker.timer" <<EOF
 [Unit]
-Description=Run Aria2 BT Exclude List Update Daily
+Description=Daily update of Aria2 Peer Blacklist
 
 [Timer]
-OnBootSec=12min
+OnBootSec=15min
 OnUnitActiveSec=24h
 Persistent=true
 
@@ -627,19 +575,50 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
-            ${SYSTEMCTL_CMD} daemon-reload
-            ${SYSTEMCTL_CMD} enable --now aria2-update-exclude-tracker.timer
-            echo ">> 排除服务器自动更新定时器已成功启用！"
+            ${SUDO_CMD} systemctl daemon-reload
+            ${SUDO_CMD} systemctl enable --now aria2-peer-blocker.timer
+
+            echo ">> 正在首次拉取并挂载吸血 Peer 黑名单到内核防火墙..."
+            bash "${BLOCKER_SCRIPT}"
+            echo ""
+            echo ">> 吸血 Peer 防火墙已正式开启！系统将每天自动拉取最新封禁 IP。"
             ;;
         2)
-            echo ">> 正在停止并禁用排除服务器定时器..."
-            ${SYSTEMCTL_CMD} stop aria2-update-exclude-tracker.timer 2>/dev/null || true
-            ${SYSTEMCTL_CMD} disable aria2-update-exclude-tracker.timer 2>/dev/null || true
-            echo ">> 排除服务器自动更新定时器已停用。"
+            echo ">> 正在停止并禁用每日定时器..."
+            ${SUDO_CMD} systemctl stop aria2-peer-blocker.timer 2>/dev/null || true
+            ${SUDO_CMD} systemctl disable aria2-peer-blocker.timer 2>/dev/null || true
+            ${SUDO_CMD} rm -f /etc/systemd/system/aria2-peer-blocker.service
+            ${SUDO_CMD} rm -f /etc/systemd/system/aria2-peer-blocker.timer
+            ${SUDO_CMD} systemctl daemon-reload
+
+            echo ">> 正在清理 iptables 拦截链与 ipset 集合..."
+            ${SUDO_CMD} iptables -D INPUT -m set --match-set aria2_ban_v4 src -j DROP 2>/dev/null || true
+            if command -v ip6tables &>/dev/null; then
+                ${SUDO_CMD} ip6tables -D INPUT -m set --match-set aria2_ban_v6 src -j DROP 2>/dev/null || true
+            fi
+            ${SUDO_CMD} ipset destroy aria2_ban_v4 2>/dev/null || true
+            ${SUDO_CMD} ipset destroy aria2_ban_v6 2>/dev/null || true
+
+            echo ">> 吸血 Peer 防火墙拦截已彻底关闭并恢复环境。"
             ;;
         3)
+            ensure_blocker_script
+            echo ">> 正在执行手动更新..."
+            bash "${BLOCKER_SCRIPT}"
+            ;;
+        4)
+            echo "=== iptables 拦截规则 ==="
+            ${SUDO_CMD} iptables -L INPUT -n -v | grep "aria2_ban" || echo "未找到 IPv4 拦截规则"
+            if command -v ip6tables &>/dev/null; then
+                ${SUDO_CMD} ip6tables -L INPUT -n -v | grep "aria2_ban" || echo "未找到 IPv6 拦截规则"
+            fi
             echo ""
-            ${SYSTEMCTL_CMD} list-timers aria2-update-exclude-tracker.timer || true
+            echo "=== ipset 集合概况 ==="
+            ${SUDO_CMD} ipset list aria2_ban_v4 -terse 2>/dev/null || echo "aria2_ban_v4 集合不存在"
+            ${SUDO_CMD} ipset list aria2_ban_v6 -terse 2>/dev/null || echo "aria2_ban_v6 集合不存在"
+            echo ""
+            echo "=== 定时器运行状态 ==="
+            systemctl list-timers aria2-peer-blocker.timer || true
             ;;
         0)
             return 0
@@ -650,7 +629,7 @@ EOF
     esac
 }
 
-# ==================== 模块 7: 迁移下载任务 ====================
+# ==================== 模块 6: 迁移下载任务 ====================
 migrate_downloads() {
     echo ""
     echo "=========================================="
@@ -846,7 +825,7 @@ migrate_downloads() {
     fi
 }
 
-# ==================== 模块 8: 扫描并恢复未完成种子任务 ====================
+# ==================== 模块 7: 扫描并恢复未完成种子任务 ====================
 scan_and_resume_torrents() {
     echo ""
     echo "=========================================="
@@ -942,7 +921,7 @@ EOF
     echo ">> 请打开 AriaNg 查看任务列表，任务会先进行“检查中 (Checking)”，自检完成后将自动断点续传。"
 }
 
-# ==================== 模块 9: 单独安装/更新 AriaNg (使用 Caddy) ====================
+# ==================== 模块 8: 单独安装/更新 AriaNg (使用 Caddy) ====================
 install_ariang() {
     local target_rpc_port="$1"
 
@@ -1023,7 +1002,7 @@ EOF
     echo "=========================================="
 }
 
-# ==================== 模块 10: 单独卸载 AriaNg ====================
+# ==================== 模块 9: 单独卸载 AriaNg ====================
 uninstall_ariang() {
     echo ""
     echo "=========================================="
@@ -1049,7 +1028,7 @@ uninstall_ariang() {
     echo ">> AriaNg 前端卸载流程已完成。"
 }
 
-# ==================== 模块 11: 完整卸载 (全部组件) ====================
+# ==================== 模块 10: 完整卸载 (全部组件) ====================
 uninstall_all() {
     echo ""
     echo "=========================================="
@@ -1066,25 +1045,37 @@ uninstall_all() {
     ${SYSTEMCTL_CMD} stop aria2.service 2>/dev/null || true
     ${SYSTEMCTL_CMD} stop aria2-update-tracker.timer 2>/dev/null || true
     ${SYSTEMCTL_CMD} stop aria2-update-tracker.service 2>/dev/null || true
-    ${SYSTEMCTL_CMD} stop aria2-update-exclude-tracker.timer 2>/dev/null || true
-    ${SYSTEMCTL_CMD} stop aria2-update-exclude-tracker.service 2>/dev/null || true
+    ${SUDO_CMD} systemctl stop aria2-peer-blocker.timer 2>/dev/null || true
+    ${SUDO_CMD} systemctl stop aria2-peer-blocker.service 2>/dev/null || true
     ${SUDO_CMD} systemctl stop caddy 2>/dev/null || true
 
     ${SYSTEMCTL_CMD} disable aria2.service 2>/dev/null || true
     ${SYSTEMCTL_CMD} disable aria2-update-tracker.timer 2>/dev/null || true
     ${SYSTEMCTL_CMD} disable aria2-update-tracker.service 2>/dev/null || true
-    ${SYSTEMCTL_CMD} disable aria2-update-exclude-tracker.timer 2>/dev/null || true
-    ${SYSTEMCTL_CMD} disable aria2-update-exclude-tracker.service 2>/dev/null || true
+    ${SUDO_CMD} systemctl disable aria2-peer-blocker.timer 2>/dev/null || true
+    ${SUDO_CMD} systemctl disable aria2-peer-blocker.service 2>/dev/null || true
     ${SUDO_CMD} systemctl disable caddy 2>/dev/null || true
 
     echo ">> 正在删除 systemd 服务配置文件..."
     ${SUDO_CMD} rm -f "${SYSTEMD_DIR}/aria2.service"
     ${SUDO_CMD} rm -f "${SYSTEMD_DIR}/aria2-update-tracker.service"
     ${SUDO_CMD} rm -f "${SYSTEMD_DIR}/aria2-update-tracker.timer"
-    ${SUDO_CMD} rm -f "${SYSTEMD_DIR}/aria2-update-exclude-tracker.service"
-    ${SUDO_CMD} rm -f "${SYSTEMD_DIR}/aria2-update-exclude-tracker.timer"
+    ${SUDO_CMD} rm -f /etc/systemd/system/aria2-peer-blocker.service
+    ${SUDO_CMD} rm -f /etc/systemd/system/aria2-peer-blocker.timer
     ${SUDO_CMD} rm -f /etc/caddy/Caddyfile
     ${SYSTEMCTL_CMD} daemon-reload
+    ${SUDO_CMD} systemctl daemon-reload 2>/dev/null || true
+
+    # 彻底注销 ipset / iptables
+    if command -v ipset &>/dev/null; then
+        echo ">> 正在注销内核防火墙规则..."
+        ${SUDO_CMD} iptables -D INPUT -m set --match-set aria2_ban_v4 src -j DROP 2>/dev/null || true
+        if command -v ip6tables &>/dev/null; then
+            ${SUDO_CMD} ip6tables -D INPUT -m set --match-set aria2_ban_v6 src -j DROP 2>/dev/null || true
+        fi
+        ${SUDO_CMD} ipset destroy aria2_ban_v4 2>/dev/null || true
+        ${SUDO_CMD} ipset destroy aria2_ban_v6 2>/dev/null || true
+    fi
 
     echo ">> 正在删除 aria2c 二进制文件..."
     if [ -f "/usr/bin/aria2c" ]; then
@@ -1111,7 +1102,7 @@ uninstall_all() {
     remove_caddy_package
 
     echo ""
-    echo ">> 所有组件卸载完成。"
+    echo ">> 所有组件与定时器卸载完成。"
 }
 
 # ==================== 主入口循环菜单 ====================
@@ -1121,33 +1112,31 @@ while true; do
     echo "          Aria2 & AriaNg 综合管理          "
     echo "  当前用户: ${CURRENT_USER} ($([ "$IS_ROOT" = true ] && echo "Root 模式" || echo "普通用户模式"))"
     echo "=========================================="
-    echo " 1. 安装 / 重新配置 Aria2 后端 (默认启用 Trackers & 排除服务器自动更新)"
+    echo " 1. 安装 / 重新配置 Aria2 后端 (默认启用 Trackers 自动更新)"
     echo " 2. 单独修改下载目录"
     echo " 3. 手动更新 / 设置 BT Trackers (双源拉取 / 自定义)"
     echo " 4. 启用 / 停用 Trackers 自动更新 (定时器管理)"
-    echo " 5. 手动更新 / 设置 BT 排除服务器 (在线拉取 / 自定义)"
-    echo " 6. 启用 / 停用 排除服务器 自动更新 (定时器管理)"
-    echo " 7. 迁移下载任务到新磁盘"
-    echo " 8. 扫描目录并恢复未完成种子断点下载"
-    echo " 9. 单独安装 / 更新 AriaNg 前端 (Caddy 反代模式)"
-    echo " 10. 单独卸载 AriaNg 前端"
-    echo " 11. 完整卸载 (Aria2 + AriaNg + 定时器 + 服务全部清除)"
+    echo " 5. BT 吸血 Peer 防火墙拦截管理 (ipset+iptables / 默认关闭 / 每日更新)"
+    echo " 6. 迁移下载任务到新磁盘"
+    echo " 7. 扫描目录并恢复未完成种子断点下载"
+    echo " 8. 单独安装 / 更新 AriaNg 前端 (Caddy 反代模式)"
+    echo " 9. 单独卸载 AriaNg 前端"
+    echo " 10. 完整卸载 (Aria2 + AriaNg + 防火墙规则 + 服务全清)"
     echo " 0. 退出"
     echo "=========================================="
-    read -rp "请选择操作 [0-11]: " MENU_CHOICE
+    read -rp "请选择操作 [0-10]: " MENU_CHOICE
 
     case "$MENU_CHOICE" in
         1) install_aria2 ;;
         2) modify_download_dir ;;
         3) update_trackers_menu ;;
         4) manage_tracker_timer ;;
-        5) update_exclude_trackers_menu ;;
-        6) manage_exclude_tracker_timer ;;
-        7) migrate_downloads ;;
-        8) scan_and_resume_torrents ;;
-        9) install_ariang ;;
-        10) uninstall_ariang ;;
-        11) uninstall_all; break ;;
+        5) manage_peer_blocker ;;
+        6) migrate_downloads ;;
+        7) scan_and_resume_torrents ;;
+        8) install_ariang ;;
+        9) uninstall_ariang ;;
+        10) uninstall_all; break ;;
         0) echo "已退出。"; exit 0 ;;
         *) echo "无效选项，请重新选择。" ;;
     esac
