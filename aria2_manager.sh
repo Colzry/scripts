@@ -176,7 +176,9 @@ install_aria2() {
     ${SUDO_CMD} chmod +x /usr/bin/aria2c
     rm -rf "${TMP_DIR}"
 
+    # 确保下载目录和配置目录均已预先创建
     mkdir -p "${DOWNLOAD_DIR}"
+    mkdir -p "${USER_HOME}/.aria2"
     touch "${SESSION_FILE}"
 
     echo ">> 写入 aria2.conf..."
@@ -370,7 +372,6 @@ manage_tracker_timer() {
     echo "     BT Trackers 自动更新 定时器管理       "
     echo "=========================================="
 
-    # 检查定时器当前状态
     IS_ACTIVE=false
     if ${SYSTEMCTL_CMD} is-active --quiet aria2-update-tracker.timer 2>/dev/null; then
         IS_ACTIVE=true
@@ -395,7 +396,6 @@ manage_tracker_timer() {
             ensure_tracker_script
             [ "$IS_ROOT" = false ] && mkdir -p "${SYSTEMD_DIR}"
 
-            # 确保 Service 和 Timer 单元存在
             ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2-update-tracker.service'" <<EOF
 [Unit]
 Description=Update Aria2 BT Trackers
