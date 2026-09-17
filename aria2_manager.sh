@@ -157,8 +157,8 @@ install_aria2() {
     echo "顺带安装 AriaNg: $([[ "$WITH_ARIANG" =~ ^[Yy]$ ]] && echo "是" || echo "否")"
     echo "Tracker 自动更新: 默认开启 (每日定时)"
     echo "======================"
-    read -rp "确认开始安装 Aria2? [y/N 默认: N]: " CONFIRM
-    CONFIRM="${CONFIRM:-N}"
+    read -rp "确认开始安装 Aria2? [Y/n 默认: Y]: " CONFIRM
+    CONFIRM="${CONFIRM:-Y}"
     if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
         echo "已取消安装。"
         return 0
@@ -176,7 +176,7 @@ install_aria2() {
     ${SUDO_CMD} chmod +x /usr/bin/aria2c
     rm -rf "${TMP_DIR}"
 
-    # 确保下载目录和配置目录均已预先创建
+    # 预先创建配置与下载目录
     mkdir -p "${DOWNLOAD_DIR}"
     mkdir -p "${USER_HOME}/.aria2"
     touch "${SESSION_FILE}"
