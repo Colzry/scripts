@@ -46,7 +46,6 @@ stop_aria2_safely() {
     echo ">> 正在平稳停止 Aria2 服务以刷新保存 session..."
     ${SYSTEMCTL_CMD} stop aria2.service 2>/dev/null || true
     
-    # 轮询等待进程彻底退出，避免写盘竞态覆盖
     local timeout=10
     while pgrep -u "$CURRENT_USER" -x aria2c &>/dev/null && [ $timeout -gt 0 ]; do
         sleep 0.5
@@ -193,7 +192,6 @@ install_aria2() {
     ${SUDO_CMD} chmod +x /usr/bin/aria2c
     rm -rf "${TMP_DIR}"
 
-    # 预先创建配置与下载目录
     mkdir -p "${DOWNLOAD_DIR}"
     mkdir -p "${ARIA2_CONF_DIR}"
     touch "${SESSION_FILE}"
@@ -499,17 +497,16 @@ migrate_downloads() {
 
     echo ""
     echo "请选择迁移范围:"
-    echo " 1. 仅迁移未完成的下载任务 (自动识别 .aria2 校验文件及其数据)"
+    echo " 1. 仅迁移未完成的下载任务 (自动识别 .aria2 校验块、数据与种子元数据)"
     echo " 2. 迁移整个下载目录的所有数据 (包含已完成与未完成)"
     echo " 3. 仅迁移指定文件/任务 (按关键词匹配)"
     read -rp "请选择 [1-3 默认: 1]: " MIGRATE_TYPE
     MIGRATE_TYPE="${MIGRATE_TYPE:-1}"
 
-    # 1. 严格停机与等待，防止进程反向覆盖 session
+    # 1. 严格停机与等待，防止进程反向写回旧 session
     stop_aria2_safely
 
     mkdir -p "${DEST_DIR}"
-    # 确保新磁盘权限对当前用户可读写
     if [ "$IS_ROOT" = false ]; then
         ${SUDO_CMD} chown -R "${CURRENT_USER}:${CURRENT_USER}" "${DEST_DIR}" 2>/dev/null || true
     fi
@@ -527,7 +524,7 @@ migrate_downloads() {
                 return 0
             fi
 
-            echo ">> 发现 ${#ARIA2_CONTROL_FILES[@]} 个未完成任务，开始同步对应文件及校验数据..."
+            echo ">> 发现 ${#ARIA2_CONTROL_FILES[@]} 个未完成任务，开始同步对应数据、控制文件与种子元数据..."
             for ctl in "${ARIA2_CONTROL_FILES[@]}"; do
                 data_target="${ctl%.aria2}"
                 rel_ctl="${ctl#"${SRC_DIR}/"}"
@@ -535,13 +532,24 @@ migrate_downloads() {
                 dest_subdir=$(dirname "${DEST_DIR}/${rel_ctl}")
                 mkdir -p "${dest_subdir}"
 
+                # 1. 同步控制文件
                 rsync -avP "${ctl}" "${dest_subdir}/"
+                # 2. 同步数据文件或目录
                 if [ -e "${data_target}" ]; then
                     rsync -avP "${data_target}" "${dest_subdir}/"
+                fi
+                # 3. 核心修复：同步对应的 .torrent 种子文件（若存在）
+                if [ -f "${data_target}.torrent" ]; then
+                    rsync -avP "${data_target}.torrent" "${dest_subdir}/"
+                    MIGRATED_ITEMS+=("${data_target}.torrent")
                 fi
 
                 MIGRATED_ITEMS+=("${ctl}" "${data_target}")
             done
+
+            # 补充同步：将源目录下存在的 .torrent 种子文件一并同步到新目标目录，防止任务因丢失元数据被丢弃
+            echo ">> 正在补充同步源目录下的所有种子元数据 (*.torrent)..."
+            find "${SRC_DIR}" -maxdepth 1 -name "*.torrent" -exec rsync -avP {} "${DEST_DIR}/" \; 2>/dev/null || true
             ;;
         2)
             echo ">> 正在完整同步下载目录下的所有数据..."
@@ -554,7 +562,7 @@ migrate_downloads() {
                 ${SYSTEMCTL_CMD} start aria2.service
                 return 1
             fi
-            echo ">> 正在同步匹配文件与 .aria2 校验文件..."
+            echo ">> 正在同步匹配文件、校验文件与种子元数据..."
             rsync -avP "${SRC_DIR}/${FILE_KEYWORD}"* "${DEST_DIR}/" || true
             ;;
         *)
@@ -564,11 +572,10 @@ migrate_downloads() {
             ;;
     esac
 
-    # 3. 安全更新 session 路径映射（备份原文件）
+    # 3. 核心修复：全面更新 session 文件中的所有旧路径（包含首行的 .torrent 路径和 dir= 路径）
     if [ -f "${SESSION_FILE}" ] && [ -s "${SESSION_FILE}" ]; then
-        echo ">> 正在更新会话文件 (${SESSION_FILE}) 中的路径映射..."
+        echo ">> 正在更新会话文件 (${SESSION_FILE}) 中的全部路径映射..."
         cp "${SESSION_FILE}" "${SESSION_FILE}.bak"
-        # 使用管道符精确匹配替换，避免斜杠冲突
         sed -i "s|${SRC_DIR}|${DEST_DIR}|g" "${SESSION_FILE}"
     fi
 
@@ -585,7 +592,8 @@ migrate_downloads() {
     ${SYSTEMCTL_CMD} start aria2.service
 
     echo ""
-    echo ">> 迁移完成！Aria2 将自动在新磁盘上自检分片并在 AriaNg 中继续显示进度。"
+    echo ">> 迁移完成！Aria2 已重新载入元数据并开始自检校验断点。"
+    echo ">> 提示: 若在 AriaNg 中任务显示为“暂停”，只需手动点击“开始”即可立即恢复传输。"
     echo ""
 
     # 5. 清理旧盘空间
