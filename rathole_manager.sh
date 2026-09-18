@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # ======================= 环境模式与路径自动判定 =======================
-PROXY_PREFIX="https://gitpy.223327.xyz/"
+# 该代理仅在执行 release 包下载时拼接生效
+DOWNLOAD_PROXY="https://gitpy.223327.xyz/"
 GITHUB_REPO="rathole-org/rathole"
 
 # 终端色彩输出
@@ -57,7 +58,7 @@ check_dependencies() {
                     exit 1
                 fi
             else
-                echo -e "${YELLOW}提示: 系统未检测到 $cmd，如果涉及证书申请(socat)或解压，请确保已安装。${NC}"
+                echo -e "${YELLOW}提示: 未检测到 $cmd，如需申请证书或解压请确保系统已就绪。${NC}"
             fi
         fi
     done
@@ -147,7 +148,7 @@ EOF
 ensure_acme_installed() {
     if [[ ! -f "$ACME_BIN" ]]; then
         echo -e "${YELLOW}未检测到 acme.sh，正在执行官方脚本安装...${NC}"
-        read -rp "请输入注册证书所需的邮箱地址 (例如 admin@example.com): " acme_email
+        read -rp "请输入申请证书所需的邮箱 (例如 admin@example.com): " acme_email
         [[ -z "$acme_email" ]] && acme_email="admin@example.com"
         curl https://get.acme.sh | sh -s email="$acme_email"
         echo -e "${GREEN}✓ acme.sh 安装完成，正在设置默认 CA 为 Let's Encrypt...${NC}"
@@ -161,7 +162,7 @@ acme_manager() {
         echo "1. 安装 / 重新安装 Acme.sh 并配置 Let's Encrypt CA"
         echo "2. 申请证书 (80 端口 Standalone 独立验证模式)"
         echo "3. 申请证书 (自定义端口 Standalone 验证，如 88)"
-        echo "4. 为 Rathole 转换 PKCS#12 (.p12) 并设置续期重启钩子"
+        echo "4. 为 Rathole 转换 PKCS#12 (.p12) 并挂载续期重启钩子"
         echo "5. 查看已申请的域名证书列表"
         echo "0. 返回上级菜单"
         echo "======================================================"
@@ -177,13 +178,13 @@ acme_manager() {
                 ensure_acme_installed
                 read -rp "请输入要申请证书的完整域名: " domain_name
                 [[ -z "$domain_name" ]] && echo -e "${RED}域名不能为空！${NC}" && continue
-                echo -e "${BLUE}开始申请证书 (需要本机的 80 端口未被占用)...${NC}"
+                echo -e "${BLUE}开始申请证书 (请确保本地 80 端口空闲)...${NC}"
                 "$ACME_BIN" --issue -d "$domain_name" --standalone
                 ;;
             3)
                 ensure_acme_installed
                 read -rp "请输入要申请证书的完整域名: " domain_name
-                read -rp "请输入用于验证的空闲端口 [例如 88]: " http_port
+                read -rp "请输入验证端口 [例如 88]: " http_port
                 [[ -z "$domain_name" || -z "$http_port" ]] && echo -e "${RED}域名或端口不能为空！${NC}" && continue
                 echo -e "${BLUE}开始申请证书 (监听端口: ${http_port})...${NC}"
                 "$ACME_BIN" --issue -d "$domain_name" --standalone --httpport "$http_port"
@@ -193,7 +194,7 @@ acme_manager() {
                 read -rp "请输入已申请证书的域名 (如 ra.223327.xyz): " cert_domain
                 read -rp "请输入导出 PKCS#12 的密码 [默认 rathole_pass_123]: " p12_pass
                 p12_pass=${p12_pass:-rathole_pass_123}
-                read -rp "关联的 Rathole 配置服务名称 (用于重启服务，如 server): " svc_instance
+                read -rp "关联的 Rathole 配置服务名称 (用于更新后重启实例，如 server): " svc_instance
                 svc_instance=${svc_instance:-server}
 
                 local ecc_dir="${ACME_HOME}/${cert_domain}_ecc"
@@ -205,12 +206,12 @@ acme_manager() {
                 elif [[ -d "$standard_dir" ]]; then
                     source_dir="$standard_dir"
                 else
-                    echo -e "${RED}未在 ${ACME_HOME} 下检测到该域名的证书目录！${NC}"
+                    echo -e "${RED}未在 ${ACME_HOME} 下找到该域名的证书目录！${NC}"
                     continue
                 fi
 
                 local p12_out="${CERTS_DIR}/${cert_domain}.p12"
-                echo -e "${BLUE}正在导出证书到: ${p12_out}${NC}"
+                echo -e "${BLUE}正在导出证书至: ${p12_out}${NC}"
 
                 openssl pkcs12 -export \
                     -in "${source_dir}/fullchain.cer" \
@@ -225,7 +226,7 @@ acme_manager() {
                 [[ "$source_dir" == *"_ecc"* ]] && is_ecc_flag="--ecc"
 
                 "$ACME_BIN" --install-cert -d "$cert_domain" $is_ecc_flag --reloadcmd "$reload_hook"
-                echo -e "${GREEN}✓ PKCS#12 证书导出完成并已挂载续期 Hook: ${p12_out}${NC}"
+                echo -e "${GREEN}✓ PKCS#12 转换完成并成功注入续期 Hook！${NC}"
                 ;;
             5)
                 if [[ -f "$ACME_BIN" ]]; then
@@ -235,64 +236,96 @@ acme_manager() {
                 fi
                 ;;
             0) break ;;
-            *) echo -e "${RED}输入无效${NC}" ;;
+            *) echo -e "${RED}无效输入${NC}" ;;
         esac
     done
 }
 
-# ======================= 版本检查与自动安装/更新 =======================
-get_latest_release_info() {
-    local api_url="${PROXY_PREFIX}https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
-    local release_json
-    release_json=$(curl -sSL "$api_url")
-    
-    LATEST_TAG=$(echo "$release_json" | jq -r '.tag_name // empty')
-    if [[ -z "$LATEST_TAG" ]]; then
-        echo -e "${RED}获取最新版本号失败，请检查网络或加速代理连通性。${NC}"
-        return 1
+# ======================= 版本检查（仅直连，绝不走代理） =======================
+get_latest_release_tag() {
+    LATEST_TAG=""
+    local ua="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+
+    # 1. 尝试直接请求 GitHub 官方 API
+    local api_res
+    api_res=$(curl -sSL -m 6 -H "User-Agent: ${ua}" "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null || true)
+    if [[ -n "$api_res" ]] && echo "$api_res" | jq -e '.tag_name' &>/dev/null; then
+        LATEST_TAG=$(echo "$api_res" | jq -r '.tag_name')
+        return 0
     fi
-    
-    DOWNLOAD_URL=$(echo "$release_json" | jq -r '.assets[] | select(.name | contains("x86_64-unknown-linux-gnu.zip")) | .browser_download_url' | head -n 1)
-    if [[ -z "$DOWNLOAD_URL" ]]; then
-        DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/download/${LATEST_TAG}/rathole-x86_64-unknown-linux-gnu.zip"
+
+    # 2. 备选方案：通过官方 releases/latest 302 目标 URL 获取 tag（彻底避开 API 速率限制及 JSON 解析）
+    local redirect_url
+    redirect_url=$(curl -sSLI -m 6 -o /dev/null -w "%{url_effective}" "https://github.com/${GITHUB_REPO}/releases/latest" 2>/dev/null || true)
+    if [[ "$redirect_url" =~ tag/(v?[0-9].*) ]]; then
+        LATEST_TAG="${BASH_REMATCH[1]}"
+        return 0
     fi
+
+    # 3. 容错手动输入
+    echo -e "${YELLOW}未能通过官方直接解析到最新版本号。${NC}"
+    read -rp "请手动指定要安装的版本号 (例如 v0.5.0，直接回车取消): " manual_tag
+    if [[ -n "$manual_tag" ]]; then
+        LATEST_TAG="$manual_tag"
+        return 0
+    fi
+
+    return 1
 }
 
+# ======================= 下载与安装（仅此处应用代理） =======================
 install_or_update() {
-    echo -e "${BLUE}===> 正在检索 Rathole 官方最新稳定版...${NC}"
-    get_latest_release_info || return
+    echo -e "${BLUE}===> 正在检查 Rathole 官方最新稳定版...${NC}"
+    if ! get_latest_release_tag; then
+        echo -e "${RED}获取最新版本失败。${NC}"
+        return
+    fi
 
     local current_ver=""
     if [[ -f "$BIN_PATH" ]]; then
         current_ver=$("$BIN_PATH" --version 2>&1 | awk '{print $2}')
-        echo -e "当前本地版本: ${YELLOW}v${current_ver}${NC}"
+        echo -e "当前本地安装版本: ${YELLOW}v${current_ver}${NC}"
     else
         echo -e "当前本地状态: ${YELLOW}未安装${NC}"
     fi
 
-    echo -e "官方最新版本: ${GREEN}${LATEST_TAG}${NC}"
+    echo -e "目标安装版本: ${GREEN}${LATEST_TAG}${NC}"
 
-    if [[ "v${current_ver}" == "${LATEST_TAG}" ]]; then
-        read -rp "当前版本已是最新，是否强制重新下载覆盖？(y/N): " force_reinstall
+    if [[ "v${current_ver}" == "${LATEST_TAG}" || "${current_ver}" == "${LATEST_TAG}" ]]; then
+        read -rp "当前版本已是最新，是否覆盖重装？(y/N): " force_reinstall
         if [[ "$force_reinstall" != "y" && "$force_reinstall" != "Y" ]]; then
             return
         fi
     fi
 
-    local target_url="${PROXY_PREFIX}${DOWNLOAD_URL}"
-    echo -e "${BLUE}开始通过加速代理下载: ${target_url}${NC}"
-    
+    # 构造原始下载路径及代理加速下载路径
+    local raw_download_url="https://github.com/${GITHUB_REPO}/releases/download/${LATEST_TAG}/rathole-x86_64-unknown-linux-gnu.zip"
+    local proxy_download_url="${DOWNLOAD_PROXY}${raw_download_url}"
+
+    echo -e "${BLUE}通过下载代理拉取: ${proxy_download_url}${NC}"
+
     local tmp_dir
     tmp_dir=$(mktemp -d)
-    if curl -fSL -o "${tmp_dir}/rathole.zip" "$target_url"; then
+
+    # 优先走代理下载，如果代理出错则回退到官方直连
+    if curl -fSL -o "${tmp_dir}/rathole.zip" "$proxy_download_url"; then
         unzip -qo "${tmp_dir}/rathole.zip" -d "$tmp_dir"
         install -m 755 "${tmp_dir}/rathole" "$BIN_PATH"
         rm -rf "$tmp_dir"
         init_systemd_templates
-        echo -e "${GREEN}✓ Rathole ${LATEST_TAG} 安装/更新成功！${NC}"
+        echo -e "${GREEN}✓ Rathole ${LATEST_TAG} 安装成功！安装路径: ${BIN_PATH}${NC}"
     else
-        echo -e "${RED}下载失败，请检查镜像源或网络。${NC}"
-        rm -rf "$tmp_dir"
+        echo -e "${YELLOW}代理下载失败，正在尝试直连官方源下载...${NC}"
+        if curl -fSL -o "${tmp_dir}/rathole.zip" "$raw_download_url"; then
+            unzip -qo "${tmp_dir}/rathole.zip" -d "$tmp_dir"
+            install -m 755 "${tmp_dir}/rathole" "$BIN_PATH"
+            rm -rf "$tmp_dir"
+            init_systemd_templates
+            echo -e "${GREEN}✓ Rathole ${LATEST_TAG} 安装成功！${NC}"
+        else
+            echo -e "${RED}下载失败，请检查网络连接。${NC}"
+            rm -rf "$tmp_dir"
+        fi
     fi
 }
 
@@ -301,7 +334,7 @@ add_config() {
     echo -e "\n${BLUE}--- 添加 Rathole 配置文件 ---${NC}"
     read -rp "请输入配置文件名称 (无需后缀，例如 app1): " conf_name
     [[ -z "$conf_name" ]] && echo -e "${RED}名称不能为空！${NC}" && return
-    
+
     local target_file="${CONFIG_DIR}/${conf_name}.toml"
     if [[ -f "$target_file" ]]; then
         echo -e "${RED}错误: 配置文件 ${conf_name}.toml 已存在！${NC}"
@@ -313,7 +346,7 @@ add_config() {
     echo "2. 客户端 (Client)"
     read -rp "输入选项 [1-2]: " role_choice
 
-    echo -e "\n选择传输层加密模式 (Transport Layer):"
+    echo -e "\n选择传输层通道加密模式 (Transport Layer):"
     echo "1. Plain (常规明文直连)"
     echo "2. Noise (Noise Protocol 加密，轻量安全免配置证书)"
     echo "3. TLS / mTLS (基于 TLS 证书加密)"
@@ -374,7 +407,6 @@ path = "${p12_path}"
 password = "${p12_pwd}"
 EOF
                 else
-                    # 探测 Acme 默认目录
                     echo "正在检索 ${ACME_HOME} 中的证书..."
                     if [[ -d "$ACME_HOME" ]]; then
                         find "$ACME_HOME" -maxdepth 2 -name "fullchain.cer" 2>/dev/null || true
