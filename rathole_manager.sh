@@ -2,7 +2,6 @@
 set -euo pipefail
 
 # ======================= 环境模式与路径自动判定 =======================
-# 该代理仅在执行 release 包下载时拼接生效
 DOWNLOAD_PROXY="https://gitpy.223327.xyz/"
 GITHUB_REPO="rathole-org/rathole"
 
@@ -273,7 +272,7 @@ get_latest_release_tag() {
     return 1
 }
 
-# ======================= 下载与安装（精准提取本地多行版本号） =======================
+# ======================= 下载与安装（精准提取版本号） =======================
 install_or_update() {
     echo -e "${BLUE}===> 正在检查 Rathole 官方最新稳定版...${NC}"
     if ! get_latest_release_tag; then
@@ -283,10 +282,14 @@ install_or_update() {
 
     local current_ver=""
     if [[ -f "$BIN_PATH" ]]; then
-        # Rathole 输出格式为多行构建元数据，提取其中以 Version: 开头的行
-        current_ver=$("$BIN_PATH" --version 2>&1 | awk -F': *' '/^Version:/ {print $2}' | tr -d ' \r\n')
-        if [[ -n "$current_ver" ]]; then
-            [[ "$current_ver" != v* ]] && current_ver="v${current_ver}"
+        # 执行 rathole -V 并使用正则精准匹配版本号
+        local raw_ver
+        raw_ver=$("$BIN_PATH" -V 2>&1 || true)
+        local parsed_ver
+        parsed_ver=$(echo "$raw_ver" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+
+        if [[ -n "$parsed_ver" ]]; then
+            current_ver="v${parsed_ver}"
             echo -e "当前本地安装版本: ${YELLOW}${current_ver}${NC}"
         else
             echo -e "当前本地安装版本: ${YELLOW}未知版本${NC}"
@@ -300,6 +303,7 @@ install_or_update() {
     [[ "$display_latest_tag" != v* ]] && display_latest_tag="v${display_latest_tag}"
     echo -e "目标安装版本: ${GREEN}${display_latest_tag}${NC}"
 
+    # 版本对齐对比
     if [[ -n "$current_ver" && "$current_ver" == "$display_latest_tag" ]]; then
         read -rp "当前版本已是最新 (${current_ver})，是否覆盖重装？(y/N): " force_reinstall
         if [[ "$force_reinstall" != "y" && "$force_reinstall" != "Y" ]]; then
