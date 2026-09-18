@@ -5,7 +5,7 @@ set -euo pipefail
 DOWNLOAD_PROXY="https://gitpy.223327.xyz/"
 GITHUB_REPO="rathole-org/rathole"
 
-# 终端色彩输出
+# 终端色彩定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -39,6 +39,59 @@ fi
 CERTS_DIR="${CONFIG_DIR}/certs"
 CLIENT_SERVICE_FILE="${SYSTEMD_DIR}/rathole-client@.service"
 SERVER_SERVICE_FILE="${SYSTEMD_DIR}/rathole-server@.service"
+
+# ======================= 终端中英混排与居中对齐工具函数 =======================
+# 计算字符串在终端中的可见显示宽度（过滤 ANSI 颜色代码，中文字符计宽 2）
+get_display_width() {
+    local str="$1"
+    local clean_str
+    clean_str=$(echo -e "$str" | sed -r "s/\x1B\[[0-9;]*[a-zA-Z]//g")
+    local byte_len=${#clean_str}
+    local u8_len
+    u8_len=$(echo -n "$clean_str" | wc -m)
+    # 中文字符每个在 UTF-8 占 3 字节、1 个字宽单位；终端显示占 2 个半角宽度
+    echo $(( (byte_len - u8_len) / 2 + u8_len ))
+}
+
+# 文本居中打印并按目标宽度补空格
+print_cell_center() {
+    local raw_text="$1"
+    local target_width="$2"
+    local cur_width
+    cur_width=$(get_display_width "$raw_text")
+
+    if (( cur_width >= target_width )); then
+        echo -en "${raw_text} "
+        return
+    fi
+
+    local pad_total=$(( target_width - cur_width ))
+    local pad_left=$(( pad_total / 2 ))
+    local pad_right=$(( pad_total - pad_left ))
+
+    printf "%*s" "$pad_left" ""
+    echo -en "$raw_text"
+    printf "%*s" "$pad_right" ""
+}
+
+# 状态带颜色格式化
+format_status_colored() {
+    local status="$1"
+    case "$status" in
+        active)
+            echo -en "${GREEN}● active${NC}"
+            ;;
+        inactive)
+            echo -en "${RED}○ inactive${NC}"
+            ;;
+        failed)
+            echo -en "${RED}✖ failed${NC}"
+            ;;
+        *)
+            echo -en "${YELLOW}? ${status}${NC}"
+            ;;
+    esac
+}
 
 # ======================= 依赖检查 =======================
 check_dependencies() {
@@ -245,7 +298,6 @@ get_latest_release_tag() {
     LATEST_TAG=""
     local ua="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
 
-    # 1. 尝试直接请求 GitHub 官方 API
     local api_res
     api_res=$(curl -sSL -m 6 -H "User-Agent: ${ua}" "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null || true)
     if [[ -n "$api_res" ]] && echo "$api_res" | jq -e '.tag_name' &>/dev/null; then
@@ -253,7 +305,6 @@ get_latest_release_tag() {
         return 0
     fi
 
-    # 2. 备选方案：通过官方 releases/latest 302 目标 URL 获取 tag
     local redirect_url
     redirect_url=$(curl -sSLI -m 6 -o /dev/null -w "%{url_effective}" "https://github.com/${GITHUB_REPO}/releases/latest" 2>/dev/null || true)
     if [[ "$redirect_url" =~ tag/(v?[0-9].*) ]]; then
@@ -261,7 +312,6 @@ get_latest_release_tag() {
         return 0
     fi
 
-    # 3. 容错手动输入
     echo -e "${YELLOW}未能通过官方直接解析到最新版本号。${NC}"
     read -rp "请手动指定要安装的版本号 (例如 v0.5.0，直接回车取消): " manual_tag
     if [[ -n "$manual_tag" ]]; then
@@ -272,7 +322,7 @@ get_latest_release_tag() {
     return 1
 }
 
-# ======================= 下载与安装（精准提取版本号） =======================
+# ======================= 下载与安装 =======================
 install_or_update() {
     echo -e "${BLUE}===> 正在检查 Rathole 官方最新稳定版...${NC}"
     if ! get_latest_release_tag; then
@@ -523,7 +573,7 @@ delete_config() {
     fi
 }
 
-# ======================= 服务运行与状态控制 (修复对齐与多余输出) =======================
+# ======================= 实例运行状态看板 (居中排版与色彩高亮) =======================
 manage_services() {
     local mode_tag="用户模式"
     [[ "$IS_ROOT" == true ]] && mode_tag="Root 全局模式"
@@ -535,8 +585,20 @@ manage_services() {
         return
     fi
 
-    printf "%-18s %-12s %-16s %-16s\n" "配置名称" "配置类型" "Client 状态" "Server 状态"
-    echo "----------------------------------------------------------------"
+    # 各列固定半角显示宽度定义 (依次为: 配置名称, 配置类型, Client状态, Server状态)
+    local W_NAME=18
+    local W_TYPE=14
+    local W_CSTATUS=18
+    local W_SSTATUS=18
+
+    # 打印居中表头
+    print_cell_center "配置名称" "$W_NAME"
+    print_cell_center "配置类型" "$W_TYPE"
+    print_cell_center "Client 状态" "$W_CSTATUS"
+    print_cell_center "Server 状态" "$W_SSTATUS"
+    echo
+    echo "----------------------------------------------------------------------"
+
     for f in "${files[@]}"; do
         local name
         name=$(basename "$f" .toml)
@@ -544,7 +606,6 @@ manage_services() {
         if grep -q "^\[client\]" "$f"; then role="Client"; fi
         if grep -q "^\[server\]" "$f"; then role="Server"; fi
 
-        # 仅截取第一行并去除多余空白字符
         local c_status s_status
         c_status=$($SYSTEMCTL_CMD is-active "rathole-client@${name}" 2>/dev/null | head -n 1 | tr -d ' \r\n' || true)
         s_status=$($SYSTEMCTL_CMD is-active "rathole-server@${name}" 2>/dev/null | head -n 1 | tr -d ' \r\n' || true)
@@ -552,9 +613,20 @@ manage_services() {
         [[ -z "$c_status" ]] && c_status="inactive"
         [[ -z "$s_status" ]] && s_status="inactive"
 
-        printf "%-18s %-12s %-16s %-16s\n" "$name" "$role" "$c_status" "$s_status"
+        # 格式化带颜色状态文本
+        local c_colored
+        c_colored=$(format_status_colored "$c_status")
+        local s_colored
+        s_colored=$(format_status_colored "$s_status")
+
+        # 依次居中对齐打印每一列
+        print_cell_center "$name" "$W_NAME"
+        print_cell_center "$role" "$W_TYPE"
+        print_cell_center "$c_colored" "$W_CSTATUS"
+        print_cell_center "$s_colored" "$W_SSTATUS"
+        echo
     done
-    echo "----------------------------------------------------------------"
+    echo "----------------------------------------------------------------------"
 
     read -rp "请输入要操作的配置名称: " op_name
     if [[ ! -f "${CONFIG_DIR}/${op_name}.toml" ]]; then
