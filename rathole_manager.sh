@@ -10,7 +10,11 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 NC='\033[0m'
+
+ACME_HOME="${HOME}/.acme.sh"
+ACME_BIN="${ACME_HOME}/acme.sh"
 
 if [[ $EUID -eq 0 ]]; then
     IS_ROOT=true
@@ -27,18 +31,18 @@ else
     CONFIG_DIR="${HOME}/.local/etc/rathole"
     SYSTEMD_DIR="${HOME}/.config/systemd/user"
     mkdir -p "${HOME}/.local/bin"
-    # 确保用户 local bin 在 PATH 中
     if [[ ":$PATH:" != *":${HOME}/.local/bin:"* ]]; then
         export PATH="${HOME}/.local/bin:$PATH"
     fi
 fi
 
+CERTS_DIR="${CONFIG_DIR}/certs"
 CLIENT_SERVICE_FILE="${SYSTEMD_DIR}/rathole-client@.service"
 SERVER_SERVICE_FILE="${SYSTEMD_DIR}/rathole-server@.service"
 
 # ======================= 依赖检查 =======================
 check_dependencies() {
-    for cmd in curl jq unzip systemctl; do
+    for cmd in curl jq unzip systemctl openssl socat; do
         if ! command -v "$cmd" &>/dev/null; then
             if [[ "$IS_ROOT" == true ]]; then
                 echo -e "${YELLOW}缺少依赖 $cmd，正在自动安装...${NC}"
@@ -53,14 +57,14 @@ check_dependencies() {
                     exit 1
                 fi
             else
-                echo -e "${RED}错误: 系统缺少命令 '$cmd'。作为非 root 用户无法直接安装，请联系管理员或使用包管理器安装该依赖。${NC}"
-                exit 1
+                echo -e "${YELLOW}提示: 系统未检测到 $cmd，如果涉及证书申请(socat)或解压，请确保已安装。${NC}"
             fi
         fi
     done
 }
 
 mkdir -p "$CONFIG_DIR"
+mkdir -p "$CERTS_DIR"
 mkdir -p "$SYSTEMD_DIR"
 check_dependencies
 
@@ -131,13 +135,109 @@ ExecStart=%h/.local/bin/rathole -s %h/.local/etc/rathole/%i.toml
 WantedBy=default.target
 EOF
 
-        # 非 root 用户开启 linger，确保退出终端后服务仍然常驻后台运行
         if command -v loginctl &>/dev/null; then
             loginctl enable-linger "$USER" 2>/dev/null || true
         fi
     fi
 
     $SYSTEMCTL_CMD daemon-reload
+}
+
+# ======================= Acme.sh 管理模块 =======================
+ensure_acme_installed() {
+    if [[ ! -f "$ACME_BIN" ]]; then
+        echo -e "${YELLOW}未检测到 acme.sh，正在执行官方脚本安装...${NC}"
+        read -rp "请输入注册证书所需的邮箱地址 (例如 admin@example.com): " acme_email
+        [[ -z "$acme_email" ]] && acme_email="admin@example.com"
+        curl https://get.acme.sh | sh -s email="$acme_email"
+        echo -e "${GREEN}✓ acme.sh 安装完成，正在设置默认 CA 为 Let's Encrypt...${NC}"
+        "$ACME_BIN" --set-default-ca --server letsencrypt
+    fi
+}
+
+acme_manager() {
+    while true; do
+        echo -e "\n${CYAN}================ Acme.sh 证书管理面板 ================${NC}"
+        echo "1. 安装 / 重新安装 Acme.sh 并配置 Let's Encrypt CA"
+        echo "2. 申请证书 (80 端口 Standalone 独立验证模式)"
+        echo "3. 申请证书 (自定义端口 Standalone 验证，如 88)"
+        echo "4. 为 Rathole 转换 PKCS#12 (.p12) 并设置续期重启钩子"
+        echo "5. 查看已申请的域名证书列表"
+        echo "0. 返回上级菜单"
+        echo "======================================================"
+        read -rp "请输入选项 [0-5]: " acme_choice
+
+        case "$acme_choice" in
+            1)
+                ensure_acme_installed
+                "$ACME_BIN" --set-default-ca --server letsencrypt
+                echo -e "${GREEN}✓ Acme.sh 已初始化且默认 CA 已切至 Let's Encrypt${NC}"
+                ;;
+            2)
+                ensure_acme_installed
+                read -rp "请输入要申请证书的完整域名: " domain_name
+                [[ -z "$domain_name" ]] && echo -e "${RED}域名不能为空！${NC}" && continue
+                echo -e "${BLUE}开始申请证书 (需要本机的 80 端口未被占用)...${NC}"
+                "$ACME_BIN" --issue -d "$domain_name" --standalone
+                ;;
+            3)
+                ensure_acme_installed
+                read -rp "请输入要申请证书的完整域名: " domain_name
+                read -rp "请输入用于验证的空闲端口 [例如 88]: " http_port
+                [[ -z "$domain_name" || -z "$http_port" ]] && echo -e "${RED}域名或端口不能为空！${NC}" && continue
+                echo -e "${BLUE}开始申请证书 (监听端口: ${http_port})...${NC}"
+                "$ACME_BIN" --issue -d "$domain_name" --standalone --httpport "$http_port"
+                ;;
+            4)
+                ensure_acme_installed
+                read -rp "请输入已申请证书的域名 (如 ra.223327.xyz): " cert_domain
+                read -rp "请输入导出 PKCS#12 的密码 [默认 rathole_pass_123]: " p12_pass
+                p12_pass=${p12_pass:-rathole_pass_123}
+                read -rp "关联的 Rathole 配置服务名称 (用于重启服务，如 server): " svc_instance
+                svc_instance=${svc_instance:-server}
+
+                local ecc_dir="${ACME_HOME}/${cert_domain}_ecc"
+                local standard_dir="${ACME_HOME}/${cert_domain}"
+                local source_dir=""
+
+                if [[ -d "$ecc_dir" ]]; then
+                    source_dir="$ecc_dir"
+                elif [[ -d "$standard_dir" ]]; then
+                    source_dir="$standard_dir"
+                else
+                    echo -e "${RED}未在 ${ACME_HOME} 下检测到该域名的证书目录！${NC}"
+                    continue
+                fi
+
+                local p12_out="${CERTS_DIR}/${cert_domain}.p12"
+                echo -e "${BLUE}正在导出证书到: ${p12_out}${NC}"
+
+                openssl pkcs12 -export \
+                    -in "${source_dir}/fullchain.cer" \
+                    -inkey "${source_dir}/${cert_domain}.key" \
+                    -out "$p12_out" \
+                    -passout "pass:${p12_pass}"
+
+                local restart_cmd="${SYSTEMCTL_CMD} restart rathole-server@${svc_instance}"
+                local reload_hook="openssl pkcs12 -export -in ${source_dir}/fullchain.cer -inkey ${source_dir}/${cert_domain}.key -out ${p12_out} -passout pass:${p12_pass} && ${restart_cmd}"
+
+                local is_ecc_flag=""
+                [[ "$source_dir" == *"_ecc"* ]] && is_ecc_flag="--ecc"
+
+                "$ACME_BIN" --install-cert -d "$cert_domain" $is_ecc_flag --reloadcmd "$reload_hook"
+                echo -e "${GREEN}✓ PKCS#12 证书导出完成并已挂载续期 Hook: ${p12_out}${NC}"
+                ;;
+            5)
+                if [[ -f "$ACME_BIN" ]]; then
+                    "$ACME_BIN" --list
+                else
+                    echo -e "${YELLOW}尚未安装 acme.sh${NC}"
+                fi
+                ;;
+            0) break ;;
+            *) echo -e "${RED}输入无效${NC}" ;;
+        esac
+    done
 }
 
 # ======================= 版本检查与自动安装/更新 =======================
@@ -148,7 +248,7 @@ get_latest_release_info() {
     
     LATEST_TAG=$(echo "$release_json" | jq -r '.tag_name // empty')
     if [[ -z "$LATEST_TAG" ]]; then
-        echo -e "${RED}获取最新版本号失败，请检查网络或代理连通性。${NC}"
+        echo -e "${RED}获取最新版本号失败，请检查网络或加速代理连通性。${NC}"
         return 1
     fi
     
@@ -159,7 +259,7 @@ get_latest_release_info() {
 }
 
 install_or_update() {
-    echo -e "${BLUE}===> 正在检测 Rathole 官方最新稳定版...${NC}"
+    echo -e "${BLUE}===> 正在检索 Rathole 官方最新稳定版...${NC}"
     get_latest_release_info || return
 
     local current_ver=""
@@ -173,7 +273,7 @@ install_or_update() {
     echo -e "官方最新版本: ${GREEN}${LATEST_TAG}${NC}"
 
     if [[ "v${current_ver}" == "${LATEST_TAG}" ]]; then
-        read -rp "当前版本已是最新，是否强制重新安装？(y/N): " force_reinstall
+        read -rp "当前版本已是最新，是否强制重新下载覆盖？(y/N): " force_reinstall
         if [[ "$force_reinstall" != "y" && "$force_reinstall" != "Y" ]]; then
             return
         fi
@@ -189,9 +289,9 @@ install_or_update() {
         install -m 755 "${tmp_dir}/rathole" "$BIN_PATH"
         rm -rf "$tmp_dir"
         init_systemd_templates
-        echo -e "${GREEN}✓ Rathole ${LATEST_TAG} 安装成功！目标路径: ${BIN_PATH}${NC}"
+        echo -e "${GREEN}✓ Rathole ${LATEST_TAG} 安装/更新成功！${NC}"
     else
-        echo -e "${RED}下载失败，请检查加速源或网络环境。${NC}"
+        echo -e "${RED}下载失败，请检查镜像源或网络。${NC}"
         rm -rf "$tmp_dir"
     fi
 }
@@ -199,7 +299,7 @@ install_or_update() {
 # ======================= 多协议/多模式配置生成 =======================
 add_config() {
     echo -e "\n${BLUE}--- 添加 Rathole 配置文件 ---${NC}"
-    read -rp "请输入配置文件名称 (无需后缀，例如 web1): " conf_name
+    read -rp "请输入配置文件名称 (无需后缀，例如 app1): " conf_name
     [[ -z "$conf_name" ]] && echo -e "${RED}名称不能为空！${NC}" && return
     
     local target_file="${CONFIG_DIR}/${conf_name}.toml"
@@ -213,14 +313,14 @@ add_config() {
     echo "2. 客户端 (Client)"
     read -rp "输入选项 [1-2]: " role_choice
 
-    echo -e "\n选择传输层通道加密模式 (Transport Layer):"
-    echo "1. Plain (普通直连，无通道封装)"
-    echo "2. Noise (Noise Protocol 加密，免配置证书)"
+    echo -e "\n选择传输层加密模式 (Transport Layer):"
+    echo "1. Plain (常规明文直连)"
+    echo "2. Noise (Noise Protocol 加密，轻量安全免配置证书)"
     echo "3. TLS / mTLS (基于 TLS 证书加密)"
     read -rp "输入传输层选项 [1-3, 默认 1]: " transport_choice
     transport_choice=${transport_choice:-1}
 
-    echo -e "\n选择转发业务协议类型 (Service Type):"
+    echo -e "\n选择内网穿透协议类型 (Service Type):"
     echo "1. TCP"
     echo "2. UDP"
     read -rp "输入协议类型 [1-2, 默认 1]: " proto_choice
@@ -229,12 +329,12 @@ add_config() {
 
     case "$role_choice" in
         1)
-            # 服务端参数录入
-            read -rp "服务端监听端口 [默认 2333]: " bind_port
+            # 服务端
+            read -rp "服务端运行监听端口 [默认 2333]: " bind_port
             bind_port=${bind_port:-2333}
-            read -rp "转发服务名称 (Service Name, 例如 app_tcp): " svc_name
-            read -rp "公网访问端口 (bind_addr 端口, 例如 8080): " svc_bind_port
-            read -rp "认证密钥 (token): " svc_token
+            read -rp "转发服务名称 (Service Name, 例如 web_app): " svc_name
+            read -rp "对外暴露公网监听端口 (bind_addr 端口, 例如 8080): " svc_bind_port
+            read -rp "服务共享鉴权密钥 (token): " svc_token
 
             cat <<EOF > "$target_file"
 # Rathole Server Configuration
@@ -249,9 +349,39 @@ EOF
 type = "noise"
 EOF
             elif [[ "$transport_choice" == "3" ]]; then
-                read -rp "TLS 证书绝对路径 (如 ${CONFIG_DIR}/server.crt): " tls_cert
-                read -rp "TLS 私钥绝对路径 (如 ${CONFIG_DIR}/server.key): " tls_key
-                cat <<EOF >> "$target_file"
+                echo -e "\n${CYAN}--- TLS 证书配置 ---${NC}"
+                echo "1. 使用 PKCS#12 格式证书 (.p12)"
+                echo "2. 使用 PEM 格式证书 (.cer / .crt 和 .key)"
+                read -rp "请选择证书类型 [1-2, 默认 1]: " cert_format
+                cert_format=${cert_format:-1}
+
+                if [[ "$cert_format" == "1" ]]; then
+                    echo "系统已检测到的 .p12 证书:"
+                    local p12_files=("$CERTS_DIR"/*.p12)
+                    if [[ -e "${p12_files[0]}" ]]; then
+                        for pf in "${p12_files[@]}"; do
+                            echo " - $pf"
+                        done
+                    fi
+                    read -rp "请输入 .p12 证书路径: " p12_path
+                    read -rp "请输入 .p12 证书密码: " p12_pwd
+                    cat <<EOF >> "$target_file"
+
+[server.transport]
+type = "tls"
+[server.transport.tls.pkcs12]
+path = "${p12_path}"
+password = "${p12_pwd}"
+EOF
+                else
+                    # 探测 Acme 默认目录
+                    echo "正在检索 ${ACME_HOME} 中的证书..."
+                    if [[ -d "$ACME_HOME" ]]; then
+                        find "$ACME_HOME" -maxdepth 2 -name "fullchain.cer" 2>/dev/null || true
+                    fi
+                    read -rp "TLS 证书全链路径 (cert/fullchain.cer): " tls_cert
+                    read -rp "TLS 私钥路径 (key): " tls_key
+                    cat <<EOF >> "$target_file"
 
 [server.transport]
 type = "tls"
@@ -259,6 +389,7 @@ type = "tls"
 cert = "${tls_cert}"
 key = "${tls_key}"
 EOF
+                fi
             fi
 
             cat <<EOF >> "$target_file"
@@ -272,13 +403,13 @@ EOF
             ;;
 
         2)
-            # 客户端参数录入
-            read -rp "服务端 IP 或域名: " server_host
-            read -rp "服务端连接端口 [默认 2333]: " server_port
+            # 客户端
+            read -rp "服务端公网 IP 或域名: " server_host
+            read -rp "服务端监听端口 [默认 2333]: " server_port
             server_port=${server_port:-2333}
-            read -rp "转发服务名称 (须与服务端配置一致): " svc_name
+            read -rp "转发服务名称 (须与服务端一致): " svc_name
             read -rp "本地目标服务地址 (local_addr, 例如 127.0.0.1:80): " local_addr
-            read -rp "认证密钥 (token, 须与服务端一致): " svc_token
+            read -rp "服务共享鉴权密钥 (token, 须与服务端一致): " svc_token
 
             cat <<EOF > "$target_file"
 # Rathole Client Configuration
@@ -293,7 +424,7 @@ EOF
 type = "noise"
 EOF
             elif [[ "$transport_choice" == "3" ]]; then
-                read -rp "服务端 TLS 验证域名 (trusted_root/SNI): " tls_sni
+                read -rp "服务端 TLS 认证域名 (trusted_root/SNI，例如 example.com): " tls_sni
                 cat <<EOF >> "$target_file"
 
 [client.transport]
@@ -427,19 +558,21 @@ menu() {
         fi
 
         echo -e "\n${GREEN}================ Rathole 多实例管理面板 ${mode_desc} ================${NC}"
-        echo "1. 检查最新版本并安装/更新"
+        echo "1. 检查最新版本并安装/更新 Rathole"
         echo "2. 添加配置文件 (TCP/UDP, Plain/Noise/TLS)"
         echo "3. 删除配置文件并清理服务"
         echo "4. 服务启停控制与状态看板"
+        echo "5. Acme.sh 证书申请与管理 (支持 PKCS#12 转换与续期挂载)"
         echo "0. 退出管理脚本"
         echo "========================================================================="
-        read -rp "请输入序号 [0-4]: " choice
+        read -rp "请输入序号 [0-5]: " choice
 
         case "$choice" in
             1) install_or_update ;;
             2) add_config ;;
             3) delete_config ;;
             4) manage_services ;;
+            5) acme_manager ;;
             0) exit 0 ;;
             *) echo -e "${RED}输入无效，请重新输入。${NC}" ;;
         esac
