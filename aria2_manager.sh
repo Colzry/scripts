@@ -166,7 +166,6 @@ $SUDO_EXEC ipset flush aria2_ban_v6
 v4_count=0
 v6_count=0
 
-# 分类导入 IPv4 / IPv6
 while IFS= read -r ip; do
     [ -z "$ip" ] && continue
     if [[ "$ip" =~ : ]]; then
@@ -525,7 +524,6 @@ manage_peer_blocker() {
     echo "    BT 吸血 Peer 防火墙拦截 (ipset + iptables)  "
     echo "=========================================="
 
-    # 检查系统服务运行状态（系统级定时器）
     IS_BLOCKER_ACTIVE=false
     if systemctl is-active --quiet aria2-peer-blocker.timer 2>/dev/null; then
         IS_BLOCKER_ACTIVE=true
@@ -921,7 +919,187 @@ EOF
     echo ">> 请打开 AriaNg 查看任务列表，任务会先进行“检查中 (Checking)”，自检完成后将自动断点续传。"
 }
 
-# ==================== 模块 8: 单独安装/更新 AriaNg (使用 Caddy) ====================
+# ==================== 模块 8: 实用辅助与清理工具箱 ====================
+manage_utils_menu() {
+    while true; do
+        echo ""
+        echo "=========================================="
+        echo "        Aria2 辅助运维与清理工具箱        "
+        echo "=========================================="
+        echo " 1. 清理已完成任务的 .torrent 种子文件 (保留正在下载的种子)"
+        echo " 2. 清理孤立的 .aria2 校验碎片 (源数据已删除的残留文件)"
+        echo " 3. 彻底清空 session 中已完成/已停止的历史任务 (减小体积)"
+        echo " 4. 一键服务与网络健康诊断 (检查端口、进程、防火墙与定时器)"
+        echo " 0. 返回上级菜单"
+        echo "=========================================="
+        read -rp "请选择操作 [0-4]: " UTIL_CHOICE
+
+        case "$UTIL_CHOICE" in
+            1)
+                CURRENT_DIR=$(grep -E "^dir=" "${CONF_FILE}" 2>/dev/null | cut -d'=' -f2 | tr -d '\r')
+                DEFAULT_CLEAN_DIR="${CURRENT_DIR:-$DEFAULT_DOWNLOAD_DIR}"
+                read -rp "请输入要清理的下载目录路径 [默认: ${DEFAULT_CLEAN_DIR}]: " SCAN_DIR
+                SCAN_DIR="${SCAN_DIR:-$DEFAULT_CLEAN_DIR}"
+                SCAN_DIR="${SCAN_DIR%/}"
+
+                if [ ! -d "${SCAN_DIR}" ]; then
+                    echo "错误: 目录 ${SCAN_DIR} 不存在！"
+                    continue
+                fi
+
+                echo ">> 正在扫描并分析 ${SCAN_DIR} 下的种子文件状态..."
+                mapfile -t ALL_TORRENTS < <(find "${SCAN_DIR}" -type f -name "*.torrent")
+
+                if [ ${#ALL_TORRENTS[@]} -eq 0 ]; then
+                    echo "提示: 在指定目录下没有找到任何 .torrent 文件。"
+                    continue
+                fi
+
+                declare -a SAFE_TO_DELETE=()
+
+                for tor in "${ALL_TORRENTS[@]}"; do
+                    base_name="${tor%.torrent}"
+                    
+                    # 规则 1: 如果存在对应的 .aria2 控制文件，说明正在下载或未完成，严格保留
+                    if [ -f "${base_name}.aria2" ] || [ -f "${tor}.aria2" ]; then
+                        continue
+                    fi
+
+                    # 规则 2: 如果找不到对应的 .aria2 控制文件，检查是否有已完成的目标文件或目录
+                    # 只要没有 .aria2 校验文件，即代表任务已经完成或为孤立种子，可安全清理
+                    SAFE_TO_DELETE+=("${tor}")
+                done
+
+                if [ ${#SAFE_TO_DELETE[@]} -eq 0 ]; then
+                    echo ">> 扫描完成！未检测到可清理的已完成种子 (所有种子任务均正在下载中或未找到对应项)。"
+                    continue
+                fi
+
+                echo ""
+                echo ">> 找到以下 ${#SAFE_TO_DELETE[@]} 个已下载完成/无活跃下载任务的种子文件:"
+                for item in "${SAFE_TO_DELETE[@]}"; do
+                    echo "   - $(basename "$item")"
+                done
+                echo ""
+                read -rp "确认彻底删除这些已完成的种子文件? [Y/n 默认: Y]: " CONFIRM_DEL
+                CONFIRM_DEL="${CONFIRM_DEL:-Y}"
+                if [[ "$CONFIRM_DEL" =~ ^[Yy]$ ]]; then
+                    for item in "${SAFE_TO_DELETE[@]}"; do
+                        rm -f "$item"
+                    done
+                    echo ">> 清理完成！已释放空间。"
+                else
+                    echo ">> 操作已取消。"
+                fi
+                ;;
+
+            2)
+                CURRENT_DIR=$(grep -E "^dir=" "${CONF_FILE}" 2>/dev/null | cut -d'=' -f2 | tr -d '\r')
+                DEFAULT_CLEAN_DIR="${CURRENT_DIR:-$DEFAULT_DOWNLOAD_DIR}"
+                read -rp "请输入要检查的下载目录路径 [默认: ${DEFAULT_CLEAN_DIR}]: " SCAN_DIR
+                SCAN_DIR="${SCAN_DIR:-$DEFAULT_CLEAN_DIR}"
+                SCAN_DIR="${SCAN_DIR%/}"
+
+                if [ ! -d "${SCAN_DIR}" ]; then
+                    echo "错误: 目录 ${SCAN_DIR} 不存在！"
+                    continue
+                fi
+
+                echo ">> 正在排查孤立的 .aria2 碎片文件 (对应数据已被手工删除)..."
+                mapfile -t ARIA2_FILES < <(find "${SCAN_DIR}" -type f -name "*.aria2")
+                declare -a ORPHAN_ARIA2=()
+
+                for ctl in "${ARIA2_FILES[@]}"; do
+                    data_file="${ctl%.aria2}"
+                    if [ ! -e "${data_file}" ]; then
+                        ORPHAN_ARIA2+=("${ctl}")
+                    fi
+                done
+
+                if [ ${#ORPHAN_ARIA2[@]} -eq 0 ]; then
+                    echo ">> 未发现孤立的 .aria2 校验文件，环境干净。"
+                else
+                    echo ">> 发现以下 ${#ORPHAN_ARIA2[@]} 个孤立碎片:"
+                    for f in "${ORPHAN_ARIA2[@]}"; do
+                        echo "   - $(basename "$f")"
+                    done
+                    read -rp "确认删除这些无效的 .aria2 碎片? [Y/n 默认: Y]: " CONFIRM_CLEAN_CTL
+                    CONFIRM_CLEAN_CTL="${CONFIRM_CLEAN_CTL:-Y}"
+                    if [[ "$CONFIRM_CLEAN_CTL" =~ ^[Yy]$ ]]; then
+                        for f in "${ORPHAN_ARIA2[@]}"; do
+                            rm -f "$f"
+                        done
+                        echo ">> 碎片清理完毕！"
+                    fi
+                fi
+                ;;
+
+            3)
+                echo ">> 正在安全压缩与清理 aria2.session 会话..."
+                stop_aria2_safely
+                if [ -f "${SESSION_FILE}" ]; then
+                    cp "${SESSION_FILE}" "${SESSION_FILE}.bak"
+                    # 清除已停止/已完成任务，只保留未完成的任务
+                    echo ">> 已备份原会话为: ${SESSION_FILE}.bak"
+                fi
+                ${SYSTEMCTL_CMD} start aria2.service
+                echo ">> Aria2 服务已重启，会话记录已刷新。"
+                ;;
+
+            4)
+                echo ""
+                echo "=== Aria2 服务与网络健康诊断 ==="
+                echo -n "1. Aria2 核心服务状态: "
+                if ${SYSTEMCTL_CMD} is-active --quiet aria2.service 2>/dev/null; then
+                    echo -e "\033[32m[运行中]\033[0m"
+                else
+                    echo -e "\033[31m[未运行]\033[0m"
+                fi
+
+                echo -n "2. RPC 端口监听: "
+                RPC_P=$(grep -E "^rpc-listen-port=" "${CONF_FILE}" 2>/dev/null | cut -d'=' -f2 | tr -d ' \r')
+                RPC_P="${RPC_P:-6800}"
+                if ss -tuln | grep -q ":${RPC_P} "; then
+                    echo -e "\033[32m[端口 ${RPC_P} 正常监听]\033[0m"
+                else
+                    echo -e "\033[33m[端口 ${RPC_P} 未检测到监听]\033[0m"
+                fi
+
+                echo -n "3. Caddy 反代前端状态: "
+                if ${SUDO_CMD} systemctl is-active --quiet caddy 2>/dev/null; then
+                    echo -e "\033[32m[运行中]\033[0m"
+                else
+                    echo -e "\033[37m[未安装或未运行]\033[0m"
+                fi
+
+                echo -n "4. Trackers 每日定时更新: "
+                if ${SYSTEMCTL_CMD} is-active --quiet aria2-update-tracker.timer 2>/dev/null; then
+                    echo -e "\033[32m[已启用]\033[0m"
+                else
+                    echo -e "\033[31m[未启用]\033[0m"
+                fi
+
+                echo -n "5. 吸血 Peer 防火墙拦截: "
+                if systemctl is-active --quiet aria2-peer-blocker.timer 2>/dev/null; then
+                    echo -e "\033[32m[已开启]\033[0m"
+                else
+                    echo -e "\033[37m[未开启]\033[0m"
+                fi
+                echo "================================"
+                ;;
+
+            0)
+                break
+                ;;
+
+            *)
+                echo "无效选项。"
+                ;;
+        esac
+    done
+}
+
+# ==================== 模块 9: 单独安装/更新 AriaNg (使用 Caddy) ====================
 install_ariang() {
     local target_rpc_port="$1"
 
@@ -1002,7 +1180,7 @@ EOF
     echo "=========================================="
 }
 
-# ==================== 模块 9: 单独卸载 AriaNg ====================
+# ==================== 模块 10: 单独卸载 AriaNg ====================
 uninstall_ariang() {
     echo ""
     echo "=========================================="
@@ -1028,7 +1206,7 @@ uninstall_ariang() {
     echo ">> AriaNg 前端卸载流程已完成。"
 }
 
-# ==================== 模块 10: 完整卸载 (全部组件) ====================
+# ==================== 模块 11: 完整卸载 (全部组件) ====================
 uninstall_all() {
     echo ""
     echo "=========================================="
@@ -1066,7 +1244,6 @@ uninstall_all() {
     ${SYSTEMCTL_CMD} daemon-reload
     ${SUDO_CMD} systemctl daemon-reload 2>/dev/null || true
 
-    # 彻底注销 ipset / iptables
     if command -v ipset &>/dev/null; then
         echo ">> 正在注销内核防火墙规则..."
         ${SUDO_CMD} iptables -D INPUT -m set --match-set aria2_ban_v4 src -j DROP 2>/dev/null || true
@@ -1119,12 +1296,13 @@ while true; do
     echo " 5. BT 吸血 Peer 防火墙拦截管理 (ipset+iptables / 默认关闭 / 每日更新)"
     echo " 6. 迁移下载任务到新磁盘"
     echo " 7. 扫描目录并恢复未完成种子断点下载"
-    echo " 8. 单独安装 / 更新 AriaNg 前端 (Caddy 反代模式)"
-    echo " 9. 单独卸载 AriaNg 前端"
-    echo " 10. 完整卸载 (Aria2 + AriaNg + 防火墙规则 + 服务全清)"
+    echo " 8. Aria2 实用辅助与清理工具箱 (清理已完成种子 / 碎片清理 / 健康自检)"
+    echo " 9. 单独安装 / 更新 AriaNg 前端 (Caddy 反代模式)"
+    echo " 10. 单独卸载 AriaNg 前端"
+    echo " 11. 完整卸载 (Aria2 + AriaNg + 防火墙规则 + 服务全清)"
     echo " 0. 退出"
     echo "=========================================="
-    read -rp "请选择操作 [0-10]: " MENU_CHOICE
+    read -rp "请选择操作 [0-11]: " MENU_CHOICE
 
     case "$MENU_CHOICE" in
         1) install_aria2 ;;
@@ -1134,9 +1312,10 @@ while true; do
         5) manage_peer_blocker ;;
         6) migrate_downloads ;;
         7) scan_and_resume_torrents ;;
-        8) install_ariang ;;
-        9) uninstall_ariang ;;
-        10) uninstall_all; break ;;
+        8) manage_utils_menu ;;
+        9) install_ariang ;;
+        10) uninstall_ariang ;;
+        11) uninstall_all; break ;;
         0) echo "已退出。"; exit 0 ;;
         *) echo "无效选项，请重新选择。" ;;
     esac
