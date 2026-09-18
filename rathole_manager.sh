@@ -273,7 +273,7 @@ get_latest_release_tag() {
     return 1
 }
 
-# ======================= 下载与安装（仅此处应用代理） =======================
+# ======================= 下载与安装（精准提取本地多行版本号） =======================
 install_or_update() {
     echo -e "${BLUE}===> 正在检查 Rathole 官方最新稳定版...${NC}"
     if ! get_latest_release_tag; then
@@ -283,16 +283,25 @@ install_or_update() {
 
     local current_ver=""
     if [[ -f "$BIN_PATH" ]]; then
-        current_ver=$("$BIN_PATH" --version 2>&1 | awk '{print $2}')
-        echo -e "当前本地安装版本: ${YELLOW}v${current_ver}${NC}"
+        # Rathole 输出格式为多行构建元数据，提取其中以 Version: 开头的行
+        current_ver=$("$BIN_PATH" --version 2>&1 | awk -F': *' '/^Version:/ {print $2}' | tr -d ' \r\n')
+        if [[ -n "$current_ver" ]]; then
+            [[ "$current_ver" != v* ]] && current_ver="v${current_ver}"
+            echo -e "当前本地安装版本: ${YELLOW}${current_ver}${NC}"
+        else
+            echo -e "当前本地安装版本: ${YELLOW}未知版本${NC}"
+        fi
     else
         echo -e "当前本地状态: ${YELLOW}未安装${NC}"
     fi
 
-    echo -e "目标安装版本: ${GREEN}${LATEST_TAG}${NC}"
+    # 统一确保最新 tag 带 v
+    local display_latest_tag="$LATEST_TAG"
+    [[ "$display_latest_tag" != v* ]] && display_latest_tag="v${display_latest_tag}"
+    echo -e "目标安装版本: ${GREEN}${display_latest_tag}${NC}"
 
-    if [[ "v${current_ver}" == "${LATEST_TAG}" || "${current_ver}" == "${LATEST_TAG}" ]]; then
-        read -rp "当前版本已是最新，是否覆盖重装？(y/N): " force_reinstall
+    if [[ -n "$current_ver" && "$current_ver" == "$display_latest_tag" ]]; then
+        read -rp "当前版本已是最新 (${current_ver})，是否覆盖重装？(y/N): " force_reinstall
         if [[ "$force_reinstall" != "y" && "$force_reinstall" != "Y" ]]; then
             return
         fi
