@@ -148,7 +148,7 @@ mkdir -p "$CERTS_DIR"
 mkdir -p "$SYSTEMD_DIR"
 check_dependencies
 
-# ======================= Systemd 模板初始化 =======================
+# ======================= 强制重写并同步 Systemd 模板 =======================
 init_systemd_templates() {
     if [[ "$IS_ROOT" == true ]]; then
         cat <<'EOF' > "$CLIENT_SERVICE_FILE"
@@ -182,6 +182,11 @@ ExecStart=/usr/local/bin/rathole -s /etc/rathole/%i.toml
 [Install]
 WantedBy=multi-user.target
 EOF
+
+        # 兼容性软链接：若系统历史残留 /usr/bin/rathole 路径，避免报错
+        if [[ -f "/usr/local/bin/rathole" && ! -f "/usr/bin/rathole" ]]; then
+            ln -sf /usr/local/bin/rathole /usr/bin/rathole 2>/dev/null || true
+        fi
     else
         cat <<'EOF' > "$CLIENT_SERVICE_FILE"
 [Unit]
@@ -419,7 +424,6 @@ acme_manager() {
                     continue
                 fi
 
-                # 收集当前已申请证书的目录列表
                 local cert_domains=()
                 local cert_dirs=()
                 local cert_is_ecc=()
@@ -428,12 +432,10 @@ acme_manager() {
                     [[ -d "$d" ]] || continue
                     local bname
                     bname=$(basename "$d")
-                    # 排除 acme 自身配置及 CA 内部文件夹
                     if [[ "$bname" =~ ^(ca|deploy|dnsapi|notify)$ ]]; then
                         continue
                     fi
 
-                    # 包含 fullchain.cer 或 .conf 的认定为证书目录
                     if [[ -f "$d/fullchain.cer" || -f "$d/${bname}.conf" ]]; then
                         local pure_d="${bname%_ecc}"
                         cert_domains+=("$pure_d")
@@ -491,15 +493,12 @@ acme_manager() {
                     local rm_ecc_flag=""
                     [[ "$target_rm_ecc" == true ]] && rm_ecc_flag="--ecc"
 
-                    # 1. 停止续期任务并移出注册表
                     "$ACME_BIN" --remove -d "$target_rm_domain" $rm_ecc_flag 2>/dev/null || true
 
-                    # 2. 清理 acme 证书目录
                     if [[ -d "$target_rm_dir" ]]; then
                         rm -rf "$target_rm_dir"
                     fi
 
-                    # 3. 联动清理转换出的 .p12 证书
                     local matched_p12="${CERTS_DIR}/${target_rm_domain}.p12"
                     if [[ -f "$matched_p12" ]]; then
                         rm -f "$matched_p12"
@@ -1155,9 +1154,7 @@ menu() {
     done
 }
 
-# 初始化 Systemd 单元文件
-if [[ ! -f "$CLIENT_SERVICE_FILE" || ! -f "$SERVER_SERVICE_FILE" ]]; then
-    init_systemd_templates
-fi
+# 无论何时运行，强制同步刷新 Systemd 模板，防止残留旧路径问题
+init_systemd_templates
 
 menu
