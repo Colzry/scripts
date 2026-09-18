@@ -282,7 +282,6 @@ install_or_update() {
 
     local current_ver=""
     if [[ -f "$BIN_PATH" ]]; then
-        # 执行 rathole -V 并使用正则精准匹配版本号
         local raw_ver
         raw_ver=$("$BIN_PATH" -V 2>&1 || true)
         local parsed_ver
@@ -298,12 +297,10 @@ install_or_update() {
         echo -e "当前本地状态: ${YELLOW}未安装${NC}"
     fi
 
-    # 统一确保最新 tag 带 v
     local display_latest_tag="$LATEST_TAG"
     [[ "$display_latest_tag" != v* ]] && display_latest_tag="v${display_latest_tag}"
     echo -e "目标安装版本: ${GREEN}${display_latest_tag}${NC}"
 
-    # 版本对齐对比
     if [[ -n "$current_ver" && "$current_ver" == "$display_latest_tag" ]]; then
         read -rp "当前版本已是最新 (${current_ver})，是否覆盖重装？(y/N): " force_reinstall
         if [[ "$force_reinstall" != "y" && "$force_reinstall" != "Y" ]]; then
@@ -311,10 +308,8 @@ install_or_update() {
         fi
     fi
 
-    # 确保目标安装目录存在
     mkdir -p "$(dirname "$BIN_PATH")"
 
-    # 构造原始下载路径及代理加速下载路径
     local raw_download_url="https://github.com/${GITHUB_REPO}/releases/download/${LATEST_TAG}/rathole-x86_64-unknown-linux-gnu.zip"
     local proxy_download_url="${DOWNLOAD_PROXY}${raw_download_url}"
 
@@ -323,7 +318,6 @@ install_or_update() {
     local tmp_dir
     tmp_dir=$(mktemp -d)
 
-    # 优先走代理下载，如果代理出错则回退到官方直连
     if curl -fSL -o "${tmp_dir}/rathole.zip" "$proxy_download_url"; then
         unzip -qo "${tmp_dir}/rathole.zip" -d "$tmp_dir"
         install -m 755 "${tmp_dir}/rathole" "$BIN_PATH"
@@ -378,7 +372,6 @@ add_config() {
 
     case "$role_choice" in
         1)
-            # 服务端
             read -rp "服务端运行监听端口 [默认 2333]: " bind_port
             bind_port=${bind_port:-2333}
             read -rp "转发服务名称 (Service Name, 例如 web_app): " svc_name
@@ -451,7 +444,6 @@ EOF
             ;;
 
         2)
-            # 客户端
             read -rp "服务端公网 IP 或域名: " server_host
             read -rp "服务端监听端口 [默认 2333]: " server_port
             server_port=${server_port:-2333}
@@ -531,17 +523,20 @@ delete_config() {
     fi
 }
 
-# ======================= 服务运行与状态控制 =======================
+# ======================= 服务运行与状态控制 (修复对齐与多余输出) =======================
 manage_services() {
-    echo -e "\n${BLUE}--- 实例运行状态看板 (${IS_ROOT:+全局Root模式}${IS_ROOT:-用户模式}) ---${NC}"
+    local mode_tag="用户模式"
+    [[ "$IS_ROOT" == true ]] && mode_tag="Root 全局模式"
+    echo -e "\n${BLUE}--- 实例运行状态看板 [${mode_tag}] ---${NC}"
+    
     local files=("$CONFIG_DIR"/*.toml)
     if [[ ! -e "${files[0]}" ]]; then
         echo -e "${YELLOW}当前没有任何配置，请先添加配置后再管理。${NC}"
         return
     fi
 
-    printf "%-18s %-10s %-14s %-14s\n" "配置名称" "配置类型" "Client 状态" "Server 状态"
-    echo "--------------------------------------------------------"
+    printf "%-18s %-12s %-16s %-16s\n" "配置名称" "配置类型" "Client 状态" "Server 状态"
+    echo "----------------------------------------------------------------"
     for f in "${files[@]}"; do
         local name
         name=$(basename "$f" .toml)
@@ -549,13 +544,17 @@ manage_services() {
         if grep -q "^\[client\]" "$f"; then role="Client"; fi
         if grep -q "^\[server\]" "$f"; then role="Server"; fi
 
+        # 仅截取第一行并去除多余空白字符
         local c_status s_status
-        c_status=$($SYSTEMCTL_CMD is-active "rathole-client@${name}" 2>/dev/null || echo "inactive")
-        s_status=$($SYSTEMCTL_CMD is-active "rathole-server@${name}" 2>/dev/null || echo "inactive")
+        c_status=$($SYSTEMCTL_CMD is-active "rathole-client@${name}" 2>/dev/null | head -n 1 | tr -d ' \r\n' || true)
+        s_status=$($SYSTEMCTL_CMD is-active "rathole-server@${name}" 2>/dev/null | head -n 1 | tr -d ' \r\n' || true)
+        
+        [[ -z "$c_status" ]] && c_status="inactive"
+        [[ -z "$s_status" ]] && s_status="inactive"
 
-        printf "%-20s %-12s %-16s %-16s\n" "$name" "$role" "$c_status" "$s_status"
+        printf "%-18s %-12s %-16s %-16s\n" "$name" "$role" "$c_status" "$s_status"
     done
-    echo "--------------------------------------------------------"
+    echo "----------------------------------------------------------------"
 
     read -rp "请输入要操作的配置名称: " op_name
     if [[ ! -f "${CONFIG_DIR}/${op_name}.toml" ]]; then
