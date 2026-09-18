@@ -40,62 +40,89 @@ CERTS_DIR="${CONFIG_DIR}/certs"
 CLIENT_SERVICE_FILE="${SYSTEMD_DIR}/rathole-client@.service"
 SERVER_SERVICE_FILE="${SYSTEMD_DIR}/rathole-server@.service"
 
-# ======================= 终端中英混排与居中对齐工具函数 =======================
-# 计算字符串在终端中的可见显示宽度（过滤 ANSI 颜色代码，中文字符计宽 2）
-get_display_width() {
-    local str="$1"
-    local clean_str
-    clean_str=$(echo -e "$str" | sed -r "s/\x1B\[[0-9;]*[a-zA-Z]//g")
-    local byte_len=${#clean_str}
-    local u8_len
-    u8_len=$(echo -n "$clean_str" | wc -m)
-    # 中文字符每个在 UTF-8 占 3 字节、1 个字宽单位；终端显示占 2 个半角宽度
-    echo $(( (byte_len - u8_len) / 2 + u8_len ))
+# ======================= 交互校验工具函数 =======================
+prompt_required() {
+    local prompt_msg="$1"
+    local var_name="$2"
+    local val=""
+    while true; do
+        read -rp "$prompt_msg" val
+        val=$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        if [[ -n "$val" ]]; then
+            printf -v "$var_name" '%s' "$val"
+            break
+        else
+            echo -e "${RED}该项为必填项，内容不能为空，请重新输入！${NC}"
+        fi
+    done
 }
 
-# 文本居中打印并按目标宽度补空格
-print_cell_center() {
-    local raw_text="$1"
-    local target_width="$2"
-    local cur_width
-    cur_width=$(get_display_width "$raw_text")
+# 智能处理 local_addr：如果只输入纯数字端口，自动补全为 127.0.0.1:端口
+prompt_local_addr() {
+    local prompt_msg="$1"
+    local var_name="$2"
+    local val=""
+    while true; do
+        read -rp "$prompt_msg" val
+        val=$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        if [[ -z "$val" ]]; then
+            echo -e "${RED}该项为必填项，内容不能为空，请重新输入！${NC}"
+            continue
+        fi
 
-    if (( cur_width >= target_width )); then
-        echo -en "${raw_text} "
+        if [[ "$val" =~ ^[0-9]+$ ]]; then
+            val="127.0.0.1:${val}"
+            echo -e "${YELLOW}检测到仅输入端口，已自动补全本地地址: ${val}${NC}"
+        fi
+
+        printf -v "$var_name" '%s' "$val"
+        break
+    done
+}
+
+# 解析 acme.sh 中的 ReloadCmd（自动处理 Base64 编码格式）
+parse_reload_cmd() {
+    local raw_cmd="$1"
+    if [[ "$raw_cmd" =~ __ACME_BASE64__START_(.+)__ACME_BASE64__END_ ]]; then
+        echo "${BASH_REMATCH[1]}" | base64 -d 2>/dev/null || echo "$raw_cmd"
+    else
+        echo "$raw_cmd"
+    fi
+}
+
+# ======================= 终端精准居中对齐工具 =======================
+get_str_display_width() {
+    local text="$1"
+    local total_bytes
+    total_bytes=$(printf "%s" "$text" | wc -c)
+    local total_chars
+    total_chars=$(printf "%s" "$text" | wc -m)
+    echo $(( (total_bytes - total_chars) / 2 + total_chars ))
+}
+
+print_cell() {
+    local plain_txt="$1"
+    local colored_txt="$2"
+    local col_width="$3"
+
+    local cur_w
+    cur_w=$(get_str_display_width "$plain_txt")
+
+    if (( cur_w >= col_width )); then
+        printf "%b" "$colored_txt"
         return
     fi
 
-    local pad_total=$(( target_width - cur_width ))
+    local pad_total=$(( col_width - cur_w ))
     local pad_left=$(( pad_total / 2 ))
     local pad_right=$(( pad_total - pad_left ))
 
-    printf "%*s" "$pad_left" ""
-    echo -en "$raw_text"
-    printf "%*s" "$pad_right" ""
-}
-
-# 状态带颜色格式化
-format_status_colored() {
-    local status="$1"
-    case "$status" in
-        active)
-            echo -en "${GREEN}● active${NC}"
-            ;;
-        inactive)
-            echo -en "${RED}○ inactive${NC}"
-            ;;
-        failed)
-            echo -en "${RED}✖ failed${NC}"
-            ;;
-        *)
-            echo -en "${YELLOW}? ${status}${NC}"
-            ;;
-    esac
+    printf "%*s%b%*s" "$pad_left" "" "$colored_txt" "$pad_right" ""
 }
 
 # ======================= 依赖检查 =======================
 check_dependencies() {
-    for cmd in curl jq unzip systemctl openssl socat; do
+    for cmd in curl jq unzip systemctl openssl socat base64; do
         if ! command -v "$cmd" &>/dev/null; then
             if [[ "$IS_ROOT" == true ]]; then
                 echo -e "${YELLOW}缺少依赖 $cmd，正在自动安装...${NC}"
@@ -210,15 +237,18 @@ ensure_acme_installed() {
 
 acme_manager() {
     while true; do
-        echo -e "\n${CYAN}================ Acme.sh 证书管理面板 ================${NC}"
+        echo -e "\n${CYAN}================ Acme.sh 证书与 Hook 管理面板 ================${NC}"
         echo "1. 安装 / 重新安装 Acme.sh 并配置 Let's Encrypt CA"
         echo "2. 申请证书 (80 端口 Standalone 独立验证模式)"
         echo "3. 申请证书 (自定义端口 Standalone 验证，如 88)"
-        echo "4. 为 Rathole 转换 PKCS#12 (.p12) 并挂载续期重启钩子"
-        echo "5. 查看已申请的域名证书列表"
+        echo "4. 转换 PKCS#12 (.p12) 并挂载续期重启钩子 (Hook)"
+        echo "5. 查看已挂载的续期钩子 (Hook 详情)"
+        echo "6. 取消 / 清除域名的续期钩子"
+        echo "7. 查看已申请的域名证书列表"
+        echo "8. 删除 / 撤销已申请的域名证书"
         echo "0. 返回上级菜单"
-        echo "======================================================"
-        read -rp "请输入选项 [0-5]: " acme_choice
+        echo "=============================================================="
+        read -rp "请输入选项 [0-8]: " acme_choice
 
         case "$acme_choice" in
             1)
@@ -228,25 +258,23 @@ acme_manager() {
                 ;;
             2)
                 ensure_acme_installed
-                read -rp "请输入要申请证书的完整域名: " domain_name
-                [[ -z "$domain_name" ]] && echo -e "${RED}域名不能为空！${NC}" && continue
+                prompt_required "请输入要申请证书的完整域名 (例如 example.com): " domain_name
                 echo -e "${BLUE}开始申请证书 (请确保本地 80 端口空闲)...${NC}"
                 "$ACME_BIN" --issue -d "$domain_name" --standalone
                 ;;
             3)
                 ensure_acme_installed
-                read -rp "请输入要申请证书的完整域名: " domain_name
-                read -rp "请输入验证端口 [例如 88]: " http_port
-                [[ -z "$domain_name" || -z "$http_port" ]] && echo -e "${RED}域名或端口不能为空！${NC}" && continue
+                prompt_required "请输入要申请证书的完整域名 (例如 example.com): " domain_name
+                prompt_required "请输入验证端口 [例如 88]: " http_port
                 echo -e "${BLUE}开始申请证书 (监听端口: ${http_port})...${NC}"
                 "$ACME_BIN" --issue -d "$domain_name" --standalone --httpport "$http_port"
                 ;;
             4)
                 ensure_acme_installed
-                read -rp "请输入已申请证书的域名 (如 ra.223327.xyz): " cert_domain
+                prompt_required "请输入已申请证书的域名 (例如 example.com): " cert_domain
                 read -rp "请输入导出 PKCS#12 的密码 [默认 rathole_pass_123]: " p12_pass
                 p12_pass=${p12_pass:-rathole_pass_123}
-                read -rp "关联的 Rathole 配置服务名称 (用于更新后重启实例，如 server): " svc_instance
+                read -rp "关联的 Rathole 配置服务名称 (用于更新后重启实例，例如 server): " svc_instance
                 svc_instance=${svc_instance:-server}
 
                 local ecc_dir="${ACME_HOME}/${cert_domain}_ecc"
@@ -278,13 +306,209 @@ acme_manager() {
                 [[ "$source_dir" == *"_ecc"* ]] && is_ecc_flag="--ecc"
 
                 "$ACME_BIN" --install-cert -d "$cert_domain" $is_ecc_flag --reloadcmd "$reload_hook"
-                echo -e "${GREEN}✓ PKCS#12 转换完成并成功注入续期 Hook！${NC}"
+                echo -e "${GREEN}✓ PKCS#12 转换完成并成功挂载续期 Hook！${NC}"
                 ;;
             5)
+                echo -e "\n${BLUE}--- 当前已挂载的续期 Hook 列表 ---${NC}"
+                if [[ ! -d "$ACME_HOME" ]]; then
+                    echo -e "${YELLOW}未检测到 Acme.sh 目录。${NC}"
+                    continue
+                fi
+
+                local found_any=false
+                for conf_file in "$ACME_HOME"/*/*.conf; do
+                    [[ -f "$conf_file" ]] || continue
+                    local d_dir
+                    d_dir=$(dirname "$conf_file")
+                    local d_name
+                    d_name=$(basename "$d_dir")
+
+                    local raw_cmd
+                    raw_cmd=$(grep "^Le_ReloadCmd=" "$conf_file" | cut -d'=' -f2- | tr -d "'\"" || true)
+
+                    if [[ -n "$raw_cmd" ]]; then
+                        local real_cmd
+                        real_cmd=$(parse_reload_cmd "$raw_cmd")
+                        found_any=true
+                        echo -e "域名目录: ${CYAN}${d_name}${NC}"
+                        echo -e "挂载命令: ${YELLOW}${real_cmd}${NC}"
+                        echo "--------------------------------------------------------"
+                    fi
+                done
+
+                if [[ "$found_any" == false ]]; then
+                    echo -e "${YELLOW}暂无任何域名挂载续期 Hook。${NC}"
+                fi
+                ;;
+            6)
+                echo -e "\n${BLUE}--- 取消/清除域名续期 Hook ---${NC}"
+                if [[ ! -d "$ACME_HOME" ]]; then
+                    echo -e "${YELLOW}未检测到 Acme.sh 目录。${NC}"
+                    continue
+                fi
+
+                local hook_domains=()
+                local hook_is_ecc=()
+                for conf_file in "$ACME_HOME"/*/*.conf; do
+                    [[ -f "$conf_file" ]] || continue
+                    local d_dir
+                    d_dir=$(dirname "$conf_file")
+                    local d_name
+                    d_name=$(basename "$d_dir")
+
+                    local raw_cmd
+                    raw_cmd=$(grep "^Le_ReloadCmd=" "$conf_file" | cut -d'=' -f2- | tr -d "'\"" || true)
+
+                    if [[ -n "$raw_cmd" ]]; then
+                        local domain_pure="${d_name%_ecc}"
+                        hook_domains+=("$domain_pure")
+                        if [[ "$d_name" == *"_ecc"* ]]; then
+                            hook_is_ecc+=("true")
+                        else
+                            hook_is_ecc+=("false")
+                        fi
+                    fi
+                done
+
+                if [[ ${#hook_domains[@]} -eq 0 ]]; then
+                    echo -e "${YELLOW}当前未检测到任何已挂载 Hook 的域名。${NC}"
+                    continue
+                fi
+
+                echo "已挂载 Hook 的域名清单:"
+                for i in "${!hook_domains[@]}"; do
+                    local idx=$((i + 1))
+                    local ecc_tag=""
+                    [[ "${hook_is_ecc[$i]}" == "true" ]] && ecc_tag=" (ECC)"
+                    echo -e "  [${CYAN}${idx}${NC}] ${hook_domains[$i]}${ecc_tag}"
+                done
+                echo "----------------------------------------"
+
+                read -rp "请选择要清除 Hook 的域名 [输入序号或域名, 0 取消]: " del_hook_input
+                [[ "$del_hook_input" == "0" || -z "$del_hook_input" ]] && continue
+
+                local target_domain=""
+                local target_ecc=false
+
+                if [[ "$del_hook_input" =~ ^[0-9]+$ ]] && (( del_hook_input >= 1 && del_hook_input <= ${#hook_domains[@]} )); then
+                    local sel_idx=$((del_hook_input - 1))
+                    target_domain="${hook_domains[$sel_idx]}"
+                    [[ "${hook_is_ecc[$sel_idx]}" == "true" ]] && target_ecc=true
+                else
+                    target_domain="$del_hook_input"
+                    [[ -d "${ACME_HOME}/${target_domain}_ecc" ]] && target_ecc=true
+                fi
+
+                local is_ecc_flag=""
+                [[ "$target_ecc" == true ]] && is_ecc_flag="--ecc"
+
+                "$ACME_BIN" --install-cert -d "$target_domain" $is_ecc_flag --reloadcmd ""
+                echo -e "${GREEN}✓ 已成功清除域名 [${target_domain}] 的续期 Hook！${NC}"
+                ;;
+            7)
                 if [[ -f "$ACME_BIN" ]]; then
                     "$ACME_BIN" --list
                 else
                     echo -e "${YELLOW}尚未安装 acme.sh${NC}"
+                fi
+                ;;
+            8)
+                echo -e "\n${BLUE}--- 删除 / 撤销已申请的域名证书 ---${NC}"
+                if [[ ! -f "$ACME_BIN" ]]; then
+                    echo -e "${YELLOW}尚未安装 acme.sh${NC}"
+                    continue
+                fi
+
+                # 收集当前已申请证书的目录列表
+                local cert_domains=()
+                local cert_dirs=()
+                local cert_is_ecc=()
+
+                for d in "$ACME_HOME"/*; do
+                    [[ -d "$d" ]] || continue
+                    local bname
+                    bname=$(basename "$d")
+                    # 排除 acme 自身配置及 CA 内部文件夹
+                    if [[ "$bname" =~ ^(ca|deploy|dnsapi|notify)$ ]]; then
+                        continue
+                    fi
+
+                    # 包含 fullchain.cer 或 .conf 的认定为证书目录
+                    if [[ -f "$d/fullchain.cer" || -f "$d/${bname}.conf" ]]; then
+                        local pure_d="${bname%_ecc}"
+                        cert_domains+=("$pure_d")
+                        cert_dirs+=("$d")
+                        if [[ "$bname" == *"_ecc"* ]]; then
+                            cert_is_ecc+=("true")
+                        else
+                            cert_is_ecc+=("false")
+                        fi
+                    fi
+                done
+
+                if [[ ${#cert_domains[@]} -eq 0 ]]; then
+                    echo -e "${YELLOW}当前未在 ${ACME_HOME} 下找到任何已申请的域名证书。${NC}"
+                    continue
+                fi
+
+                echo "已申请的证书清单:"
+                for i in "${!cert_domains[@]}"; do
+                    local idx=$((i + 1))
+                    local ecc_tag=""
+                    [[ "${cert_is_ecc[$i]}" == "true" ]] && ecc_tag=" (ECC)"
+                    echo -e "  [${CYAN}${idx}${NC}] ${cert_domains[$i]}${ecc_tag}"
+                done
+                echo "----------------------------------------"
+
+                read -rp "请选择要删除的域名证书 [输入序号或域名, 0 取消]: " rm_cert_input
+                [[ "$rm_cert_input" == "0" || -z "$rm_cert_input" ]] && continue
+
+                local target_rm_domain=""
+                local target_rm_ecc=false
+                local target_rm_dir=""
+
+                if [[ "$rm_cert_input" =~ ^[0-9]+$ ]] && (( rm_cert_input >= 1 && rm_cert_input <= ${#cert_domains[@]} )); then
+                    local s_idx=$((rm_cert_input - 1))
+                    target_rm_domain="${cert_domains[$s_idx]}"
+                    target_rm_dir="${cert_dirs[$s_idx]}"
+                    [[ "${cert_is_ecc[$s_idx]}" == "true" ]] && target_rm_ecc=true
+                else
+                    target_rm_domain="$rm_cert_input"
+                    if [[ -d "${ACME_HOME}/${target_rm_domain}_ecc" ]]; then
+                        target_rm_dir="${ACME_HOME}/${target_rm_domain}_ecc"
+                        target_rm_ecc=true
+                    elif [[ -d "${ACME_HOME}/${target_rm_domain}" ]]; then
+                        target_rm_dir="${ACME_HOME}/${target_rm_domain}"
+                        target_rm_ecc=false
+                    else
+                        echo -e "${RED}未找到指定域名证书目录！${NC}"
+                        continue
+                    fi
+                fi
+
+                read -rp "确认彻底从 Acme 移除并删除域名 [${target_rm_domain}] 的本地证书？(y/N): " confirm_rm
+                if [[ "$confirm_rm" == "y" || "$confirm_rm" == "Y" ]]; then
+                    local rm_ecc_flag=""
+                    [[ "$target_rm_ecc" == true ]] && rm_ecc_flag="--ecc"
+
+                    # 1. 停止续期任务并移出注册表
+                    "$ACME_BIN" --remove -d "$target_rm_domain" $rm_ecc_flag 2>/dev/null || true
+
+                    # 2. 清理 acme 证书目录
+                    if [[ -d "$target_rm_dir" ]]; then
+                        rm -rf "$target_rm_dir"
+                    fi
+
+                    # 3. 联动清理转换出的 .p12 证书
+                    local matched_p12="${CERTS_DIR}/${target_rm_domain}.p12"
+                    if [[ -f "$matched_p12" ]]; then
+                        rm -f "$matched_p12"
+                        echo -e "${YELLOW}已同步清理 Rathole 证书目录下的: ${matched_p12}${NC}"
+                    fi
+
+                    echo -e "${GREEN}✓ 域名 [${target_rm_domain}] 的证书及续期任务已成功彻底删除！${NC}"
+                else
+                    echo -e "${YELLOW}操作已取消。${NC}"
                 fi
                 ;;
             0) break ;;
@@ -389,31 +613,38 @@ install_or_update() {
     fi
 }
 
-# ======================= 多协议/多模式配置生成 =======================
+# ======================= 添加主配置文件 =======================
 add_config() {
-    echo -e "\n${BLUE}--- 添加 Rathole 配置文件 ---${NC}"
-    read -rp "请输入配置文件名称 (无需后缀，例如 app1): " conf_name
-    [[ -z "$conf_name" ]] && echo -e "${RED}名称不能为空！${NC}" && return
+    echo -e "\n${BLUE}--- 添加 Rathole 主配置文件 ---${NC}"
+    
+    echo "请选择配置角色类型:"
+    echo "1. 服务端 (Server)"
+    echo "2. 客户端 (Client)"
+    local role_choice=""
+    while [[ "$role_choice" != "1" && "$role_choice" != "2" ]]; do
+        read -rp "输入选项 [1-2]: " role_choice
+    done
 
+    local role_str="Server"
+    [[ "$role_choice" == "2" ]] && role_str="Client"
+    echo -e "已选择角色: ${CYAN}${role_str}${NC}"
+
+    prompt_required "请输入该 [${role_str}] 配置文件名称 (无需后缀，例如 app1): " conf_name
     local target_file="${CONFIG_DIR}/${conf_name}.toml"
     if [[ -f "$target_file" ]]; then
         echo -e "${RED}错误: 配置文件 ${conf_name}.toml 已存在！${NC}"
         return
     fi
 
-    echo "选择配置角色类型:"
-    echo "1. 服务端 (Server)"
-    echo "2. 客户端 (Client)"
-    read -rp "输入选项 [1-2]: " role_choice
-
-    echo -e "\n选择传输层通道加密模式 (Transport Layer):"
-    echo "1. Plain (常规明文直连)"
+    echo -e "\n选择底层通道传输加密模式 (Transport Layer):"
+    echo "1. Plain (常规明文直连通道)"
     echo "2. Noise (Noise Protocol 加密，轻量安全免配置证书)"
-    echo "3. TLS / mTLS (基于 TLS 证书加密)"
+    echo "3. TLS / mTLS (基于 TLS 证书的高强度加密)"
     read -rp "输入传输层选项 [1-3, 默认 1]: " transport_choice
     transport_choice=${transport_choice:-1}
 
-    echo -e "\n选择内网穿透协议类型 (Service Type):"
+    echo -e "\n选择首个转发服务的协议类型:"
+    echo "说明: 即使底层使用 TLS 隧道，Rathole 仍可在隧道内部多路复用转发 UDP 流量"
     echo "1. TCP"
     echo "2. UDP"
     read -rp "输入协议类型 [1-2, 默认 1]: " proto_choice
@@ -422,11 +653,11 @@ add_config() {
 
     case "$role_choice" in
         1)
-            read -rp "服务端运行监听端口 [默认 2333]: " bind_port
+            read -rp "服务端监听端口 (接收客户端连接) [默认 2333]: " bind_port
             bind_port=${bind_port:-2333}
-            read -rp "转发服务名称 (Service Name, 例如 web_app): " svc_name
-            read -rp "对外暴露公网监听端口 (bind_addr 端口, 例如 8080): " svc_bind_port
-            read -rp "服务共享鉴权密钥 (token): " svc_token
+            prompt_required "首个转发服务名称 (例如 web_app): " svc_name
+            prompt_required "对外暴露公网监听端口 (bind_addr 端口, 例如 8080): " svc_bind_port
+            prompt_required "服务共享鉴权密钥 (token): " svc_token
 
             cat <<EOF > "$target_file"
 # Rathole Server Configuration
@@ -441,10 +672,10 @@ EOF
 type = "noise"
 EOF
             elif [[ "$transport_choice" == "3" ]]; then
-                echo -e "\n${CYAN}--- TLS 证书配置 ---${NC}"
-                echo "1. 使用 PKCS#12 格式证书 (.p12)"
-                echo "2. 使用 PEM 格式证书 (.cer / .crt 和 .key)"
-                read -rp "请选择证书类型 [1-2, 默认 1]: " cert_format
+                echo -e "\n${CYAN}--- 服务端 TLS 证书载入方式 ---${NC}"
+                echo "1. 使用 PKCS#12 格式证书 (.p12 格式)"
+                echo "2. 使用 PEM 格式证书 (.cer / .crt 和 .key 文件)"
+                read -rp "请选择证书载入格式 [1-2, 默认 1]: " cert_format
                 cert_format=${cert_format:-1}
 
                 if [[ "$cert_format" == "1" ]]; then
@@ -455,8 +686,8 @@ EOF
                             echo " - $pf"
                         done
                     fi
-                    read -rp "请输入 .p12 证书路径: " p12_path
-                    read -rp "请输入 .p12 证书密码: " p12_pwd
+                    prompt_required "请输入 .p12 证书路径: " p12_path
+                    prompt_required "请输入 .p12 证书密码: " p12_pwd
                     cat <<EOF >> "$target_file"
 
 [server.transport]
@@ -470,8 +701,8 @@ EOF
                     if [[ -d "$ACME_HOME" ]]; then
                         find "$ACME_HOME" -maxdepth 2 -name "fullchain.cer" 2>/dev/null || true
                     fi
-                    read -rp "TLS 证书全链路径 (cert/fullchain.cer): " tls_cert
-                    read -rp "TLS 私钥路径 (key): " tls_key
+                    prompt_required "TLS 证书全链路径 (cert/fullchain.cer): " tls_cert
+                    prompt_required "TLS 私钥路径 (key): " tls_key
                     cat <<EOF >> "$target_file"
 
 [server.transport]
@@ -494,12 +725,12 @@ EOF
             ;;
 
         2)
-            read -rp "服务端公网 IP 或域名: " server_host
+            prompt_required "服务端公网 IP 或域名 (例如 example.com): " server_host
             read -rp "服务端监听端口 [默认 2333]: " server_port
             server_port=${server_port:-2333}
-            read -rp "转发服务名称 (须与服务端一致): " svc_name
-            read -rp "本地目标服务地址 (local_addr, 例如 127.0.0.1:80): " local_addr
-            read -rp "服务共享鉴权密钥 (token, 须与服务端一致): " svc_token
+            prompt_required "首个转发服务名称 (须与服务端一致): " svc_name
+            prompt_local_addr "本地目标服务地址 (支持输入 3389 或 127.0.0.1:3389): " local_addr
+            prompt_required "服务共享鉴权密钥 (token, 须与服务端一致): " svc_token
 
             cat <<EOF > "$target_file"
 # Rathole Client Configuration
@@ -514,14 +745,43 @@ EOF
 type = "noise"
 EOF
             elif [[ "$transport_choice" == "3" ]]; then
-                read -rp "服务端 TLS 认证域名 (trusted_root/SNI，例如 example.com): " tls_sni
-                cat <<EOF >> "$target_file"
+                echo -e "\n${CYAN}--- 客户端 TLS 证书验证与 SNI 设定 ---${NC}"
+                echo "1. 默认权威 CA 校验 (推荐: 信任系统 Let's Encrypt / ZeroSSL 证书库，自动匹配连接域名)"
+                echo "2. 指定预期域名 (SNI 模式: 当服务端是按域名签发，但连接地址填写的是 IP 时使用)"
+                echo "3. 指定私有根证书路径 (Custom CA: 针对自签名根证书文件进行校验)"
+                read -rp "请选择客户端 TLS 验证方式 [1-3, 默认 1]: " tls_client_mode
+                tls_client_mode=${tls_client_mode:-1}
+
+                case "$tls_client_mode" in
+                    2)
+                        prompt_required "请输入服务端的预期域名 (SNI，例如 example.com): " custom_sni
+                        cat <<EOF >> "$target_file"
 
 [client.transport]
 type = "tls"
 [client.transport.tls]
-trusted_root = "${tls_sni}"
+trusted_root = "${custom_sni}"
 EOF
+                        ;;
+                    3)
+                        prompt_required "请输入根证书文件绝对路径 (例如 /etc/ssl/certs/ca-certificates.crt): " custom_ca_path
+                        cat <<EOF >> "$target_file"
+
+[client.transport]
+type = "tls"
+[client.transport.tls]
+trusted_root = "${custom_ca_path}"
+EOF
+                        ;;
+                    *)
+                        cat <<EOF >> "$target_file"
+
+[client.transport]
+type = "tls"
+[client.transport.tls]
+EOF
+                        ;;
+                esac
             fi
 
             cat <<EOF >> "$target_file"
@@ -533,12 +793,115 @@ token = "${svc_token}"
 EOF
             echo -e "${GREEN}✓ 客户端配置生成成功: ${target_file}${NC}"
             ;;
-
-        *)
-            echo -e "${RED}输入无效，返回上层。${NC}"
-            return
-            ;;
     esac
+}
+
+# ======================= 追加转发端口/服务 =======================
+append_service_config() {
+    echo -e "\n${BLUE}--- 向现有配置追加转发端口/服务 ---${NC}"
+    local files=("$CONFIG_DIR"/*.toml)
+    if [[ ! -e "${files[0]}" ]]; then
+        echo -e "${YELLOW}未检索到任何配置文件，请先添加主配置文件！${NC}"
+        return
+    fi
+
+    echo "现有配置文件清单:"
+    local names=()
+    local idx=1
+    for f in "${files[@]}"; do
+        local n
+        n=$(basename "$f" .toml)
+        names+=("$n")
+        echo -e "  [${CYAN}${idx}${NC}] ${n}"
+        ((idx++))
+    done
+    echo "----------------------------------------"
+
+    read -rp "请选择要追加服务的配置文件 [序号或名称, 0 取消]: " target_input
+    [[ "$target_input" == "0" || -z "$target_input" ]] && return
+
+    local conf_name=""
+    if [[ "$target_input" =~ ^[0-9]+$ ]] && (( target_input >= 1 && target_input <= ${#names[@]} )); then
+        conf_name="${names[$((target_input - 1))]}"
+    else
+        conf_name="$target_input"
+    fi
+
+    local target_file="${CONFIG_DIR}/${conf_name}.toml"
+    if [[ ! -f "$target_file" ]]; then
+        echo -e "${RED}未找到指定配置文件: ${target_file}${NC}"
+        return
+    fi
+
+    local is_server=false
+    local is_client=false
+    grep -q "^\[server\]" "$target_file" && is_server=true
+    grep -q "^\[client\]" "$target_file" && is_client=true
+
+    if [[ "$is_server" == false && "$is_client" == false ]]; then
+        echo -e "${RED}无法解析此配置文件的角色架构（缺少 [server] 或 [client] 标头）。${NC}"
+        return
+    fi
+
+    echo -e "\n${CYAN}>>> 正在向 [${conf_name}] 追加转发服务 <<<${NC}"
+    echo "选择追加服务的协议类型:"
+    echo "1. TCP"
+    echo "2. UDP"
+    read -rp "输入协议类型 [1-2, 默认 1]: " proto_choice
+    local svc_type="tcp"
+    [[ "$proto_choice" == "2" ]] && svc_type="udp"
+
+    prompt_required "新转发服务名称 (例如 RDP 或 ssh_service): " new_svc_name
+
+    if grep -q "services\.${new_svc_name}\]" "$target_file"; then
+        echo -e "${RED}错误: 服务名称 [${new_svc_name}] 在当前配置文件中已存在！${NC}"
+        return
+    fi
+
+    if [[ "$is_server" == true ]]; then
+        prompt_required "对外暴露公网监听端口 (bind_addr 端口, 例如 3389): " svc_bind_port
+        prompt_required "服务共享鉴权密钥 (token): " svc_token
+
+        cat <<EOF >> "$target_file"
+
+[server.services.${new_svc_name}]
+type = "${svc_type}"
+bind_addr = "0.0.0.0:${svc_bind_port}"
+token = "${svc_token}"
+EOF
+        echo -e "${GREEN}✓ 服务端映射 [${new_svc_name}] 已成功追加到 ${target_file}${NC}"
+        
+        local unit_name="rathole-server@${conf_name}"
+        if [[ $($SYSTEMCTL_CMD is-active "$unit_name" 2>/dev/null) == "active" ]]; then
+            read -rp "检测到该服务正在运行，是否立即重启使其生效？(Y/n): " restart_now
+            if [[ "$restart_now" != "n" && "$restart_now" != "N" ]]; then
+                $SYSTEMCTL_CMD restart "$unit_name"
+                echo -e "${GREEN}✓ 服务 ${unit_name} 已完成重启。${NC}"
+            fi
+        fi
+
+    elif [[ "$is_client" == true ]]; then
+        prompt_local_addr "本地目标服务地址 (输入纯端口如 3389 自动补全 127.0.0.1:3389): " local_addr
+        prompt_required "服务共享鉴权密钥 (token, 须与服务端一致): " svc_token
+
+        cat <<EOF >> "$target_file"
+
+[client.services.${new_svc_name}]
+type = "${svc_type}"
+local_addr = "${local_addr}"
+token = "${svc_token}"
+EOF
+        echo -e "${GREEN}✓ 客户端映射 [${new_svc_name}] 已成功追加到 ${target_file}${NC}"
+
+        local unit_name="rathole-client@${conf_name}"
+        if [[ $($SYSTEMCTL_CMD is-active "$unit_name" 2>/dev/null) == "active" ]]; then
+            read -rp "检测到该服务正在运行，是否立即重启使其生效？(Y/n): " restart_now
+            if [[ "$restart_now" != "n" && "$restart_now" != "N" ]]; then
+                $SYSTEMCTL_CMD restart "$unit_name"
+                echo -e "${GREEN}✓ 服务 ${unit_name} 已完成重启。${NC}"
+            fi
+        fi
+    fi
 }
 
 # ======================= 删除配置及关联服务 =======================
@@ -551,11 +914,27 @@ delete_config() {
     fi
 
     echo "现有配置文件清单:"
+    local names=()
+    local idx=1
     for f in "${files[@]}"; do
-        echo " - $(basename "$f" .toml)"
+        local n
+        n=$(basename "$f" .toml)
+        names+=("$n")
+        echo -e "  [${CYAN}${idx}${NC}] ${n}"
+        ((idx++))
     done
+    echo "----------------------------------------"
 
-    read -rp "请输入要删除的配置名称 (无需后缀): " del_name
+    read -rp "请输入要删除的配置 [序号或名称, 0 取消]: " del_input
+    [[ "$del_input" == "0" || -z "$del_input" ]] && return
+
+    local del_name=""
+    if [[ "$del_input" =~ ^[0-9]+$ ]] && (( del_input >= 1 && del_input <= ${#names[@]} )); then
+        del_name="${names[$((del_input - 1))]}"
+    else
+        del_name="$del_input"
+    fi
+
     local target_file="${CONFIG_DIR}/${del_name}.toml"
 
     if [[ -f "$target_file" ]]; then
@@ -566,105 +945,181 @@ delete_config() {
             $SYSTEMCTL_CMD disable "rathole-client@${del_name}" 2>/dev/null || true
             $SYSTEMCTL_CMD disable "rathole-server@${del_name}" 2>/dev/null || true
             rm -f "$target_file"
-            echo -e "${GREEN}✓ 配置及服务已成功移除。${NC}"
+            echo -e "${GREEN}✓ 配置及服务已成功移除: ${del_name}.toml${NC}"
+        else
+            echo -e "${YELLOW}操作已取消。${NC}"
         fi
     else
-        echo -e "${RED}未找到指定文件: ${target_file}${NC}"
+        echo -e "${RED}未找到指定配置文件: ${target_file}${NC}"
     fi
 }
 
-# ======================= 实例运行状态看板 (居中排版与色彩高亮) =======================
+# ======================= 状态看板与智能角色自启菜单 =======================
 manage_services() {
     local mode_tag="用户模式"
     [[ "$IS_ROOT" == true ]] && mode_tag="Root 全局模式"
     echo -e "\n${BLUE}--- 实例运行状态看板 [${mode_tag}] ---${NC}"
-    
+
     local files=("$CONFIG_DIR"/*.toml)
     if [[ ! -e "${files[0]}" ]]; then
         echo -e "${YELLOW}当前没有任何配置，请先添加配置后再管理。${NC}"
         return
     fi
 
-    # 各列固定半角显示宽度定义 (依次为: 配置名称, 配置类型, Client状态, Server状态)
+    local W_IDX=8
     local W_NAME=18
     local W_TYPE=14
-    local W_CSTATUS=18
-    local W_SSTATUS=18
+    local W_STATUS=18
+    local W_ENABLED=16
 
-    # 打印居中表头
-    print_cell_center "配置名称" "$W_NAME"
-    print_cell_center "配置类型" "$W_TYPE"
-    print_cell_center "Client 状态" "$W_CSTATUS"
-    print_cell_center "Server 状态" "$W_SSTATUS"
+    print_cell "序号" "序号" "$W_IDX"
+    print_cell "配置名称" "配置名称" "$W_NAME"
+    print_cell "配置类型" "配置类型" "$W_TYPE"
+    print_cell "运行状态" "运行状态" "$W_STATUS"
+    print_cell "自启状态" "自启状态" "$W_ENABLED"
     echo
-    echo "----------------------------------------------------------------------"
+    echo "----------------------------------------------------------------------------------"
 
+    local config_list=()
+    local idx=1
     for f in "${files[@]}"; do
         local name
         name=$(basename "$f" .toml)
+        config_list+=("$name")
+
         local role="未知"
-        if grep -q "^\[client\]" "$f"; then role="Client"; fi
-        if grep -q "^\[server\]" "$f"; then role="Server"; fi
+        local unit=""
+        if grep -q "^\[client\]" "$f"; then 
+            role="Client"
+            unit="rathole-client@${name}"
+        elif grep -q "^\[server\]" "$f"; then 
+            role="Server"
+            unit="rathole-server@${name}"
+        fi
 
-        local c_status s_status
-        c_status=$($SYSTEMCTL_CMD is-active "rathole-client@${name}" 2>/dev/null | head -n 1 | tr -d ' \r\n' || true)
-        s_status=$($SYSTEMCTL_CMD is-active "rathole-server@${name}" 2>/dev/null | head -n 1 | tr -d ' \r\n' || true)
-        
-        [[ -z "$c_status" ]] && c_status="inactive"
-        [[ -z "$s_status" ]] && s_status="inactive"
+        local active_status="inactive"
+        local enabled_status="disabled"
 
-        # 格式化带颜色状态文本
-        local c_colored
-        c_colored=$(format_status_colored "$c_status")
-        local s_colored
-        s_colored=$(format_status_colored "$s_status")
+        if [[ -n "$unit" ]]; then
+            active_status=$($SYSTEMCTL_CMD is-active "$unit" 2>/dev/null | head -n 1 | tr -d ' \r\n' || true)
+            enabled_status=$($SYSTEMCTL_CMD is-enabled "$unit" 2>/dev/null | head -n 1 | tr -d ' \r\n' || true)
+        fi
 
-        # 依次居中对齐打印每一列
-        print_cell_center "$name" "$W_NAME"
-        print_cell_center "$role" "$W_TYPE"
-        print_cell_center "$c_colored" "$W_CSTATUS"
-        print_cell_center "$s_colored" "$W_SSTATUS"
+        [[ -z "$active_status" ]] && active_status="inactive"
+        [[ -z "$enabled_status" ]] && enabled_status="disabled"
+
+        local active_colored="$active_status"
+        case "$active_status" in
+            active)   active_colored="${GREEN}${active_status}${NC}" ;;
+            inactive) active_colored="${RED}${active_status}${NC}" ;;
+            failed)   active_colored="${RED}${active_status}${NC}" ;;
+            *)        active_colored="${YELLOW}${active_status}${NC}" ;;
+        esac
+
+        local enabled_colored="$enabled_status"
+        case "$enabled_status" in
+            enabled)  enabled_colored="${GREEN}${enabled_status}${NC}" ;;
+            disabled) enabled_colored="${RED}${enabled_status}${NC}" ;;
+            *)        enabled_colored="${YELLOW}${enabled_status}${NC}" ;;
+        esac
+
+        print_cell "[$idx]" "[$idx]" "$W_IDX"
+        print_cell "$name" "$name" "$W_NAME"
+        print_cell "$role" "$role" "$W_TYPE"
+        print_cell "$active_status" "$active_colored" "$W_STATUS"
+        print_cell "$enabled_status" "$enabled_colored" "$W_ENABLED"
         echo
+        ((idx++))
     done
-    echo "----------------------------------------------------------------------"
+    echo "----------------------------------------------------------------------------------"
 
-    read -rp "请输入要操作的配置名称: " op_name
-    if [[ ! -f "${CONFIG_DIR}/${op_name}.toml" ]]; then
-        echo -e "${RED}配置不存在！${NC}"
+    read -rp "请输入要操作的配置 [序号或名称, 0 返回]: " user_input
+    [[ "$user_input" == "0" || -z "$user_input" ]] && return
+
+    local op_name=""
+    if [[ "$user_input" =~ ^[0-9]+$ ]] && (( user_input >= 1 && user_input <= ${#config_list[@]} )); then
+        op_name="${config_list[$((user_input - 1))]}"
+    else
+        op_name="$user_input"
+    fi
+
+    local selected_file="${CONFIG_DIR}/${op_name}.toml"
+    if [[ ! -f "$selected_file" ]]; then
+        echo -e "${RED}未找到配置: ${op_name}${NC}"
         return
     fi
 
-    echo -e "\n请选择针对 [${op_name}] 的操作:"
-    echo "1. 启动 Client 服务"
-    echo "2. 停止 Client 服务"
-    echo "3. 启动 Server 服务"
-    echo "4. 停止 Server 服务"
-    echo "5. 配置开机自启"
-    echo "6. 关闭开机自启"
-    echo "7. 实时查看日志"
-    read -rp "输入选项 [1-7]: " action_choice
+    local detected_role=""
+    if grep -q "^\[server\]" "$selected_file"; then
+        detected_role="Server"
+    elif grep -q "^\[client\]" "$selected_file"; then
+        detected_role="Client"
+    else
+        echo -e "${YELLOW}未能识别配置角色，请手动指定:${NC}"
+        echo "1. 作为 Server 管理"
+        echo "2. 作为 Client 管理"
+        read -rp "输入选项 [1-2]: " fallback_choice
+        [[ "$fallback_choice" == "1" ]] && detected_role="Server" || detected_role="Client"
+    fi
 
-    case "$action_choice" in
-        1) $SYSTEMCTL_CMD start "rathole-client@${op_name}" && echo -e "${GREEN}已启动 Client@${op_name}${NC}" ;;
-        2) $SYSTEMCTL_CMD stop "rathole-client@${op_name}" && echo -e "${YELLOW}已停止 Client@${op_name}${NC}" ;;
-        3) $SYSTEMCTL_CMD start "rathole-server@${op_name}" && echo -e "${GREEN}已启动 Server@${op_name}${NC}" ;;
-        4) $SYSTEMCTL_CMD stop "rathole-server@${op_name}" && echo -e "${YELLOW}已停止 Server@${op_name}${NC}" ;;
+    local target_unit=""
+    if [[ "$detected_role" == "Server" ]]; then
+        target_unit="rathole-server@${op_name}"
+    else
+        target_unit="rathole-client@${op_name}"
+    fi
+
+    local is_enabled_now
+    is_enabled_now=$($SYSTEMCTL_CMD is-enabled "$target_unit" 2>/dev/null | head -n 1 | tr -d ' \r\n' || true)
+
+    local toggle_autostart_desc=""
+    if [[ "$is_enabled_now" == "enabled" ]]; then
+        toggle_autostart_desc="关闭开机自启 (当前: 已开启)"
+    else
+        toggle_autostart_desc="开启开机自启 (当前: 已关闭)"
+    fi
+
+    echo -e "\n${CYAN}>>> 已选中 [${op_name}] (角色: ${detected_role}) <<<${NC}"
+    echo "1. 启动 ${detected_role} 服务"
+    echo "2. 停止 ${detected_role} 服务"
+    echo "3. 重启 ${detected_role} 服务"
+    echo "4. ${toggle_autostart_desc}"
+    echo "5. 实时查看运行日志"
+    echo "0. 返回上级菜单"
+    read -rp "请输入操作序号 [0-5]: " role_act
+
+    case "$role_act" in
+        1)
+            $SYSTEMCTL_CMD start "$target_unit"
+            echo -e "${GREEN}✓ 已启动 ${target_unit}${NC}"
+            ;;
+        2)
+            $SYSTEMCTL_CMD stop "$target_unit"
+            echo -e "${YELLOW}✓ 已停止 ${target_unit}${NC}"
+            ;;
+        3)
+            $SYSTEMCTL_CMD restart "$target_unit"
+            echo -e "${GREEN}✓ 已重启 ${target_unit}${NC}"
+            ;;
+        4)
+            if [[ "$is_enabled_now" == "enabled" ]]; then
+                $SYSTEMCTL_CMD disable "$target_unit"
+                echo -e "${YELLOW}✓ 已成功关闭 ${target_unit} 的开机自启${NC}"
+            else
+                $SYSTEMCTL_CMD enable "$target_unit"
+                echo -e "${GREEN}✓ 已成功开启 ${target_unit} 的开机自启${NC}"
+            fi
+            ;;
         5)
-            read -rp "选择自启类型 (1: Client, 2: Server): " auto_mode
-            [[ "$auto_mode" == "1" ]] && $SYSTEMCTL_CMD enable "rathole-client@${op_name}"
-            [[ "$auto_mode" == "2" ]] && $SYSTEMCTL_CMD enable "rathole-server@${op_name}"
-            echo -e "${GREEN}已完成开机自启动配置${NC}"
+            echo -e "${BLUE}正在追踪 ${target_unit} 日志 (按 Ctrl+C 退出)...${NC}"
+            $JOURNALCTL_CMD -u "$target_unit" -f -n 50
             ;;
-        6)
-            $SYSTEMCTL_CMD disable "rathole-client@${op_name}" 2>/dev/null || true
-            $SYSTEMCTL_CMD disable "rathole-server@${op_name}" 2>/dev/null || true
-            echo -e "${YELLOW}已取消开机自启动${NC}"
+        0)
+            return
             ;;
-        7)
-            echo -e "${BLUE}正在展示日志，按 Ctrl+C 退出追踪...${NC}"
-            $JOURNALCTL_CMD -u "rathole-*@${op_name}" -f -n 50
+        *)
+            echo -e "${RED}无效选项${NC}"
             ;;
-        *) echo -e "${RED}无效选项${NC}" ;;
     esac
 }
 
@@ -678,20 +1133,22 @@ menu() {
 
         echo -e "\n${GREEN}================ Rathole 多实例管理面板 ${mode_desc} ================${NC}"
         echo "1. 检查最新版本并安装/更新 Rathole"
-        echo "2. 添加配置文件 (TCP/UDP, Plain/Noise/TLS)"
-        echo "3. 删除配置文件并清理服务"
-        echo "4. 服务启停控制与状态看板"
-        echo "5. Acme.sh 证书申请与管理 (支持 PKCS#12 转换与续期挂载)"
+        echo "2. 添加新的主配置文件 (新建通道与基础服务)"
+        echo "3. 向现有配置追加转发端口/服务"
+        echo "4. 删除配置文件并清理服务"
+        echo "5. 服务启停控制与状态看板 (支持运行/自启管理)"
+        echo "6. Acme.sh 证书申请与管理 (支持 PKCS#12 转换与续期挂载)"
         echo "0. 退出管理脚本"
         echo "========================================================================="
-        read -rp "请输入序号 [0-5]: " choice
+        read -rp "请输入序号 [0-6]: " choice
 
         case "$choice" in
             1) install_or_update ;;
             2) add_config ;;
-            3) delete_config ;;
-            4) manage_services ;;
-            5) acme_manager ;;
+            3) append_service_config ;;
+            4) delete_config ;;
+            5) manage_services ;;
+            6) acme_manager ;;
             0) exit 0 ;;
             *) echo -e "${RED}输入无效，请重新输入。${NC}" ;;
         esac
