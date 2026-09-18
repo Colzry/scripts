@@ -21,7 +21,7 @@ if [[ $EUID -eq 0 ]]; then
     IS_ROOT=true
     SYSTEMCTL_CMD="systemctl"
     JOURNALCTL_CMD="journalctl"
-    BIN_PATH="/usr/bin/rathole"
+    BIN_PATH="/usr/local/bin/rathole"
     CONFIG_DIR="/etc/rathole"
     SYSTEMD_DIR="/etc/systemd/system"
 else
@@ -82,7 +82,7 @@ Type=simple
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=1048576
-ExecStart=/usr/bin/rathole -c /etc/rathole/%i.toml
+ExecStart=/usr/local/bin/rathole -c /etc/rathole/%i.toml
 
 [Install]
 WantedBy=multi-user.target
@@ -98,7 +98,7 @@ Type=simple
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=1048576
-ExecStart=/usr/bin/rathole -s /etc/rathole/%i.toml
+ExecStart=/usr/local/bin/rathole -s /etc/rathole/%i.toml
 
 [Install]
 WantedBy=multi-user.target
@@ -254,7 +254,7 @@ get_latest_release_tag() {
         return 0
     fi
 
-    # 2. 备选方案：通过官方 releases/latest 302 目标 URL 获取 tag（彻底避开 API 速率限制及 JSON 解析）
+    # 2. 备选方案：通过官方 releases/latest 302 目标 URL 获取 tag
     local redirect_url
     redirect_url=$(curl -sSLI -m 6 -o /dev/null -w "%{url_effective}" "https://github.com/${GITHUB_REPO}/releases/latest" 2>/dev/null || true)
     if [[ "$redirect_url" =~ tag/(v?[0-9].*) ]]; then
@@ -297,6 +297,9 @@ install_or_update() {
             return
         fi
     fi
+
+    # 确保目标安装目录存在
+    mkdir -p "$(dirname "$BIN_PATH")"
 
     # 构造原始下载路径及代理加速下载路径
     local raw_download_url="https://github.com/${GITHUB_REPO}/releases/download/${LATEST_TAG}/rathole-x86_64-unknown-linux-gnu.zip"
