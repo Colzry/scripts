@@ -28,6 +28,7 @@ SESSION_FILE="${ARIA2_CONF_DIR}/aria2.session"
 LOG_FILE="${ARIA2_CONF_DIR}/aria2.log"
 TRACKER_SCRIPT="${ARIA2_CONF_DIR}/scripts/update_tracker.sh"
 BLOCKER_SCRIPT="${ARIA2_CONF_DIR}/scripts/block_peers.sh"
+FILTER_SCRIPT="${ARIA2_CONF_DIR}/scripts/auto_filter_video.py"
 DEFAULT_DOWNLOAD_DIR="${USER_HOME}/Downloads"
 DEFAULT_PORT="6800"
 DEFAULT_ARIANG_PORT="6880"
@@ -207,6 +208,145 @@ EOF
     chmod +x "${BLOCKER_SCRIPT}"
 }
 
+# ==================== 生成 BT 自动筛选 Python 守护脚本 ====================
+ensure_filter_script() {
+    local min_size="${1:-50}"
+    local target_exts="${2:-ALL}" # ALL 表示不过滤扩展名，只看体积
+    mkdir -p "${ARIA2_CONF_DIR}/scripts"
+
+    cat > "${FILTER_SCRIPT}" <<EOF
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import os
+import time
+import json
+import urllib.request
+import urllib.error
+
+CONF_FILE = "${CONF_FILE}"
+DEFAULT_PORT = 6800
+DEFAULT_MIN_MB = ${min_size}
+FILTER_EXTS = "${target_exts}"
+
+def get_allowed_extensions():
+    if FILTER_EXTS == "ALL":
+        return None
+    ext_list = [ext.strip().lower() for ext in FILTER_EXTS.split(",") if ext.strip()]
+    return set(ext if ext.startswith(".") else "." + ext for ext in ext_list)
+
+ALLOWED_EXTS = get_allowed_extensions()
+
+def get_aria2_config():
+    rpc_port = DEFAULT_PORT
+    rpc_secret = ""
+    if os.path.exists(CONF_FILE):
+        with open(CONF_FILE, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("rpc-listen-port="):
+                    try:
+                        rpc_port = int(line.split("=", 1)[1].strip())
+                    except ValueError:
+                        pass
+                elif line.startswith("rpc-secret="):
+                    rpc_secret = line.split("=", 1)[1].strip()
+    return rpc_port, rpc_secret
+
+def rpc_call(method, params=None):
+    port, secret = get_aria2_config()
+    url = f"http://127.0.0.1:{port}/jsonrpc"
+    p = []
+    if secret:
+        p.append(f"token:{secret}")
+    if params:
+        p.extend(params)
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": "bt_filter_daemon",
+        "method": method,
+        "params": p
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+            return res.get("result")
+    except Exception:
+        return None
+
+def process_tasks(handled_gids, min_size_mb):
+    min_bytes = min_size_mb * 1024 * 1024
+    active_tasks = rpc_call("aria2.tellActive", [["gid", "bittorrent", "files"]]) or []
+    waiting_tasks = rpc_call("aria2.tellWaiting", [0, 100, ["gid", "bittorrent", "files"]]) or []
+    all_tasks = active_tasks + waiting_tasks
+
+    current_gids = set()
+    for task in all_tasks:
+        gid = task.get("gid")
+        current_gids.add(gid)
+        
+        # 仅处理 BT 任务
+        if not task.get("bittorrent"):
+            continue
+        if gid in handled_gids:
+            continue
+
+        files = task.get("files", [])
+        if not files or len(files) <= 1:
+            # 单文件任务或种子元数据尚未完全解析，等待后续轮询
+            continue
+
+        selected_indices = []
+        for f in files:
+            path = f.get("path", "")
+            length = int(f.get("length", 0))
+            idx = str(f.get("index"))
+            ext = os.path.splitext(path)[1].lower()
+
+            # 1. 检查大小阈值
+            if length < min_bytes:
+                continue
+
+            # 2. 检查扩展名 (若为 None 则匹配所有大文件)
+            if ALLOWED_EXTS is not None and ext not in ALLOWED_EXTS:
+                continue
+
+            selected_indices.append(idx)
+
+        if selected_indices:
+            select_str = ",".join(selected_indices)
+            rpc_call("aria2.changeOption", [gid, {"select-file": select_str}])
+            desc = f"类型限制 [{FILTER_EXTS}]" if ALLOWED_EXTS else "任意格式"
+            print(f"[Aria2-Filter] 成功为 GID {gid} 勾选符合项 ({desc}, >={min_size_mb}MB): 匹配 {len(selected_indices)}/{len(files)} 个文件 (索引: {select_str})", flush=True)
+        else:
+            print(f"[Aria2-Filter] 提示: 任务 GID {gid} 未匹配到符合条件的文件，保持默认全选下载。", flush=True)
+
+        handled_gids.add(gid)
+
+    # 清理已完成或已删除的任务缓存
+    obsolete = handled_gids - current_gids
+    for gid in list(obsolete):
+        handled_gids.remove(gid)
+
+def main():
+    type_info = f"扩展名: {FILTER_EXTS}" if ALLOWED_EXTS else "任意文件格式 (无后缀限制)"
+    print(f"[Aria2-Filter] 守护进程启动完成！规则: 体积 >= {DEFAULT_MIN_MB}MB, {type_info}", flush=True)
+    handled_gids = set()
+    while True:
+        try:
+            process_tasks(handled_gids, DEFAULT_MIN_MB)
+        except Exception:
+            time.sleep(2)
+        time.sleep(2)
+
+if __name__ == "__main__":
+    main()
+EOF
+    chmod +x "${FILTER_SCRIPT}"
+}
+
 # ==================== 模块 1: 安装 / 重新配置 Aria2 后端 ====================
 install_aria2() {
     echo ""
@@ -264,7 +404,7 @@ install_aria2() {
     echo "RPC 密钥: ${RPC_SECRET}"
     echo "顺带配置 AriaNg: $([[ "$WITH_ARIANG" =~ ^[Yy]$ ]] && echo "是" || echo "否")"
     echo "Trackers 自动更新: 默认开启 (每日定时)"
-    echo "吸血 Peer 防火墙: 默认不开启 (可在主菜单按需启用)"
+    echo "未选文件自动清理: 开启 (bt-remove-unselected-file=true)"
     echo "======================"
     read -rp "确认应用并保存配置? [Y/n 默认: Y]: " CONFIRM
     CONFIRM="${CONFIRM:-Y}"
@@ -281,7 +421,7 @@ install_aria2() {
     fi
 
     if [ "$NEED_DOWNLOAD" = true ]; then
-        install_packages curl wget tar
+        install_packages curl wget tar python3
         echo ">> 正在下载 Aria2 增强版..."
         ARIA2_URL="${GH_PROXY}/P3TERX/Aria2-Pro-Core/releases/download/1.36.0_2021.08.22/aria2-1.36.0-static-linux-amd64.tar.gz"
         TMP_DIR=$(mktemp -d)
@@ -334,6 +474,7 @@ rpc-secret=${RPC_SECRET}
 ## BT/PT 设置 ##
 bt-save-metadata=false
 follow-torrent=mem
+bt-remove-unselected-file=true
 bt-tracker=
 EOF
 
@@ -941,7 +1082,6 @@ archive_completed_files() {
 
     echo ">> 正在安全分析 ${SRC_DIR} 中完全已下载完成的内容 (严格排除带 .aria2 控制文件的活跃任务)..."
 
-    # 1. 提取所有未完成文件的标识
     declare -A ACTIVE_TASKS
     while IFS= read -r ctl; do
         target="${ctl%.aria2}"
@@ -953,12 +1093,9 @@ archive_completed_files() {
     declare -a COMPLETED_ITEMS=()
     while IFS= read -r item; do
         base_name=$(basename "$item")
-        # 排除下载目录下的临时会话/系统隐藏文件夹
         [[ "$base_name" == .* ]] && continue
-        # 排除以 .aria2 结尾的控制文件
         [[ "$base_name" == *.aria2 ]] && continue
 
-        # 如果顶级文件名或目录名命中未完成集合，说明正在下载，绝对跳过
         if [[ -n "${ACTIVE_TASKS[$base_name]}" ]]; then
             continue
         fi
@@ -986,7 +1123,6 @@ archive_completed_files() {
     fi
 
     echo ">> 正在断点同步数据..."
-    # 使用 --partial --append-verify 保障中断后接着续传
     for it in "${COMPLETED_ITEMS[@]}"; do
         echo "   -> 正在转移: $(basename "$it")..."
         rsync -avP --partial --append-verify "${it}" "${DEST_DIR}/"
@@ -1265,6 +1401,13 @@ manage_utils_menu() {
                 else
                     echo -e "\033[37m[未开启]\033[0m"
                 fi
+
+                echo -n "6. BT 自动筛选下载服务: "
+                if ${SYSTEMCTL_CMD} is-active --quiet aria2-filter.service 2>/dev/null; then
+                    echo -e "\033[32m[已开启]\033[0m"
+                else
+                    echo -e "\033[37m[未开启]\033[0m"
+                fi
                 echo "================================"
                 ;;
 
@@ -1292,9 +1435,10 @@ manage_logs_menu() {
         echo " 4. 查看 Trackers 自动更新日志 (最近执行记录)"
         echo " 5. 查看 吸血 Peer 防火墙更新日志 (最近执行记录)"
         echo " 6. 查看 Caddy 反代 Web 前端日志"
+        echo " 7. 查看 BT 自动筛选服务运行日志"
         echo " 0. 返回上级菜单"
         echo "=========================================="
-        read -rp "请选择操作 [0-6]: " LOG_CHOICE
+        read -rp "请选择操作 [0-7]: " LOG_CHOICE
 
         case "$LOG_CHOICE" in
             1)
@@ -1354,6 +1498,15 @@ manage_logs_menu() {
                 echo ""
                 echo ">> 最近一次 Caddy 服务日志:"
                 ${SUDO_CMD} journalctl -u caddy -n 30 --no-pager 2>/dev/null || echo "尚未安装 Caddy 服务"
+                ;;
+            7)
+                echo ""
+                echo ">> BT 自动筛选守护进程日志:"
+                if [ "$IS_ROOT" = true ]; then
+                    journalctl -u aria2-filter.service -n 40 -f
+                else
+                    journalctl --user -u aria2-filter.service -n 40 -f
+                fi
                 ;;
             0)
                 break
@@ -1472,6 +1625,134 @@ uninstall_ariang() {
     echo ">> AriaNg 前端卸载流程已完成。"
 }
 
+# ==================== 模块 14: BT 自动筛选下载管理 (支持按大小及格式过滤) ====================
+manage_video_filter() {
+    echo ""
+    echo "=========================================="
+    echo "       BT 自动筛选下载管理 (大小与类型过滤)  "
+    echo "=========================================="
+
+    if [ ! -f "${CONF_FILE}" ]; then
+        echo "错误: 未找到配置文件 ${CONF_FILE}，请先安装 Aria2！"
+        return 1
+    fi
+
+    local IS_FILTER_ACTIVE=false
+    if ${SYSTEMCTL_CMD} is-active --quiet aria2-filter.service 2>/dev/null; then
+        IS_FILTER_ACTIVE=true
+    fi
+
+    echo -n "当前自动筛选守护服务状态: "
+    if [ "$IS_FILTER_ACTIVE" = true ]; then
+        echo -e "\033[32m已启用 (正在实时过滤新下载任务)\033[0m"
+    else
+        echo -e "\033[31m未启用 (Inactive)\033[0m"
+    fi
+    echo ""
+
+    echo " 1. 开启 / 重新配置自动筛选守护服务"
+    echo " 2. 停止并禁用自动筛选守护服务"
+    echo " 3. 查看实时筛选过滤日志"
+    echo " 0. 返回上级菜单"
+    read -rp "请选择操作 [0-3]: " FILTER_CHOICE
+
+    case "$FILTER_CHOICE" in
+        1)
+            install_packages python3
+            
+            # 1. 设置大小阈值
+            read -rp "请输入需要保留的文件最小体积 (MB) [默认: 50]: " INPUT_MIN_MB
+            INPUT_MIN_MB="${INPUT_MIN_MB:-50}"
+
+            # 2. 设置文件过滤类型
+            echo ""
+            echo "请选择文件类型过滤模式:"
+            echo " 1. 仅按体积筛选所有类型 (默认: 只要 >= ${INPUT_MIN_MB}MB 的文件都下载，不限类型)"
+            echo " 2. 仅下载常见视频格式 (mp4, mkv, ts, avi, mov, flv, wmv, m4v, rmvb, iso)"
+            echo " 3. 自定义需要保留的文件后缀名 (如: mp4,mkv,zip,iso)"
+            read -rp "请选择 [1-3 默认: 1]: " TYPE_CHOICE
+            TYPE_CHOICE="${TYPE_CHOICE:-1}"
+
+            TARGET_EXTS="ALL"
+            if [ "$TYPE_CHOICE" == "2" ]; then
+                TARGET_EXTS=".mp4,.mkv,.ts,.avi,.mov,.flv,.wmv,.m4v,.rmvb,.iso"
+            elif [ "$TYPE_CHOICE" == "3" ]; then
+                read -rp "请输入自定义文件后缀名 (英文逗号分隔，例如: mp4,mkv,zip): " USER_EXTS
+                if [ -n "$USER_EXTS" ]; then
+                    TARGET_EXTS="$USER_EXTS"
+                else
+                    echo ">> 输入为空，将默认保留所有大于 ${INPUT_MIN_MB}MB 的文件。"
+                    TARGET_EXTS="ALL"
+                fi
+            fi
+
+            # 确保 aria2.conf 配置了自动清理未选中文件占位
+            if ! grep -q "^bt-remove-unselected-file=" "${CONF_FILE}"; then
+                echo "bt-remove-unselected-file=true" >> "${CONF_FILE}"
+                ${SYSTEMCTL_CMD} restart aria2.service
+            elif grep -q "^bt-remove-unselected-file=false" "${CONF_FILE}"; then
+                sed -i "s|^bt-remove-unselected-file=.*|bt-remove-unselected-file=true|g" "${CONF_FILE}"
+                ${SYSTEMCTL_CMD} restart aria2.service
+            fi
+
+            ensure_filter_script "${INPUT_MIN_MB}" "${TARGET_EXTS}"
+            [ "$IS_ROOT" = false ] && mkdir -p "${SYSTEMD_DIR}"
+
+            cat > "${SYSTEMD_DIR}/aria2-filter.service" <<EOF
+[Unit]
+Description=Aria2 BT Automatic Filter Daemon
+After=network.target aria2.service
+Requires=aria2.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 ${FILTER_SCRIPT}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+
+            ${SYSTEMCTL_CMD} daemon-reload
+            ${SYSTEMCTL_CMD} enable --now aria2-filter.service
+            ${SYSTEMCTL_CMD} restart aria2-filter.service
+
+            echo ""
+            echo ">> BT 自动筛选服务已成功配置并启动！"
+            echo "   体积阈值: >= ${INPUT_MIN_MB} MB"
+            if [ "$TARGET_EXTS" == "ALL" ]; then
+                echo "   格式过滤: 任意格式 (只要满足大小即可)"
+            else
+                echo "   格式过滤: 仅限 [${TARGET_EXTS}]"
+            fi
+            echo "   未选文件: 自动清理 (bt-remove-unselected-file=true)"
+            ;;
+        2)
+            echo ">> 正在停止并禁用筛选守护服务..."
+            ${SYSTEMCTL_CMD} stop aria2-filter.service 2>/dev/null || true
+            ${SYSTEMCTL_CMD} disable aria2-filter.service 2>/dev/null || true
+            rm -f "${SYSTEMD_DIR}/aria2-filter.service"
+            ${SYSTEMCTL_CMD} daemon-reload
+            echo ">> 自动筛选服务已关闭。"
+            ;;
+        3)
+            echo ">> 正在调取筛选守护进程实时日志 (按 Ctrl+C 退出):"
+            if [ "$IS_ROOT" = true ]; then
+                journalctl -u aria2-filter.service -n 40 -f
+            else
+                journalctl --user -u aria2-filter.service -n 40 -f
+            fi
+            ;;
+        0)
+            return 0
+            ;;
+        *)
+            echo "无效选项。"
+            ;;
+    esac
+}
+
 # ==================== 模块 13: 完整卸载 (全部组件) ====================
 uninstall_all() {
     echo ""
@@ -1485,10 +1766,11 @@ uninstall_all() {
         return 0
     fi
 
-    echo ">> 正在停止并禁用 Aria2、定时器 与 Caddy 服务..."
+    echo ">> 正在停止并禁用 Aria2、定时器、筛选守护 与 Caddy 服务..."
     ${SYSTEMCTL_CMD} stop aria2.service 2>/dev/null || true
     ${SYSTEMCTL_CMD} stop aria2-update-tracker.timer 2>/dev/null || true
     ${SYSTEMCTL_CMD} stop aria2-update-tracker.service 2>/dev/null || true
+    ${SYSTEMCTL_CMD} stop aria2-filter.service 2>/dev/null || true
     ${SUDO_CMD} systemctl stop aria2-peer-blocker.timer 2>/dev/null || true
     ${SUDO_CMD} systemctl stop aria2-peer-blocker.service 2>/dev/null || true
     ${SUDO_CMD} systemctl stop caddy 2>/dev/null || true
@@ -1496,6 +1778,7 @@ uninstall_all() {
     ${SYSTEMCTL_CMD} disable aria2.service 2>/dev/null || true
     ${SYSTEMCTL_CMD} disable aria2-update-tracker.timer 2>/dev/null || true
     ${SYSTEMCTL_CMD} disable aria2-update-tracker.service 2>/dev/null || true
+    ${SYSTEMCTL_CMD} disable aria2-filter.service 2>/dev/null || true
     ${SUDO_CMD} systemctl disable aria2-peer-blocker.timer 2>/dev/null || true
     ${SUDO_CMD} systemctl disable aria2-peer-blocker.service 2>/dev/null || true
     ${SUDO_CMD} systemctl disable caddy 2>/dev/null || true
@@ -1504,6 +1787,7 @@ uninstall_all() {
     ${SUDO_CMD} rm -f "${SYSTEMD_DIR}/aria2.service"
     ${SUDO_CMD} rm -f "${SYSTEMD_DIR}/aria2-update-tracker.service"
     ${SUDO_CMD} rm -f "${SYSTEMD_DIR}/aria2-update-tracker.timer"
+    ${SUDO_CMD} rm -f "${SYSTEMD_DIR}/aria2-filter.service"
     ${SUDO_CMD} rm -f /etc/systemd/system/aria2-peer-blocker.service
     ${SUDO_CMD} rm -f /etc/systemd/system/aria2-peer-blocker.timer
     ${SUDO_CMD} rm -f /etc/caddy/Caddyfile
@@ -1557,7 +1841,7 @@ while true; do
     echo "  可执行文件: ${ARIA2C_BIN}"
     echo "=========================================="
     echo " 1. $([ -f "${ARIA2C_BIN}" ] && echo "重新配置 Aria2 后端 (自动带入当前设置)" || echo "安装 / 配置 Aria2 后端 (默认启用 Trackers 自动更新)")"
-    echo " 2. 单独修改下载目录"
+    echo " 2. 修改下载目录"
     echo " 3. 手动更新 / 设置 BT Trackers (双源拉取 / 自定义)"
     echo " 4. 启用 / 停用 Trackers 自动更新"
     echo " 5. BT 吸血 Peer 防火墙拦截管理 (ipset+iptables / 默认关闭 / 每日更新)"
@@ -1569,9 +1853,10 @@ while true; do
     echo " 11. 单独安装 / 更新 AriaNg 前端 (Caddy 反代模式)"
     echo " 12. 单独卸载 AriaNg 前端"
     echo " 13. 完整卸载 (Aria2 + AriaNg + 防火墙规则 + 服务全清)"
+    echo " 14. BT 自动筛选下载管理 (支持按大小及自定义后缀过滤)"
     echo " 0. 退出"
     echo "=========================================="
-    read -rp "请选择操作 [0-13]: " MENU_CHOICE
+    read -rp "请选择操作 [0-14]: " MENU_CHOICE
 
     case "$MENU_CHOICE" in
         1) install_aria2 ;;
@@ -1587,6 +1872,7 @@ while true; do
         11) install_ariang ;;
         12) uninstall_ariang ;;
         13) uninstall_all; break ;;
+        14) manage_video_filter ;;
         0) echo "已退出。"; exit 0 ;;
         *) echo "无效选项，请重新选择。" ;;
     esac
