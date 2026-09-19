@@ -59,6 +59,18 @@ get_aria2_status() {
     fi
 }
 
+get_current_download_dir() {
+    if [ -f "${CONF_FILE}" ]; then
+        local configured_dir
+        configured_dir=$(grep -E "^dir=" "${CONF_FILE}" 2>/dev/null | cut -d'=' -f2 | tr -d '\r')
+        if [ -n "$configured_dir" ]; then
+            echo "$configured_dir"
+            return
+        fi
+    fi
+    echo "$DEFAULT_DOWNLOAD_DIR"
+}
+
 # ==================== 进程安全停机与等待 ====================
 stop_aria2_safely() {
     echo ">> 正在平稳停止 Aria2 服务以刷新保存 session..."
@@ -211,7 +223,7 @@ EOF
 # ==================== 生成 BT 自动筛选 Python 守护脚本 ====================
 ensure_filter_script() {
     local min_size="${1:-50}"
-    local target_exts="${2:-ALL}" # ALL 表示不过滤扩展名，只看体积
+    local target_exts="${2:-ALL}"
     mkdir -p "${ARIA2_CONF_DIR}/scripts"
 
     cat > "${FILTER_SCRIPT}" <<EOF
@@ -287,7 +299,6 @@ def process_tasks(handled_gids, min_size_mb):
         gid = task.get("gid")
         current_gids.add(gid)
         
-        # 仅处理 BT 任务
         if not task.get("bittorrent"):
             continue
         if gid in handled_gids:
@@ -295,7 +306,6 @@ def process_tasks(handled_gids, min_size_mb):
 
         files = task.get("files", [])
         if not files or len(files) <= 1:
-            # 单文件任务或种子元数据尚未完全解析，等待后续轮询
             continue
 
         selected_indices = []
@@ -305,11 +315,9 @@ def process_tasks(handled_gids, min_size_mb):
             idx = str(f.get("index"))
             ext = os.path.splitext(path)[1].lower()
 
-            # 1. 检查大小阈值
             if length < min_bytes:
                 continue
 
-            # 2. 检查扩展名 (若为 None 则匹配所有大文件)
             if ALLOWED_EXTS is not None and ext not in ALLOWED_EXTS:
                 continue
 
@@ -325,7 +333,6 @@ def process_tasks(handled_gids, min_size_mb):
 
         handled_gids.add(gid)
 
-    # 清理已完成或已删除的任务缓存
     obsolete = handled_gids - current_gids
     for gid in list(obsolete):
         handled_gids.remove(gid)
@@ -877,7 +884,7 @@ migrate_downloads() {
         fi
     fi
 
-    CURRENT_DIR=$(grep -E "^dir=" "${CONF_FILE}" | cut -d'=' -f2 | tr -d '\r')
+    CURRENT_DIR=$(get_current_download_dir)
     echo ""
     echo "当前默认下载目录为: ${CURRENT_DIR}"
     read -rp "请输入源下载目录 [默认: ${CURRENT_DIR}]: " SRC_DIR
@@ -1057,10 +1064,9 @@ archive_completed_files() {
 
     install_packages rsync findutils
 
-    CURRENT_DIR=$(grep -E "^dir=" "${CONF_FILE}" | cut -d'=' -f2 | tr -d '\r')
-    read -rp "请输入下载目录绝对路径 [默认: ${CURRENT_DIR:-$DEFAULT_DOWNLOAD_DIR}]: " SRC_DIR
+    CURRENT_DIR=$(get_current_download_dir)
+    read -rp "请输入下载目录绝对路径 [默认: ${CURRENT_DIR}]: " SRC_DIR
     SRC_DIR="${SRC_DIR:-$CURRENT_DIR}"
-    SRC_DIR="${SRC_DIR:-$DEFAULT_DOWNLOAD_DIR}"
     SRC_DIR="${SRC_DIR%/}"
 
     if [ ! -d "${SRC_DIR}" ]; then
@@ -1170,10 +1176,9 @@ scan_and_resume_torrents() {
         sleep 1
     fi
 
-    CURRENT_DIR=$(grep -E "^dir=" "${CONF_FILE}" | cut -d'=' -f2 | tr -d '\r')
-    read -rp "请输入要扫描的种子所在目录 [默认: ${CURRENT_DIR:-$DEFAULT_DOWNLOAD_DIR}]: " TARGET_SCAN_DIR
+    CURRENT_DIR=$(get_current_download_dir)
+    read -rp "请输入要扫描的种子所在目录 [默认: ${CURRENT_DIR}]: " TARGET_SCAN_DIR
     TARGET_SCAN_DIR="${TARGET_SCAN_DIR:-$CURRENT_DIR}"
-    TARGET_SCAN_DIR="${TARGET_SCAN_DIR:-$DEFAULT_DOWNLOAD_DIR}"
     TARGET_SCAN_DIR="${TARGET_SCAN_DIR%/}"
 
     if [ ! -d "${TARGET_SCAN_DIR}" ]; then
@@ -1259,8 +1264,7 @@ manage_utils_menu() {
 
         case "$UTIL_CHOICE" in
             1)
-                CURRENT_DIR=$(grep -E "^dir=" "${CONF_FILE}" 2>/dev/null | cut -d'=' -f2 | tr -d '\r')
-                DEFAULT_CLEAN_DIR="${CURRENT_DIR:-$DEFAULT_DOWNLOAD_DIR}"
+                DEFAULT_CLEAN_DIR=$(get_current_download_dir)
                 read -rp "请输入要清理的下载目录路径 [默认: ${DEFAULT_CLEAN_DIR}]: " SCAN_DIR
                 SCAN_DIR="${SCAN_DIR:-$DEFAULT_CLEAN_DIR}"
                 SCAN_DIR="${SCAN_DIR%/}"
@@ -1314,8 +1318,7 @@ manage_utils_menu() {
                 ;;
 
             2)
-                CURRENT_DIR=$(grep -E "^dir=" "${CONF_FILE}" 2>/dev/null | cut -d'=' -f2 | tr -d '\r')
-                DEFAULT_CLEAN_DIR="${CURRENT_DIR:-$DEFAULT_DOWNLOAD_DIR}"
+                DEFAULT_CLEAN_DIR=$(get_current_download_dir)
                 read -rp "请输入要检查的下载目录路径 [默认: ${DEFAULT_CLEAN_DIR}]: " SCAN_DIR
                 SCAN_DIR="${SCAN_DIR:-$DEFAULT_CLEAN_DIR}"
                 SCAN_DIR="${SCAN_DIR%/}"
@@ -1663,11 +1666,9 @@ manage_video_filter() {
         1)
             install_packages python3
             
-            # 1. 设置大小阈值
             read -rp "请输入需要保留的文件最小体积 (MB) [默认: 50]: " INPUT_MIN_MB
             INPUT_MIN_MB="${INPUT_MIN_MB:-50}"
 
-            # 2. 设置文件过滤类型
             echo ""
             echo "请选择文件类型过滤模式:"
             echo " 1. 仅按体积筛选所有类型 (默认: 只要 >= ${INPUT_MIN_MB}MB 的文件都下载，不限类型)"
@@ -1691,7 +1692,6 @@ manage_video_filter() {
 
             local NEED_RESTART_ARIA2=false
 
-            # 确保 aria2.conf 配置了自动清理未选中文件占位
             if ! grep -q "^bt-remove-unselected-file=" "${CONF_FILE}"; then
                 echo "bt-remove-unselected-file=true" >> "${CONF_FILE}"
                 NEED_RESTART_ARIA2=true
@@ -1700,7 +1700,6 @@ manage_video_filter() {
                 NEED_RESTART_ARIA2=true
             fi
 
-            # 确保补充了最大上传限速 2M
             if ! grep -q "^max-overall-upload-limit=" "${CONF_FILE}"; then
                 echo "max-overall-upload-limit=2M" >> "${CONF_FILE}"
                 echo "max-upload-limit=2M" >> "${CONF_FILE}"
@@ -1768,6 +1767,133 @@ EOF
             echo "无效选项。"
             ;;
     esac
+}
+
+# ==================== 模块 15: 扫描并清理小文件工具 (支持分页预览) ====================
+clean_small_files_menu() {
+    echo ""
+    echo "=========================================="
+    echo "      清理下载目录下的小文件 (防误删)     "
+    echo "=========================================="
+
+    # 1. 默认路径为当前配置的下载路径
+    local DEF_CLEAN_DIR
+    DEF_CLEAN_DIR=$(get_current_download_dir)
+
+    read -rp "请输入要扫描清理的目录路径 [默认: ${DEF_CLEAN_DIR}]: " TARGET_DIR
+    TARGET_DIR="${TARGET_DIR:-$DEF_CLEAN_DIR}"
+    TARGET_DIR="${TARGET_DIR%/}"
+
+    if [ ! -d "${TARGET_DIR}" ]; then
+        echo "错误: 目录 '${TARGET_DIR}' 不存在！"
+        return 1
+    fi
+
+    # 2. 输入大小门槛，默认 50MB
+    read -rp "请输入文件大小门槛 (小于该大小的文件将被清理, 单位 MB) [默认: 50]: " SIZE_MB
+    SIZE_MB="${SIZE_MB:-50}"
+
+    if ! [[ "$SIZE_MB" =~ ^[0-9]+$ ]] || [ "$SIZE_MB" -le 0 ]; then
+        echo "错误: 请输入有效的正整数！"
+        return 1
+    fi
+
+    echo ""
+    echo ">> 正在扫描目录: ${TARGET_DIR}"
+    echo ">> 过滤条件: 体积小于 ${SIZE_MB}MB (自动保护 .aria2 及正在下载中的任务)..."
+
+    # 3. 收集所有未完成任务的控制标识，防止误删正在下载的数据块
+    declare -A ACTIVE_TASKS
+    while IFS= read -r ctl; do
+        ACTIVE_TASKS["$ctl"]=1
+        ACTIVE_TASKS["${ctl%.aria2}"]=1
+    done < <(find "${TARGET_DIR}" -type f -name "*.aria2" 2>/dev/null)
+
+    # 4. 扫描小于阈值的文件
+    declare -a FILES_TO_DELETE=()
+    local TOTAL_BYTES=0
+
+    while IFS= read -r file; do
+        if [[ -n "${ACTIVE_TASKS[$file]}" ]] || [[ "$file" == *.aria2 ]]; then
+            continue
+        fi
+
+        FILES_TO_DELETE+=("$file")
+        local f_size
+        f_size=$(stat -c %s "$file" 2>/dev/null || stat -f %z "$file" 2>/dev/null || echo 0)
+        TOTAL_BYTES=$((TOTAL_BYTES + f_size))
+    done < <(find "${TARGET_DIR}" -type f -size -"${SIZE_MB}"M 2>/dev/null)
+
+    local FILE_COUNT=${#FILES_TO_DELETE[@]}
+    if [ "$FILE_COUNT" -eq 0 ]; then
+        echo ""
+        echo ">> 扫描完成: 未找到任何小于 ${SIZE_MB}MB 的文件。"
+        return 0
+    fi
+
+    local TOTAL_HUMAN
+    TOTAL_HUMAN=$(awk "BEGIN {printf \"%.2f\", ${TOTAL_BYTES}/1024/1024}")
+    echo ""
+    echo ">> 扫描完成！共找到 ${FILE_COUNT} 个符合条件的文件 (总计约 ${TOTAL_HUMAN} MB)。"
+
+    # 5. 分页查看机制
+    if [ "$FILE_COUNT" -gt 20 ]; then
+        read -rp "匹配到的文件较多 (${FILE_COUNT} 个)，是否翻页查看清单? [y/N 默认: N]: " VIEW_PAGER
+        VIEW_PAGER="${VIEW_PAGER:-N}"
+        if [[ "$VIEW_PAGER" =~ ^[Yy]$ ]]; then
+            local page_size=20
+            local current_idx=0
+            while [ $current_idx -lt "$FILE_COUNT" ]; do
+                clear || true
+                echo "=== 待清理文件清单 (第 $((current_idx / page_size + 1)) 页 / 共 $(((FILE_COUNT + page_size - 1) / page_size)) 页) ==="
+                for ((i=current_idx; i<current_idx+page_size && i<FILE_COUNT; i++)); do
+                    echo " [$((i+1))] ${FILES_TO_DELETE[$i]}"
+                done
+                echo "--------------------------------------------------"
+                current_idx=$((current_idx + page_size))
+                if [ $current_idx -lt "$FILE_COUNT" ]; then
+                    read -rp "按 [Enter] 查看下一页，或输入 [q] 退出预览: " PAGER_ACTION
+                    if [[ "$PAGER_ACTION" =~ ^[Qq]$ ]]; then
+                        break
+                    fi
+                else
+                    read -rp "已浏览全部文件，按 [Enter] 继续..." _
+                fi
+            done
+        fi
+    else
+        echo "---------------- 待清理文件列表 ------------------"
+        for ((i=0; i<FILE_COUNT; i++)); do
+            echo " [$((i+1))] ${FILES_TO_DELETE[$i]}"
+        done
+        echo "--------------------------------------------------"
+    fi
+
+    # 6. 二次确认删除
+    echo ""
+    read -rp "确认彻底删除以上 ${FILE_COUNT} 个小于 ${SIZE_MB}MB 的文件以释放空间? [y/N 默认: N]: " CONFIRM_DEL
+    CONFIRM_DEL="${CONFIRM_DEL:-N}"
+
+    if [[ ! "$CONFIRM_DEL" =~ ^[Yy]$ ]]; then
+        echo ">> 操作已取消，未删除任何文件。"
+        return 0
+    fi
+
+    echo ">> 正在删除文件..."
+    for file in "${FILES_TO_DELETE[@]}"; do
+        rm -f "$file"
+    done
+
+    # 7. 可选清理空文件夹
+    read -rp "是否顺带清理因删除小文件后遗留的空文件夹? [Y/n 默认: Y]: " CLEAN_EMPTY_DIR
+    CLEAN_EMPTY_DIR="${CLEAN_EMPTY_DIR:-Y}"
+    if [[ "$CLEAN_EMPTY_DIR" =~ ^[Yy]$ ]]; then
+        find "${TARGET_DIR}" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+        echo ">> 空文件夹已同步清理完毕。"
+    fi
+
+    echo ""
+    echo ">> [成功] 已清理 ${FILE_COUNT} 个小文件，释放空间约 ${TOTAL_HUMAN} MB！"
 }
 
 # ==================== 模块 13: 完整卸载 (全部组件) ====================
@@ -1855,25 +1981,33 @@ while true; do
     echo "          Aria2 & AriaNg 综合管理          "
     echo "  当前用户: ${CURRENT_USER} ($([ "$IS_ROOT" = true ] && echo "Root 模式" || echo "普通用户模式"))"
     echo "  服务状态: $(get_aria2_status)"
-    echo "  可执行文件: ${ARIA2C_BIN}"
+    if [ -f "${CONF_FILE}" ]; then
+        echo "  下载路径: $(get_current_download_dir)"
+        RPC_P=$(grep -E "^rpc-listen-port=" "${CONF_FILE}" 2>/dev/null | cut -d'=' -f2 | tr -d ' \r')
+        echo "  RPC 端口: ${RPC_P:-6800}"
+        UP_LIMIT=$(grep -E "^max-overall-upload-limit=" "${CONF_FILE}" 2>/dev/null | cut -d'=' -f2 | tr -d ' \r')
+        echo "  上传限速: ${UP_LIMIT:-未限制}"
+    fi
+    echo "  可执行程序: ${ARIA2C_BIN}"
     echo "=========================================="
     echo " 1. $([ -f "${ARIA2C_BIN}" ] && echo "重新配置 Aria2 后端 (自动带入当前设置)" || echo "安装 / 配置 Aria2 后端 (默认启用 Trackers 自动更新)")"
-    echo " 2. 修改下载目录"
+    echo " 2. 修改默认下载目录"
     echo " 3. 手动更新 / 设置 BT Trackers (双源拉取 / 自定义)"
     echo " 4. 启用 / 停用 Trackers 自动更新"
     echo " 5. BT 吸血 Peer 防火墙拦截管理 (ipset+iptables / 默认关闭 / 每日更新)"
     echo " 6. 迁移下载任务到新磁盘 (迁移 未完成 / 全部 任务并切换工作路径)"
     echo " 7. 转移已完成下载到新磁盘 (移动已完成文件释放磁盘空间)"
-    echo " 8. 扫描目录并恢复未完成种子的下载任务"
+    echo " 8. 扫描目录并恢复未完成种子断点下载"
     echo " 9. Aria2 实用辅助与清理工具箱 (清理已完成种子 / 碎片清理 / 健康自检)"
     echo " 10. Aria2 日志排查与故障分析 (实时日志 / 崩溃溯源 / 前台单测)"
     echo " 11. 单独安装 / 更新 AriaNg 前端 (Caddy 反代模式)"
     echo " 12. 单独卸载 AriaNg 前端"
     echo " 13. 完整卸载 (Aria2 + AriaNg + 防火墙规则 + 服务全清)"
     echo " 14. BT 自动筛选下载管理 (支持按大小及自定义后缀过滤)"
+    echo " 15. 扫描并清理下载目录下的小文件"
     echo " 0. 退出"
     echo "=========================================="
-    read -rp "请选择操作 [0-14]: " MENU_CHOICE
+    read -rp "请选择操作 [0-15]: " MENU_CHOICE
 
     case "$MENU_CHOICE" in
         1) install_aria2 ;;
@@ -1890,6 +2024,7 @@ while true; do
         12) uninstall_ariang ;;
         13) uninstall_all; break ;;
         14) manage_video_filter ;;
+        15) clean_small_files_menu ;;
         0) echo "已退出。"; exit 0 ;;
         *) echo "无效选项，请重新选择。" ;;
     esac
