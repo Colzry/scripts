@@ -218,7 +218,6 @@ install_aria2() {
     fi
     echo "=========================================="
 
-    # 1. 自动提取已有的历史配置默认值
     local CURRENT_DIR=""
     local CURRENT_PORT=""
     local CURRENT_SECRET=""
@@ -274,7 +273,6 @@ install_aria2() {
         return 0
     fi
 
-    # 2. 如果已经存在二进制程序，跳过重复下载
     local NEED_DOWNLOAD=true
     if [ -f "${ARIA2C_BIN}" ] && [ -x "${ARIA2C_BIN}" ]; then
         echo ""
@@ -343,7 +341,6 @@ EOF
 
     [ "$IS_ROOT" = false ] && mkdir -p "${SYSTEMD_DIR}"
 
-    # 3. 部署精炼稳定的 Systemd 单元配置
     if [ "$IS_ROOT" = true ]; then
         ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2.service'" <<EOF
 [Unit]
@@ -706,7 +703,7 @@ EOF
     esac
 }
 
-# ==================== 模块 6: 迁移下载任务 ====================
+# ==================== 模块 6: 迁移未完成下载任务到新磁盘 ====================
 migrate_downloads() {
     echo ""
     echo "=========================================="
@@ -777,45 +774,45 @@ migrate_downloads() {
                 return 0
             fi
 
-            echo ">> 发现 ${#ARIA2_CONTROL_FILES[@]} 个未完成任务，正在同步数据文件、控制文件与种子元数据..."
+            echo ">> 发现 ${#ARIA2_CONTROL_FILES[@]} 个未完成任务，正在断点同步数据、控制文件与种子元数据..."
             for ctl in "${ARIA2_CONTROL_FILES[@]}"; do
                 data_target="${ctl%.aria2}"
                 rel_ctl="${ctl#"${SRC_DIR}/"}"
                 dest_subdir=$(dirname "${DEST_DIR}/${rel_ctl}")
                 mkdir -p "${dest_subdir}"
 
-                rsync -avP "${ctl}" "${dest_subdir}/"
+                rsync -avP --partial "${ctl}" "${dest_subdir}/"
                 MIGRATED_FILES+=("${ctl}")
 
                 if [ -e "${data_target}" ]; then
-                    rsync -avP "${data_target}" "${dest_subdir}/"
+                    rsync -avP --partial "${data_target}" "${dest_subdir}/"
                     MIGRATED_FILES+=("${data_target}")
                 fi
 
                 if [ -f "${data_target}.torrent" ]; then
-                    rsync -avP "${data_target}.torrent" "${dest_subdir}/"
+                    rsync -avP --partial "${data_target}.torrent" "${dest_subdir}/"
                     MIGRATED_FILES+=("${data_target}.torrent")
                 fi
             done
 
             while IFS= read -r tor; do
                 if [ -f "$tor" ]; then
-                    rsync -avP "$tor" "${DEST_DIR}/"
+                    rsync -avP --partial "$tor" "${DEST_DIR}/"
                     MIGRATED_FILES+=("$tor")
                 fi
             done < <(find "${SRC_DIR}" -maxdepth 1 -name "*.torrent")
             ;;
 
         2)
-            echo ">> 正在完整同步下载目录下全部数据、控制文件与种子元数据..."
-            rsync -avP "${SRC_DIR}/" "${DEST_DIR}/"
+            echo ">> 正在完整断点同步下载目录下全部数据..."
+            rsync -avP --partial "${SRC_DIR}/" "${DEST_DIR}/"
             while IFS= read -r item; do
                 [ -e "$item" ] && MIGRATED_FILES+=("$item")
             done < <(find "${SRC_DIR}" -mindepth 1 -maxdepth 1)
             ;;
 
         3)
-            echo ">> 正在根据关键字 [${FILE_KEYWORD}] 匹配任务并同步..."
+            echo ">> 正在根据关键字 [${FILE_KEYWORD}] 匹配任务并断点同步..."
             MATCH_FOUND=false
             while IFS= read -r item; do
                 MATCH_FOUND=true
@@ -823,22 +820,22 @@ migrate_downloads() {
                 dest_subdir=$(dirname "${DEST_DIR}/${rel_item}")
                 mkdir -p "${dest_subdir}"
 
-                rsync -avP "${item}" "${dest_subdir}/"
+                rsync -avP --partial "${item}" "${dest_subdir}/"
                 MIGRATED_FILES+=("${item}")
 
                 if [ -f "${item}.aria2" ]; then
-                    rsync -avP "${item}.aria2" "${dest_subdir}/"
+                    rsync -avP --partial "${item}.aria2" "${dest_subdir}/"
                     MIGRATED_FILES+=("${item}.aria2")
                 fi
                 if [ -f "${item}.torrent" ]; then
-                    rsync -avP "${item}.torrent" "${dest_subdir}/"
+                    rsync -avP --partial "${item}.torrent" "${dest_subdir}/"
                     MIGRATED_FILES+=("${item}.torrent")
                 fi
             done < <(find "${SRC_DIR}" -name "*${FILE_KEYWORD}*" ! -name "*.aria2" ! -name "*.torrent")
 
             while IFS= read -r ext_file; do
                 MATCH_FOUND=true
-                rsync -avP "${ext_file}" "${DEST_DIR}/"
+                rsync -avP --partial "${ext_file}" "${DEST_DIR}/"
                 MIGRATED_FILES+=("${ext_file}")
             done < <(find "${SRC_DIR}" -maxdepth 1 -name "*${FILE_KEYWORD}*.torrent" -o -name "*${FILE_KEYWORD}*.aria2")
 
@@ -902,7 +899,115 @@ migrate_downloads() {
     fi
 }
 
-# ==================== 模块 7: 扫描并恢复未完成种子任务 ====================
+# ==================== 模块 7: 转移已完成文件到外部/新磁盘 (支持断点续传腾空间) ====================
+archive_completed_files() {
+    echo ""
+    echo "=========================================="
+    echo "   转移已完成下载到新磁盘 (释放下载空间)  "
+    echo "=========================================="
+
+    if [ ! -f "${CONF_FILE}" ]; then
+        echo "错误: 未找到配置文件 ${CONF_FILE}，请确认 Aria2 是否已安装。"
+        return 1
+    fi
+
+    install_packages rsync findutils
+
+    CURRENT_DIR=$(grep -E "^dir=" "${CONF_FILE}" | cut -d'=' -f2 | tr -d '\r')
+    read -rp "请输入下载目录绝对路径 [默认: ${CURRENT_DIR:-$DEFAULT_DOWNLOAD_DIR}]: " SRC_DIR
+    SRC_DIR="${SRC_DIR:-$CURRENT_DIR}"
+    SRC_DIR="${SRC_DIR:-$DEFAULT_DOWNLOAD_DIR}"
+    SRC_DIR="${SRC_DIR%/}"
+
+    if [ ! -d "${SRC_DIR}" ]; then
+        echo "错误: 源下载目录 ${SRC_DIR} 不存在！"
+        return 1
+    fi
+
+    while true; do
+        read -rp "请输入用于归档存放的大容量目标目录 (例如: /mnt/hdd02/Archive): " DEST_DIR
+        if [ -n "$DEST_DIR" ]; then
+            DEST_DIR="${DEST_DIR%/}"
+            break
+        fi
+        echo "目标目录不能为空，请重新输入！"
+    done
+
+    mkdir -p "${DEST_DIR}"
+    if [ "$IS_ROOT" = false ]; then
+        ${SUDO_CMD} chown -R "${CURRENT_USER}:${CURRENT_USER}" "${DEST_DIR}" 2>/dev/null || true
+    fi
+    chmod 755 "${DEST_DIR}" 2>/dev/null || true
+
+    echo ">> 正在安全分析 ${SRC_DIR} 中完全已下载完成的内容 (严格排除带 .aria2 控制文件的活跃任务)..."
+
+    # 1. 提取所有未完成文件的标识
+    declare -A ACTIVE_TASKS
+    while IFS= read -r ctl; do
+        target="${ctl%.aria2}"
+        rel="${target#"${SRC_DIR}/"}"
+        top_name="${rel%%/*}"
+        ACTIVE_TASKS["$top_name"]=1
+    done < <(find "${SRC_DIR}" -name "*.aria2")
+
+    declare -a COMPLETED_ITEMS=()
+    while IFS= read -r item; do
+        base_name=$(basename "$item")
+        # 排除下载目录下的临时会话/系统隐藏文件夹
+        [[ "$base_name" == .* ]] && continue
+        # 排除以 .aria2 结尾的控制文件
+        [[ "$base_name" == *.aria2 ]] && continue
+
+        # 如果顶级文件名或目录名命中未完成集合，说明正在下载，绝对跳过
+        if [[ -n "${ACTIVE_TASKS[$base_name]}" ]]; then
+            continue
+        fi
+
+        COMPLETED_ITEMS+=("$item")
+    done < <(find "${SRC_DIR}" -mindepth 1 -maxdepth 1)
+
+    if [ ${#COMPLETED_ITEMS[@]} -eq 0 ]; then
+        echo ">> 提示: 当前目录下没有找到完全下载完成的独立文件或目录 (所有内容均在活跃下载中或目录为空)。"
+        return 0
+    fi
+
+    echo ""
+    echo ">> 检索到以下 ${#COMPLETED_ITEMS[@]} 个已完全下载的内容可转移腾出空间:"
+    for it in "${COMPLETED_ITEMS[@]}"; do
+        echo "   - $(basename "$it")"
+    done
+    echo ""
+    echo "提示: 本操作使用 rsync 断点续传，若由于网络、空间或手动 Ctrl+C 导致中断，重新运行即可自动接着传！"
+    read -rp "确认开始断点移动以上文件到 ${DEST_DIR}? [Y/n 默认: Y]: " CONFIRM_MOVE
+    CONFIRM_MOVE="${CONFIRM_MOVE:-Y}"
+    if [[ ! "$CONFIRM_MOVE" =~ ^[Yy]$ ]]; then
+        echo ">> 操作已取消。"
+        return 0
+    fi
+
+    echo ">> 正在断点同步数据..."
+    # 使用 --partial --append-verify 保障中断后接着续传
+    for it in "${COMPLETED_ITEMS[@]}"; do
+        echo "   -> 正在转移: $(basename "$it")..."
+        rsync -avP --partial --append-verify "${it}" "${DEST_DIR}/"
+    done
+
+    echo ""
+    echo ">> [成功] 数据已完整同步到新磁盘目标目录！"
+    read -rp "是否立即彻底删除源磁盘上对应的已完成文件以释放空间? [Y/n 默认: Y]: " CLEAN_SRC
+    CLEAN_SRC="${CLEAN_SRC:-Y}"
+    if [[ "$CLEAN_SRC" =~ ^[Yy]$ ]]; then
+        echo ">> 正在释放源磁盘空间..."
+        for it in "${COMPLETED_ITEMS[@]}"; do
+            rm -rf "${it}"
+        done
+        echo ">> 源磁盘已完成内容已清空，空间成功释放！Aria2 剩余未完成任务继续正常下载。"
+    else
+        echo ">> 已保留源磁盘上的原始文件。"
+    fi
+}
+
+# ==================== 模块 8: 扫描并恢复未完成种子任务 ====================
 scan_and_resume_torrents() {
     echo ""
     echo "=========================================="
@@ -998,7 +1103,7 @@ EOF
     echo ">> 请打开 AriaNg 查看任务列表，任务会先进行“检查中 (Checking)”，自检完成后将自动断点续传。"
 }
 
-# ==================== 模块 8: 实用辅助与清理工具箱 ====================
+# ==================== 模块 9: 实用辅助与清理工具箱 ====================
 manage_utils_menu() {
     while true; do
         echo ""
@@ -1174,7 +1279,7 @@ manage_utils_menu() {
     done
 }
 
-# ==================== 模块 9: 日志查看与故障排查 ====================
+# ==================== 模块 10: 日志查看与故障排查 ====================
 manage_logs_menu() {
     while true; do
         echo ""
@@ -1260,7 +1365,7 @@ manage_logs_menu() {
     done
 }
 
-# ==================== 模块 10: 单独安装/更新 AriaNg (使用 Caddy) ====================
+# ==================== 模块 11: 单独安装/更新 AriaNg (使用 Caddy) ====================
 install_ariang() {
     local target_rpc_port="$1"
 
@@ -1341,7 +1446,7 @@ EOF
     echo "=========================================="
 }
 
-# ==================== 模块 11: 单独卸载 AriaNg ====================
+# ==================== 模块 12: 单独卸载 AriaNg ====================
 uninstall_ariang() {
     echo ""
     echo "=========================================="
@@ -1367,7 +1472,7 @@ uninstall_ariang() {
     echo ">> AriaNg 前端卸载流程已完成。"
 }
 
-# ==================== 模块 12: 完整卸载 (全部组件) ====================
+# ==================== 模块 13: 完整卸载 (全部组件) ====================
 uninstall_all() {
     echo ""
     echo "=========================================="
@@ -1454,18 +1559,19 @@ while true; do
     echo " 1. $([ -f "${ARIA2C_BIN}" ] && echo "重新配置 Aria2 后端 (自动带入当前设置)" || echo "安装 / 配置 Aria2 后端 (默认启用 Trackers 自动更新)")"
     echo " 2. 单独修改下载目录"
     echo " 3. 手动更新 / 设置 BT Trackers (双源拉取 / 自定义)"
-    echo " 4. 启用 / 停用 Trackers 自动更新 (定时器管理)"
+    echo " 4. 启用 / 停用 Trackers 自动更新"
     echo " 5. BT 吸血 Peer 防火墙拦截管理 (ipset+iptables / 默认关闭 / 每日更新)"
-    echo " 6. 迁移下载任务到新磁盘"
-    echo " 7. 扫描目录并恢复未完成种子断点下载"
-    echo " 8. Aria2 实用辅助与清理工具箱 (清理已完成种子 / 碎片清理 / 健康自检)"
-    echo " 9. Aria2 日志排查与故障分析 (实时日志 / 崩溃溯源 / 前台单测)"
-    echo " 10. 单独安装 / 更新 AriaNg 前端 (Caddy 反代模式)"
-    echo " 11. 单独卸载 AriaNg 前端"
-    echo " 12. 完整卸载 (Aria2 + AriaNg + 防火墙规则 + 服务全清)"
+    echo " 6. 迁移下载任务到新磁盘 (迁移 未完成 / 全部 任务并切换工作路径)"
+    echo " 7. 转移已完成下载到新磁盘 (移动已完成文件释放磁盘空间)"
+    echo " 8. 扫描目录并恢复未完成种子断点下载"
+    echo " 9. Aria2 实用辅助与清理工具箱 (清理已完成种子 / 碎片清理 / 健康自检)"
+    echo " 10. Aria2 日志排查与故障分析 (实时日志 / 崩溃溯源 / 前台单测)"
+    echo " 11. 单独安装 / 更新 AriaNg 前端 (Caddy 反代模式)"
+    echo " 12. 单独卸载 AriaNg 前端"
+    echo " 13. 完整卸载 (Aria2 + AriaNg + 防火墙规则 + 服务全清)"
     echo " 0. 退出"
     echo "=========================================="
-    read -rp "请选择操作 [0-12]: " MENU_CHOICE
+    read -rp "请选择操作 [0-13]: " MENU_CHOICE
 
     case "$MENU_CHOICE" in
         1) install_aria2 ;;
@@ -1474,12 +1580,13 @@ while true; do
         4) manage_tracker_timer ;;
         5) manage_peer_blocker ;;
         6) migrate_downloads ;;
-        7) scan_and_resume_torrents ;;
-        8) manage_utils_menu ;;
-        9) manage_logs_menu ;;
-        10) install_ariang ;;
-        11) uninstall_ariang ;;
-        12) uninstall_all; break ;;
+        7) archive_completed_files ;;
+        8) scan_and_resume_torrents ;;
+        9) manage_utils_menu ;;
+        10) manage_logs_menu ;;
+        11) install_ariang ;;
+        12) uninstall_ariang ;;
+        13) uninstall_all; break ;;
         0) echo "已退出。"; exit 0 ;;
         *) echo "无效选项，请重新选择。" ;;
     esac
