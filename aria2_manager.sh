@@ -404,6 +404,7 @@ install_aria2() {
     echo "RPC 密钥: ${RPC_SECRET}"
     echo "顺带配置 AriaNg: $([[ "$WITH_ARIANG" =~ ^[Yy]$ ]] && echo "是" || echo "否")"
     echo "Trackers 自动更新: 默认开启 (每日定时)"
+    echo "全局最大上传限制: 2M"
     echo "未选文件自动清理: 开启 (bt-remove-unselected-file=true)"
     echo "======================"
     read -rp "确认应用并保存配置? [Y/n 默认: Y]: " CONFIRM
@@ -452,12 +453,14 @@ disk-cache=64M
 file-allocation=falloc
 continue=true
 
-## 下载连接设置 ##
+## 下载连接与速度设置 ##
 max-concurrent-downloads=5
 max-connection-per-server=64
 min-split-size=4M
 split=64
 disable-ipv6=true
+max-overall-upload-limit=2M
+max-upload-limit=2M
 
 ## 进度保存设置 ##
 input-file=${SESSION_FILE}
@@ -1686,12 +1689,25 @@ manage_video_filter() {
                 fi
             fi
 
+            local NEED_RESTART_ARIA2=false
+
             # 确保 aria2.conf 配置了自动清理未选中文件占位
             if ! grep -q "^bt-remove-unselected-file=" "${CONF_FILE}"; then
                 echo "bt-remove-unselected-file=true" >> "${CONF_FILE}"
-                ${SYSTEMCTL_CMD} restart aria2.service
+                NEED_RESTART_ARIA2=true
             elif grep -q "^bt-remove-unselected-file=false" "${CONF_FILE}"; then
                 sed -i "s|^bt-remove-unselected-file=.*|bt-remove-unselected-file=true|g" "${CONF_FILE}"
+                NEED_RESTART_ARIA2=true
+            fi
+
+            # 确保补充了最大上传限速 2M
+            if ! grep -q "^max-overall-upload-limit=" "${CONF_FILE}"; then
+                echo "max-overall-upload-limit=2M" >> "${CONF_FILE}"
+                echo "max-upload-limit=2M" >> "${CONF_FILE}"
+                NEED_RESTART_ARIA2=true
+            fi
+
+            if [ "$NEED_RESTART_ARIA2" = true ]; then
                 ${SYSTEMCTL_CMD} restart aria2.service
             fi
 
@@ -1727,6 +1743,7 @@ EOF
                 echo "   格式过滤: 仅限 [${TARGET_EXTS}]"
             fi
             echo "   未选文件: 自动清理 (bt-remove-unselected-file=true)"
+            echo "   上传限速: 全局最大 2MB/s (max-overall-upload-limit=2M)"
             ;;
         2)
             echo ">> 正在停止并禁用筛选守护服务..."
@@ -1847,7 +1864,7 @@ while true; do
     echo " 5. BT 吸血 Peer 防火墙拦截管理 (ipset+iptables / 默认关闭 / 每日更新)"
     echo " 6. 迁移下载任务到新磁盘 (迁移 未完成 / 全部 任务并切换工作路径)"
     echo " 7. 转移已完成下载到新磁盘 (移动已完成文件释放磁盘空间)"
-    echo " 8. 扫描目录并恢复未完成种子断点下载"
+    echo " 8. 扫描目录并恢复未完成种子的下载任务"
     echo " 9. Aria2 实用辅助与清理工具箱 (清理已完成种子 / 碎片清理 / 健康自检)"
     echo " 10. Aria2 日志排查与故障分析 (实时日志 / 崩溃溯源 / 前台单测)"
     echo " 11. 单独安装 / 更新 AriaNg 前端 (Caddy 反代模式)"
