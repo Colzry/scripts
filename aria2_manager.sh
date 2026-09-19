@@ -47,6 +47,17 @@ install_packages() {
     fi
 }
 
+# ==================== 状态检查辅助函数 ====================
+get_aria2_status() {
+    if [ ! -f "${ARIA2C_BIN}" ]; then
+        echo -e "\033[37m未安装\033[0m"
+    elif ${SYSTEMCTL_CMD} is-active --quiet aria2.service 2>/dev/null; then
+        echo -e "\033[32m运行中 (Active)\033[0m"
+    else
+        echo -e "\033[31m已停止 (Stopped)\033[0m"
+    fi
+}
+
 # ==================== 进程安全停机与等待 ====================
 stop_aria2_safely() {
     echo ">> 正在平稳停止 Aria2 服务以刷新保存 session..."
@@ -196,22 +207,45 @@ EOF
     chmod +x "${BLOCKER_SCRIPT}"
 }
 
-# ==================== 模块 1: 安装 Aria2 后端 ====================
+# ==================== 模块 1: 安装 / 重新配置 Aria2 后端 ====================
 install_aria2() {
     echo ""
     echo "=========================================="
-    echo "            安装 / 配置 Aria2 后端        "
+    if [ -f "${ARIA2C_BIN}" ]; then
+        echo "            重新配置 Aria2 后端           "
+    else
+        echo "            安装 / 配置 Aria2 后端        "
+    fi
     echo "=========================================="
 
-    read -rp "请输入下载目录路径 [默认: ${DEFAULT_DOWNLOAD_DIR}]: " INPUT_DIR
-    DOWNLOAD_DIR="${INPUT_DIR:-$DEFAULT_DOWNLOAD_DIR}"
+    # 1. 自动提取已有的历史配置默认值
+    local CURRENT_DIR=""
+    local CURRENT_PORT=""
+    local CURRENT_SECRET=""
+    if [ -f "${CONF_FILE}" ]; then
+        CURRENT_DIR=$(grep -E "^dir=" "${CONF_FILE}" 2>/dev/null | cut -d'=' -f2 | tr -d '\r')
+        CURRENT_PORT=$(grep -E "^rpc-listen-port=" "${CONF_FILE}" 2>/dev/null | cut -d'=' -f2 | tr -d '\r')
+        CURRENT_SECRET=$(grep -E "^rpc-secret=" "${CONF_FILE}" 2>/dev/null | cut -d'=' -f2 | tr -d '\r')
+    fi
+
+    local DEF_DIR="${CURRENT_DIR:-$DEFAULT_DOWNLOAD_DIR}"
+    local DEF_PORT="${CURRENT_PORT:-$DEFAULT_PORT}"
+
+    read -rp "请输入下载目录路径 [默认: ${DEF_DIR}]: " INPUT_DIR
+    DOWNLOAD_DIR="${INPUT_DIR:-$DEF_DIR}"
     DOWNLOAD_DIR="${DOWNLOAD_DIR%/}"
 
-    read -rp "请输入 Aria2 RPC 监听端口 [默认: ${DEFAULT_PORT}]: " INPUT_PORT
-    RPC_PORT="${INPUT_PORT:-$DEFAULT_PORT}"
+    read -rp "请输入 Aria2 RPC 监听端口 [默认: ${DEF_PORT}]: " INPUT_PORT
+    RPC_PORT="${INPUT_PORT:-$DEF_PORT}"
 
     while true; do
-        read -rp "请输入 RPC 密钥 (rpc-secret，不能为空): " RPC_SECRET
+        if [ -n "$CURRENT_SECRET" ]; then
+            read -rp "请输入 RPC 密钥 (rpc-secret) [默认保留当前设置]: " INPUT_SECRET
+            RPC_SECRET="${INPUT_SECRET:-$CURRENT_SECRET}"
+        else
+            read -rp "请输入 RPC 密钥 (rpc-secret，不能为空): " RPC_SECRET
+        fi
+
         if [ -n "$RPC_SECRET" ]; then
             break
         fi
@@ -219,47 +253,56 @@ install_aria2() {
     done
 
     echo ""
-    read -rp "是否顺带安装 AriaNg Web 前端 (Caddy 反代模式)? [y/N 默认: N]: " WITH_ARIANG
+    read -rp "是否顺带安装/更新 AriaNg Web 前端 (Caddy 反代模式)? [y/N 默认: N]: " WITH_ARIANG
     WITH_ARIANG="${WITH_ARIANG:-N}"
 
     echo ""
     echo "=== Aria2 配置概要 ==="
     echo "运行模式: $([ "$IS_ROOT" = true ] && echo "Root 系统模式" || echo "普通用户模式 ($CURRENT_USER)")"
-    echo "安装路径: ${ARIA2C_BIN}"
+    echo "程序路径: ${ARIA2C_BIN}"
     echo "下载目录: ${DOWNLOAD_DIR}"
     echo "RPC 端口: ${RPC_PORT}"
     echo "RPC 密钥: ${RPC_SECRET}"
-    echo "顺带安装 AriaNg: $([[ "$WITH_ARIANG" =~ ^[Yy]$ ]] && echo "是" || echo "否")"
+    echo "顺带配置 AriaNg: $([[ "$WITH_ARIANG" =~ ^[Yy]$ ]] && echo "是" || echo "否")"
     echo "Trackers 自动更新: 默认开启 (每日定时)"
     echo "吸血 Peer 防火墙: 默认不开启 (可在主菜单按需启用)"
-    echo "种子文件保留: 默认关闭 (下载后自动删除种子)"
     echo "======================"
-    read -rp "确认开始安装 Aria2? [Y/n 默认: Y]: " CONFIRM
+    read -rp "确认应用并保存配置? [Y/n 默认: Y]: " CONFIRM
     CONFIRM="${CONFIRM:-Y}"
     if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
-        echo "已取消安装。"
+        echo "已取消操作。"
         return 0
     fi
 
-    install_packages curl wget tar
-    echo ">> 正在下载 Aria2 增强版..."
-    ARIA2_URL="${GH_PROXY}/P3TERX/Aria2-Pro-Core/releases/download/1.36.0_2021.08.22/aria2-1.36.0-static-linux-amd64.tar.gz"
-    TMP_DIR=$(mktemp -d)
-    wget -q --show-progress -O "${TMP_DIR}/aria2.tar.gz" "${ARIA2_URL}"
+    # 2. 如果已经存在二进制程序，跳过重复下载
+    local NEED_DOWNLOAD=true
+    if [ -f "${ARIA2C_BIN}" ] && [ -x "${ARIA2C_BIN}" ]; then
+        echo ""
+        echo ">> 检测到 ${ARIA2C_BIN} 已存在，跳过重新下载二进制程序。"
+        NEED_DOWNLOAD=false
+    fi
 
-    echo ">> 解压并安装到 ${ARIA2C_BIN}..."
-    tar -zxvf "${TMP_DIR}/aria2.tar.gz" -C "${TMP_DIR}"
-    mkdir -p "${ARIA2C_BIN_DIR}"
-    mv "${TMP_DIR}/aria2c" "${ARIA2C_BIN}"
-    chmod +x "${ARIA2C_BIN}"
-    rm -rf "${TMP_DIR}"
+    if [ "$NEED_DOWNLOAD" = true ]; then
+        install_packages curl wget tar
+        echo ">> 正在下载 Aria2 增强版..."
+        ARIA2_URL="${GH_PROXY}/P3TERX/Aria2-Pro-Core/releases/download/1.36.0_2021.08.22/aria2-1.36.0-static-linux-amd64.tar.gz"
+        TMP_DIR=$(mktemp -d)
+        wget -q --show-progress -O "${TMP_DIR}/aria2.tar.gz" "${ARIA2_URL}"
+
+        echo ">> 解压并安装到 ${ARIA2C_BIN}..."
+        tar -zxvf "${TMP_DIR}/aria2.tar.gz" -C "${TMP_DIR}"
+        mkdir -p "${ARIA2C_BIN_DIR}"
+        mv "${TMP_DIR}/aria2c" "${ARIA2C_BIN}"
+        chmod +x "${ARIA2C_BIN}"
+        rm -rf "${TMP_DIR}"
+    fi
 
     mkdir -p "${DOWNLOAD_DIR}"
     mkdir -p "${ARIA2_CONF_DIR}"
     touch "${SESSION_FILE}"
     touch "${LOG_FILE}"
 
-    echo ">> 写入 aria2.conf (含日志落盘)..."
+    echo ">> 写入/更新 aria2.conf..."
     cat > "${CONF_FILE}" <<EOF
 ## 日志设置 ##
 log=${LOG_FILE}
@@ -300,7 +343,7 @@ EOF
 
     [ "$IS_ROOT" = false ] && mkdir -p "${SYSTEMD_DIR}"
 
-    # 针对性精简版 Systemd Unit 配置（保留必要 User 与 LimitNOFILE）
+    # 3. 部署精炼稳定的 Systemd 单元配置
     if [ "$IS_ROOT" = true ]; then
         ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2.service'" <<EOF
 [Unit]
@@ -361,9 +404,10 @@ EOF
 
     ${SYSTEMCTL_CMD} daemon-reload
     ${SYSTEMCTL_CMD} enable --now aria2.service
+    ${SYSTEMCTL_CMD} restart aria2.service
     ${SYSTEMCTL_CMD} enable --now aria2-update-tracker.timer
 
-    echo ">> 正在初始化 Trackers 列表..."
+    echo ">> 正在同步 Trackers 列表..."
     bash "${TRACKER_SCRIPT}" 2>/dev/null || true
 
     if [ "$IS_ROOT" = false ] && command -v loginctl &>/dev/null; then
@@ -371,12 +415,12 @@ EOF
     fi
 
     echo ""
-    echo ">> Aria2 后端已部署成功！"
-    echo "   安装程序路径: ${ARIA2C_BIN}"
+    echo ">> Aria2 后端配置并启动成功！"
+    echo "   程序路径: ${ARIA2C_BIN}"
+    echo "   下载目录: ${DOWNLOAD_DIR}"
     echo "   RPC 端口: ${RPC_PORT}"
     echo "   RPC 密钥: ${RPC_SECRET}"
-    echo "   日志文件: ${LOG_FILE}"
-    echo "   Trackers 自动更新定时器已就绪。"
+    echo "   服务状态: $(get_aria2_status)"
 
     if [[ "$WITH_ARIANG" =~ ^[Yy]$ ]]; then
         install_ariang "${RPC_PORT}"
@@ -1404,9 +1448,10 @@ while true; do
     echo "=========================================="
     echo "          Aria2 & AriaNg 综合管理          "
     echo "  当前用户: ${CURRENT_USER} ($([ "$IS_ROOT" = true ] && echo "Root 模式" || echo "普通用户模式"))"
+    echo "  服务状态: $(get_aria2_status)"
     echo "  可执行文件: ${ARIA2C_BIN}"
     echo "=========================================="
-    echo " 1. 安装 / 重新配置 Aria2 后端 (默认启用 Trackers 自动更新)"
+    echo " 1. $([ -f "${ARIA2C_BIN}" ] && echo "重新配置 Aria2 后端 (自动带入当前设置)" || echo "安装 / 配置 Aria2 后端 (默认启用 Trackers 自动更新)")"
     echo " 2. 单独修改下载目录"
     echo " 3. 手动更新 / 设置 BT Trackers (双源拉取 / 自定义)"
     echo " 4. 启用 / 停用 Trackers 自动更新 (定时器管理)"
