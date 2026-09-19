@@ -11,16 +11,21 @@ if [ "$EUID" -eq 0 ]; then
     SUDO_CMD=""
     SYSTEMD_DIR="/etc/systemd/system"
     SYSTEMCTL_CMD="systemctl"
+    ARIA2C_BIN_DIR="/usr/local/bin"
+    ARIA2C_BIN="${ARIA2C_BIN_DIR}/aria2c"
 else
     IS_ROOT=false
     SUDO_CMD="sudo"
     SYSTEMD_DIR="${USER_HOME}/.config/systemd/user"
     SYSTEMCTL_CMD="systemctl --user"
+    ARIA2C_BIN_DIR="${USER_HOME}/.local/bin"
+    ARIA2C_BIN="${ARIA2C_BIN_DIR}/aria2c"
 fi
 
 ARIA2_CONF_DIR="${USER_HOME}/.aria2"
 CONF_FILE="${ARIA2_CONF_DIR}/aria2.conf"
 SESSION_FILE="${ARIA2_CONF_DIR}/aria2.session"
+LOG_FILE="${ARIA2_CONF_DIR}/aria2.log"
 TRACKER_SCRIPT="${ARIA2_CONF_DIR}/scripts/update_tracker.sh"
 BLOCKER_SCRIPT="${ARIA2_CONF_DIR}/scripts/block_peers.sh"
 DEFAULT_DOWNLOAD_DIR="${USER_HOME}/Downloads"
@@ -220,6 +225,7 @@ install_aria2() {
     echo ""
     echo "=== Aria2 配置概要 ==="
     echo "运行模式: $([ "$IS_ROOT" = true ] && echo "Root 系统模式" || echo "普通用户模式 ($CURRENT_USER)")"
+    echo "安装路径: ${ARIA2C_BIN}"
     echo "下载目录: ${DOWNLOAD_DIR}"
     echo "RPC 端口: ${RPC_PORT}"
     echo "RPC 密钥: ${RPC_SECRET}"
@@ -241,18 +247,24 @@ install_aria2() {
     TMP_DIR=$(mktemp -d)
     wget -q --show-progress -O "${TMP_DIR}/aria2.tar.gz" "${ARIA2_URL}"
 
-    echo ">> 解压并安装到 /usr/bin/aria2c..."
+    echo ">> 解压并安装到 ${ARIA2C_BIN}..."
     tar -zxvf "${TMP_DIR}/aria2.tar.gz" -C "${TMP_DIR}"
-    ${SUDO_CMD} mv "${TMP_DIR}/aria2c" /usr/bin/aria2c
-    ${SUDO_CMD} chmod +x /usr/bin/aria2c
+    mkdir -p "${ARIA2C_BIN_DIR}"
+    mv "${TMP_DIR}/aria2c" "${ARIA2C_BIN}"
+    chmod +x "${ARIA2C_BIN}"
     rm -rf "${TMP_DIR}"
 
     mkdir -p "${DOWNLOAD_DIR}"
     mkdir -p "${ARIA2_CONF_DIR}"
     touch "${SESSION_FILE}"
+    touch "${LOG_FILE}"
 
-    echo ">> 写入 aria2.conf..."
+    echo ">> 写入 aria2.conf (含日志落盘)..."
     cat > "${CONF_FILE}" <<EOF
+## 日志设置 ##
+log=${LOG_FILE}
+log-level=warn
+
 ## 文件保存设置 ##
 dir=${DOWNLOAD_DIR}
 disk-cache=64M
@@ -295,7 +307,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/aria2c --conf-path=${CONF_FILE}
+ExecStart=${ARIA2C_BIN} --conf-path=${CONF_FILE}
 Restart=on-failure
 
 [Install]
@@ -338,10 +350,11 @@ EOF
 
     echo ""
     echo ">> Aria2 后端已部署成功！"
+    echo "   安装程序路径: ${ARIA2C_BIN}"
     echo "   RPC 端口: ${RPC_PORT}"
     echo "   RPC 密钥: ${RPC_SECRET}"
+    echo "   日志文件: ${LOG_FILE}"
     echo "   Trackers 自动更新定时器已就绪。"
-    echo "   吸血 Peer 拦截防火墙当前未开启，可在主菜单选项 5 随时开启。"
 
     if [[ "$WITH_ARIANG" =~ ^[Yy]$ ]]; then
         install_ariang "${RPC_PORT}"
@@ -960,13 +973,10 @@ manage_utils_menu() {
                 for tor in "${ALL_TORRENTS[@]}"; do
                     base_name="${tor%.torrent}"
                     
-                    # 规则 1: 如果存在对应的 .aria2 控制文件，说明正在下载或未完成，严格保留
                     if [ -f "${base_name}.aria2" ] || [ -f "${tor}.aria2" ]; then
                         continue
                     fi
 
-                    # 规则 2: 如果找不到对应的 .aria2 控制文件，检查是否有已完成的目标文件或目录
-                    # 只要没有 .aria2 校验文件，即代表任务已经完成或为孤立种子，可安全清理
                     SAFE_TO_DELETE+=("${tor}")
                 done
 
@@ -1039,7 +1049,6 @@ manage_utils_menu() {
                 stop_aria2_safely
                 if [ -f "${SESSION_FILE}" ]; then
                     cp "${SESSION_FILE}" "${SESSION_FILE}.bak"
-                    # 清除已停止/已完成任务，只保留未完成的任务
                     echo ">> 已备份原会话为: ${SESSION_FILE}.bak"
                 fi
                 ${SYSTEMCTL_CMD} start aria2.service
@@ -1099,7 +1108,93 @@ manage_utils_menu() {
     done
 }
 
-# ==================== 模块 9: 单独安装/更新 AriaNg (使用 Caddy) ====================
+# ==================== 模块 9: 日志查看与故障排查 ====================
+manage_logs_menu() {
+    while true; do
+        echo ""
+        echo "=========================================="
+        echo "        Aria2 日志排查与故障分析          "
+        echo "=========================================="
+        echo " 1. 实时跟踪 Aria2 运行日志 (aria2.log 最后50行/动态)"
+        echo " 2. 查看 Systemd 服务崩溃/启动日志 (journalctl 最近记录)"
+        echo " 3. 前台单次测试启动 Aria2 (精准定位段错误 SEGV 与配置解析异常)"
+        echo " 4. 查看 Trackers 自动更新日志 (最近执行记录)"
+        echo " 5. 查看 吸血 Peer 防火墙更新日志 (最近执行记录)"
+        echo " 6. 查看 Caddy 反代 Web 前端日志"
+        echo " 0. 返回上级菜单"
+        echo "=========================================="
+        read -rp "请选择操作 [0-6]: " LOG_CHOICE
+
+        case "$LOG_CHOICE" in
+            1)
+                echo ""
+                if [ ! -f "${LOG_FILE}" ]; then
+                    echo "提示: 当前未检测到日志文件: ${LOG_FILE} (可能尚未产生日志或未完成安装)"
+                else
+                    echo ">> 正在输出 aria2.log (按 Ctrl+C 退出跟踪):"
+                    tail -n 50 -f "${LOG_FILE}" || true
+                fi
+                ;;
+            2)
+                echo ""
+                echo ">> 正在调取 Systemd 服务最近日志:"
+                ${SYSTEMCTL_CMD} status aria2.service --no-pager -l || true
+                echo ""
+                echo ">> 正在输出 journalctl 最近 40 行错误信息:"
+                if [ "$IS_ROOT" = true ]; then
+                    journalctl -u aria2.service -n 40 --no-pager
+                else
+                    journalctl --user -u aria2.service -n 40 --no-pager
+                fi
+                ;;
+            3)
+                echo ""
+                echo ">> 正在临时停止后台服务准备前台测试..."
+                ${SYSTEMCTL_CMD} stop aria2.service 2>/dev/null || true
+                sleep 0.5
+                echo ">> 开始前台执行: ${ARIA2C_BIN} --conf-path=${CONF_FILE}"
+                echo ">> 提示: 按 Ctrl+C 即可终止前台运行并自动恢复后台守护进程。"
+                echo "---------------------------------------------------------"
+                if [ -x "${ARIA2C_BIN}" ]; then
+                    "${ARIA2C_BIN}" --conf-path="${CONF_FILE}" || true
+                else
+                    echo "错误: 未找到可执行文件 ${ARIA2C_BIN}"
+                fi
+                echo "---------------------------------------------------------"
+                echo ">> 正在恢复后台 Aria2 服务..."
+                ${SYSTEMCTL_CMD} start aria2.service
+                echo ">> 后台服务已恢复。"
+                ;;
+            4)
+                echo ""
+                echo ">> 最近一次 Tracker 更新服务运行记录:"
+                if [ "$IS_ROOT" = true ]; then
+                    journalctl -u aria2-update-tracker.service -n 30 --no-pager
+                else
+                    journalctl --user -u aria2-update-tracker.service -n 30 --no-pager
+                fi
+                ;;
+            5)
+                echo ""
+                echo ">> 最近一次吸血 Peer 防火墙更新记录:"
+                ${SUDO_CMD} journalctl -u aria2-peer-blocker.service -n 30 --no-pager 2>/dev/null || echo "尚未配置或未运行该服务"
+                ;;
+            6)
+                echo ""
+                echo ">> 最近一次 Caddy 服务日志:"
+                ${SUDO_CMD} journalctl -u caddy -n 30 --no-pager 2>/dev/null || echo "尚未安装 Caddy 服务"
+                ;;
+            0)
+                break
+                ;;
+            *)
+                echo "无效选项。"
+                ;;
+        esac
+    done
+}
+
+# ==================== 模块 10: 单独安装/更新 AriaNg (使用 Caddy) ====================
 install_ariang() {
     local target_rpc_port="$1"
 
@@ -1180,7 +1275,7 @@ EOF
     echo "=========================================="
 }
 
-# ==================== 模块 10: 单独卸载 AriaNg ====================
+# ==================== 模块 11: 单独卸载 AriaNg ====================
 uninstall_ariang() {
     echo ""
     echo "=========================================="
@@ -1206,7 +1301,7 @@ uninstall_ariang() {
     echo ">> AriaNg 前端卸载流程已完成。"
 }
 
-# ==================== 模块 11: 完整卸载 (全部组件) ====================
+# ==================== 模块 12: 完整卸载 (全部组件) ====================
 uninstall_all() {
     echo ""
     echo "=========================================="
@@ -1255,9 +1350,8 @@ uninstall_all() {
     fi
 
     echo ">> 正在删除 aria2c 二进制文件..."
-    if [ -f "/usr/bin/aria2c" ]; then
-        ${SUDO_CMD} rm -f /usr/bin/aria2c
-    fi
+    rm -f "${ARIA2C_BIN}"
+    ${SUDO_CMD} rm -f /usr/bin/aria2c /usr/local/bin/aria2c 2>/dev/null || true
 
     read -rp "是否删除配置及脚本目录 (${ARIA2_CONF_DIR})? [y/N 默认: N]: " DEL_CONFIG
     DEL_CONFIG="${DEL_CONFIG:-N}"
@@ -1288,6 +1382,7 @@ while true; do
     echo "=========================================="
     echo "          Aria2 & AriaNg 综合管理          "
     echo "  当前用户: ${CURRENT_USER} ($([ "$IS_ROOT" = true ] && echo "Root 模式" || echo "普通用户模式"))"
+    echo "  可执行文件: ${ARIA2C_BIN}"
     echo "=========================================="
     echo " 1. 安装 / 重新配置 Aria2 后端 (默认启用 Trackers 自动更新)"
     echo " 2. 单独修改下载目录"
@@ -1297,12 +1392,13 @@ while true; do
     echo " 6. 迁移下载任务到新磁盘"
     echo " 7. 扫描目录并恢复未完成种子断点下载"
     echo " 8. Aria2 实用辅助与清理工具箱 (清理已完成种子 / 碎片清理 / 健康自检)"
-    echo " 9. 单独安装 / 更新 AriaNg 前端 (Caddy 反代模式)"
-    echo " 10. 单独卸载 AriaNg 前端"
-    echo " 11. 完整卸载 (Aria2 + AriaNg + 防火墙规则 + 服务全清)"
+    echo " 9. Aria2 日志排查与故障分析 (实时日志 / 崩溃溯源 / 前台单测)"
+    echo " 10. 单独安装 / 更新 AriaNg 前端 (Caddy 反代模式)"
+    echo " 11. 单独卸载 AriaNg 前端"
+    echo " 12. 完整卸载 (Aria2 + AriaNg + 防火墙规则 + 服务全清)"
     echo " 0. 退出"
     echo "=========================================="
-    read -rp "请选择操作 [0-11]: " MENU_CHOICE
+    read -rp "请选择操作 [0-12]: " MENU_CHOICE
 
     case "$MENU_CHOICE" in
         1) install_aria2 ;;
@@ -1313,9 +1409,10 @@ while true; do
         6) migrate_downloads ;;
         7) scan_and_resume_torrents ;;
         8) manage_utils_menu ;;
-        9) install_ariang ;;
-        10) uninstall_ariang ;;
-        11) uninstall_all; break ;;
+        9) manage_logs_menu ;;
+        10) install_ariang ;;
+        11) uninstall_ariang ;;
+        12) uninstall_all; break ;;
         0) echo "已退出。"; exit 0 ;;
         *) echo "无效选项，请重新选择。" ;;
     esac
