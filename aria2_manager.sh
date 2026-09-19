@@ -300,19 +300,41 @@ EOF
 
     [ "$IS_ROOT" = false ] && mkdir -p "${SYSTEMD_DIR}"
 
-    ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2.service'" <<EOF
+    # 针对性精简版 Systemd Unit 配置（保留必要 User 与 LimitNOFILE）
+    if [ "$IS_ROOT" = true ]; then
+        ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2.service'" <<EOF
 [Unit]
 Description=Aria2c Download Manager
 After=network.target
 
 [Service]
 Type=simple
+User=root
+LimitNOFILE=65535
 ExecStart=${ARIA2C_BIN} --conf-path=${CONF_FILE}
 Restart=on-failure
+RestartSec=3
 
 [Install]
 WantedBy=default.target
 EOF
+    else
+        cat > "${SYSTEMD_DIR}/aria2.service" <<EOF
+[Unit]
+Description=Aria2c Download Manager
+After=network.target
+
+[Service]
+Type=simple
+LimitNOFILE=65535
+ExecStart=${ARIA2C_BIN} --conf-path=${CONF_FILE}
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+EOF
+    fi
 
     ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2-update-tracker.service'" <<EOF
 [Unit]
