@@ -1259,7 +1259,7 @@ migrate_downloads() {
     fi
 }
 
-# ==================== 模块 7: 转移已完成下载到新磁盘 (RPC 白名单权威校验 + 穿透子目录) ====================
+# ==================== 模块 7: 转移已完成下载到新磁盘 (深度结合任务状态与真实字节) ====================
 archive_completed_files() {
     echo ""
     echo "=========================================="
@@ -1302,14 +1302,12 @@ archive_completed_files() {
     MIN_ARCHIVE_MB="${MIN_ARCHIVE_MB:-10}"
     local min_bytes=$((MIN_ARCHIVE_MB * 1024 * 1024))
 
-    echo ">> 正在从 Aria2 运行时状态中提取真正 100% 下载完成的文件清单..."
+    echo ">> 正在通过 Aria2 RPC 实时探测已完成 (包括已停止、已做完) 的文件..."
 
-    local rpc_complete_file
-    rpc_complete_file=$(mktemp)
-    local rpc_incomplete_file
-    rpc_incomplete_file=$(mktemp)
+    local parse_result_file
+    parse_result_file=$(mktemp)
 
-    python3 - <<EOF > "${rpc_complete_file}" 2> "${rpc_incomplete_file}" || true
+    python3 - <<EOF > "${parse_result_file}"
 import json
 import urllib.request
 import os
@@ -1334,136 +1332,153 @@ if os.path.exists(CONF_FILE):
 url = f"http://127.0.0.1:{port}/jsonrpc"
 params_prefix = [f"token:{secret}"] if secret else []
 
-def call(method, p):
+def rpc(method, p):
     payload = {"jsonrpc": "2.0", "id": "chk", "method": method, "params": params_prefix + p}
     req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=4) as resp:
             return json.loads(resp.read().decode("utf-8")).get("result", [])
     except:
-        return []
+        return None
 
-# 1. 抓取已停止/已完成的任务 (tellStopped 包含已完成和停止做种的任务)
-stopped = call("aria2.tellStopped", [0, 2000, ["status", "files", "bittorrent"]])
-# 2. 抓取正在做种中的任务 (属于 tellActive，但文件已经 100% 下载完成)
-active = call("aria2.tellActive", [["status", "files", "seeder", "bittorrent"]])
-# 3. 抓取还在下载或等待中的任务，用于构建严格黑名单
-waiting = call("aria2.tellWaiting", [0, 2000, ["status", "files"]])
+# 1. 查询所有正在下载、等待、已完成、已停止的任务
+active = rpc("aria2.tellActive", [["gid", "status", "files", "dir", "seeder"]]) or []
+waiting = rpc("aria2.tellWaiting", [0, 5000, ["gid", "status", "files", "dir"]]) or []
+stopped = rpc("aria2.tellStopped", [0, 5000, ["gid", "status", "files", "dir", "errorMessage"]]) or []
 
-# 记录未完成文件 (标准错误流输出)
-for t in (waiting + active):
-    st = t.get("status")
-    # 如果处于 active 但不是做种状态，说明正在下载数据，严格记录黑名单
-    if st == "active" and t.get("seeder") != "true":
+incomplete_paths = set()
+completed_paths = set()
+
+# 2. 处于下载中(未完成做种)的任务，其包含的所有文件绝不可转移
+for t in (active + waiting):
+    is_seeding = (t.get("status") == "active" and t.get("seeder") == "true")
+    if not is_seeding:
+        base_dir = t.get("dir", "")
         for f in t.get("files", []):
             p = f.get("path", "")
             if p:
-                sys.stderr.write(os.path.abspath(p) + "\n")
-    elif st == "waiting":
-        for f in t.get("files", []):
-            p = f.get("path", "")
-            if p:
-                sys.stderr.write(os.path.abspath(p) + "\n")
+                full_p = p if os.path.isabs(p) else os.path.join(base_dir, p)
+                incomplete_paths.add(os.path.realpath(full_p))
 
-# 记录已完成文件 (标准输出)
+# 3. 处于已完成/已停止/做种中的任务，提取 100% 下载完毕的文件
 for t in (stopped + active):
     st = t.get("status")
     is_seeding = (st == "active" and t.get("seeder") == "true")
-    if st == "complete" or is_seeding or st == "paused":
+    # 只要状态是 complete，或是已停止（且不是未完成被强停的错误），或是做种中
+    if st in ("complete", "paused") or is_seeding or st == "removed":
+        base_dir = t.get("dir", "")
         for f in t.get("files", []):
             p = f.get("path", "")
-            completed = int(f.get("completedLength", 0))
-            length = int(f.get("length", 0))
+            if not p:
+                continue
+            full_p = p if os.path.isabs(p) else os.path.join(base_dir, p)
+            full_p = os.path.realpath(full_p)
+            
+            try:
+                completed = int(f.get("completedLength", 0))
+                length = int(f.get("length", 0))
+            except:
+                completed, length = 0, 0
+                
             selected = f.get("selected", "true")
-            # 只有勾选且已下载字节等于总字节数，才是 100% 完工项
-            if p and selected == "true" and length > 0 and completed >= length:
-                print(os.path.abspath(p))
+
+            # 严格条件：被勾选、长度非0、且已完成字节数等于总字节数
+            if selected == "true" and length > 0 and completed >= length:
+                if full_p not in incomplete_paths:
+                    completed_paths.add(full_p)
+
+# 格式化输出: 第一段为白名单，第二段为黑名单
+print("===COMPLETED_START===")
+for cp in completed_paths:
+    print(cp)
+print("===COMPLETED_END===")
+
+print("===INCOMPLETE_START===")
+for ip in incomplete_paths:
+    print(ip)
+print("===INCOMPLETE_END===")
 EOF
 
-    declare -A RPC_COMPLETED_MAP
-    declare -A RPC_INCOMPLETE_MAP
+    declare -A RPC_WHITE_LIST
+    declare -A RPC_BLACK_LIST
+    local in_white=false
+    local in_black=false
 
-    if [ -s "${rpc_complete_file}" ]; then
-        while IFS= read -r c_line; do
-            [ -n "$c_line" ] && RPC_COMPLETED_MAP["$c_line"]=1
-        done < "${rpc_complete_file}"
-    fi
+    while IFS= read -r line; do
+        if [ "$line" == "===COMPLETED_START===" ]; then in_white=true; continue; fi
+        if [ "$line" == "===COMPLETED_END===" ]; then in_white=false; continue; fi
+        if [ "$line" == "===INCOMPLETE_START===" ]; then in_black=true; continue; fi
+        if [ "$line" == "===INCOMPLETE_END===" ]; then in_black=false; continue; fi
 
-    if [ -s "${rpc_incomplete_file}" ]; then
-        while IFS= read -r inc_line; do
-            [ -n "$inc_line" ] && RPC_INCOMPLETE_MAP["$inc_line"]=1
-        done < "${rpc_incomplete_file}"
-    fi
-
-    rm -f "${rpc_complete_file}" "${rpc_incomplete_file}"
+        if [ "$in_white" = true ] && [ -n "$line" ]; then
+            RPC_WHITE_LIST["$line"]=1
+        fi
+        if [ "$in_black" = true ] && [ -n "$line" ]; then
+            RPC_BLACK_LIST["$line"]=1
+        fi
+    done < "${parse_result_file}"
+    rm -f "${parse_result_file}"
 
     declare -a COMPLETED_ITEMS=()
+    local real_src
+    real_src=$(readlink -f "${SRC_DIR}" 2>/dev/null || echo "${SRC_DIR}")
 
+    # 扫描磁盘文件，与白名单交叉验证
     while IFS= read -r f; do
         local base_f
         base_f=$(basename "$f")
 
-        # 1. 基础扩展名与控制文件过滤
+        # 排除种子与控制文件
         [[ "$base_f" == .* ]] && continue
         [[ "$base_f" == *.torrent ]] && continue
         [[ "$base_f" == *.aria2 ]] && continue
 
-        local abs_f
-        abs_f=$(readlink -f "$f" 2>/dev/null || echo "$f")
+        local real_f
+        real_f=$(readlink -f "$f" 2>/dev/null || echo "$f")
 
-        # 2. 检查单文件控制文件
+        # 排除处于未完成黑名单的文件
+        if [[ -n "${RPC_BLACK_LIST[$real_f]}" ]]; then
+            continue
+        fi
+
+        # 排除该单文件带有正在进行的 .aria2 标记
         if [ -f "${f}.aria2" ]; then
             continue
         fi
 
-        # 3. 命中未完成活跃任务黑名单直接跳过
-        if [[ -n "${RPC_INCOMPLETE_MAP[$abs_f]}" ]] || [[ -n "${RPC_INCOMPLETE_MAP[$f]}" ]]; then
-            continue
-        fi
-
-        # 4. 体积门槛校验
+        # 检查文件大小门槛
         local f_size
         f_size=$(stat -c %s "$f" 2>/dev/null || stat -f %z "$f" 2>/dev/null || echo 0)
         if [ "$f_size" -lt "$min_bytes" ]; then
             continue
         fi
 
-        # 5. 校验完成逻辑：
-        # 如果 RPC 正常响应并提取了完成列表，以 RPC 白名单为准；
-        # 若 RPC 未收录（例如手动离线拷入的文件），则确保无任何同级 .aria2 并校验文件大小合规
-        if [ ${#RPC_COMPLETED_MAP[@]} -gt 0 ]; then
-            if [[ -n "${RPC_COMPLETED_MAP[$abs_f]}" ]]; then
-                COMPLETED_ITEMS+=("${f#"${SRC_DIR}/"}")
+        # 核心判定：若 RPC 白名单识别到了该文件，则直接收录！
+        # 若 RPC 白名单为空（例如 RPC 断连），则确保它没有未完成的控制块
+        if [ ${#RPC_WHITE_LIST[@]} -gt 0 ]; then
+            if [[ -n "${RPC_WHITE_LIST[$real_f]}" ]]; then
+                COMPLETED_ITEMS+=("${real_f#"${real_src}/"}")
             fi
         else
-            # 兜底：RPC 无法连接时，仅在无任何同名/同目录控制文件时放行
-            local cur_p
-            cur_p=$(dirname "$f")
-            local has_ctl=false
-            while [ "$cur_p" != "$SRC_DIR" ] && [ "$cur_p" != "/" ] && [ "$cur_p" != "." ]; do
-                if [ -f "${cur_p}.aria2" ]; then
-                    has_ctl=true
-                    break
-                fi
-                cur_p=$(dirname "$cur_p")
-            done
-            if [ "$has_ctl" = false ]; then
-                COMPLETED_ITEMS+=("${f#"${SRC_DIR}/"}")
+            # 兜底纯磁盘扫描：只要自身无 .aria2，且上层没有同名 .aria2 占位
+            if [ ! -f "${f%.*}.aria2" ]; then
+                COMPLETED_ITEMS+=("${real_f#"${real_src}/"}")
             fi
         fi
     done < <(find "${SRC_DIR}" -type f)
 
     local ITEM_COUNT=${#COMPLETED_ITEMS[@]}
     if [ "$ITEM_COUNT" -eq 0 ]; then
-        echo ">> 提示: 未检索到任何已确认下载完成 (100% 完工) 且体积 >= ${MIN_ARCHIVE_MB}MB 的文件。"
-        echo "   (未下完的任务、0 字节占位、正在下载项已被严格排除保护)"
+        echo ""
+        echo ">> 提示: 未在 ${SRC_DIR} 下检测到任何 100% 已完成且 >= ${MIN_ARCHIVE_MB}MB 的媒体文件。"
+        echo "   (未完工的 BT 任务、正在下载的数据块已全部被排除隔离)"
         return 0
     fi
 
     echo ""
-    echo ">> 成功核验到以下 ${ITEM_COUNT} 个已下载完成的文件可安全转移:"
+    echo ">> 成功识别到以下 ${ITEM_COUNT} 个已下载完成的文件可转移:"
     echo "--------------------------------------------------"
-    local show_limit=25
+    local show_limit=30
     for ((i=0; i<ITEM_COUNT && i<show_limit; i++)); do
         echo "   - ${COMPLETED_ITEMS[$i]}"
     done
@@ -1479,7 +1494,7 @@ EOF
         return 0
     fi
 
-    echo ">> 正在断点同步数据并保持对应目录结构..."
+    echo ">> 正在断点同步数据并自动保持原有目录层级..."
     (
         cd "${SRC_DIR}"
         for it in "${COMPLETED_ITEMS[@]}"; do
@@ -1495,8 +1510,9 @@ EOF
     if [[ "$CLEAN_SRC" =~ ^[Yy]$ ]]; then
         echo ">> 正在安全清理原磁盘已转移数据..."
         for it in "${COMPLETED_ITEMS[@]}"; do
-            rm -rf "${SRC_DIR}/${it}"
+            rm -f "${SRC_DIR}/${it}"
         done
+        # 联动清理因移动文件后产生的空文件夹
         find "${SRC_DIR}" -mindepth 1 -type d -empty -delete 2>/dev/null || true
         echo ">> 原磁盘已完成内容已清除，空间成功释放！所有未完成的任务继续正常下载。"
     else
