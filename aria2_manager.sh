@@ -35,7 +35,7 @@ DEFAULT_ARIANG_PORT="6880"
 GH_PROXY="https://gitpy.223327.xyz/https://github.com"
 ARIANG_DIR="${ARIA2_CONF_DIR}/ariang"
 
-# ==================== 基础依赖检测 (仅缺失时精准安装，不刷源) ====================
+# ==================== 基础依赖检测 (仅缺失时安装，不刷源) ====================
 install_packages() {
     local pkgs=("$@")
     local missing_pkgs=()
@@ -1208,7 +1208,7 @@ migrate_downloads() {
     fi
 }
 
-# ==================== 模块 7: 转移已完成文件到外部/新磁盘 (深度扫描与精准排除) ====================
+# ==================== 模块 7: 转移已完成文件到外部/新磁盘 (RPC 真实进度校验 + 深度防护) ====================
 archive_completed_files() {
     echo ""
     echo "=========================================="
@@ -1220,7 +1220,7 @@ archive_completed_files() {
         return 1
     fi
 
-    install_packages rsync findutils
+    install_packages rsync findutils python3
 
     CURRENT_DIR=$(get_current_download_dir)
     read -rp "请输入下载目录绝对路径 [默认: ${CURRENT_DIR}]: " SRC_DIR
@@ -1233,7 +1233,7 @@ archive_completed_files() {
     fi
 
     while true; do
-        read -rp "请输入用于归档存放的大容量目标目录 (例如: /mnt/hdd02/Archive): " DEST_DIR
+        read -rp "请输入用于归档存放的大容量目标目录 (例如: /mnt/hdd01/aria2-downloads): " DEST_DIR
         if [ -n "$DEST_DIR" ]; then
             DEST_DIR="${DEST_DIR%/}"
             break
@@ -1248,27 +1248,94 @@ archive_completed_files() {
     chmod 755 "${DEST_DIR}" 2>/dev/null || true
 
     echo ""
-    echo "请选择转移范围模式:"
-    echo " 1. 精准转移已完成的媒体数据 (排除未完工、0 字节及 .torrent 种子，保持子目录结构)"
-    echo " 2. 仅转移完全完成的顶级任务文件夹与独立文件 (整任务全部文件完工才转移)"
+    echo "请选择转移过滤模式:"
+    echo " 1. 转移真正下载完毕的大文件/视频 (严格校验 Aria2 进度，排除未完工 BT、0 字节及种子)"
+    echo " 2. 仅转移完全完成的顶级独立目录与文件 (整任务全部文件完工才转移)"
     read -rp "请选择 [1-2 默认: 1]: " ARCHIVE_MODE
     ARCHIVE_MODE="${ARCHIVE_MODE:-1}"
 
-    echo ">> 正在深度分析 ${SRC_DIR} 下的文件状态..."
+    read -rp "请输入转移文件的最小体积门槛 (MB) [默认: 10]: " MIN_ARCHIVE_MB
+    MIN_ARCHIVE_MB="${MIN_ARCHIVE_MB:-10}"
+    local min_bytes=$((MIN_ARCHIVE_MB * 1024 * 1024))
 
-    # 构建未完成任务关联特征黑名单
-    declare -A INCOMPLETE_PATHS
+    echo ">> 正在通过 Aria2 RPC 与磁盘控制文件双重核验未完成任务清单..."
+
+    # 通过 Python 调用 RPC 精准抓取正在下载/等待中的任务涉及的全部文件列表
+    local rpc_incomplete_file
+    rpc_incomplete_file=$(mktemp)
+    
+    python3 - <<EOF > "${rpc_incomplete_file}" || true
+import json
+import urllib.request
+import os
+
+CONF_FILE = "${CONF_FILE}"
+port = 6800
+secret = ""
+
+if os.path.exists(CONF_FILE):
+    with open(CONF_FILE, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("rpc-listen-port="):
+                try:
+                    port = int(line.split("=", 1)[1].strip())
+                except:
+                    pass
+            elif line.startswith("rpc-secret="):
+                secret = line.split("=", 1)[1].strip()
+
+url = f"http://127.0.0.1:{port}/jsonrpc"
+params_prefix = [f"token:{secret}"] if secret else []
+
+def call(method, p):
+    payload = {"jsonrpc": "2.0", "id": "chk", "method": method, "params": params_prefix + p}
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return json.loads(resp.read().decode("utf-8")).get("result", [])
+    except:
+        return []
+
+# 获取活跃和等待的任务 (未完成)
+active = call("aria2.tellActive", [["files", "status", "dir"]])
+waiting = call("aria2.tellWaiting", [0, 1000, ["files", "status", "dir"]])
+
+for task in (active + waiting):
+    for f in task.get("files", []):
+        # 只要已完成长度小于总长度，或任务处于未完成队列，记录其绝对路径
+        completed = int(f.get("completedLength", 0))
+        length = int(f.get("length", 0))
+        path = f.get("path", "")
+        if path and (completed < length or length == 0):
+            print(os.path.abspath(path))
+EOF
+
+    # 1. 汇集所有未完成文件黑名单
+    declare -A INCOMPLETE_FILES
+    if [ -s "${rpc_incomplete_file}" ]; then
+        while IFS= read -r inc_f; do
+            [ -n "$inc_f" ] && INCOMPLETE_FILES["$inc_f"]=1
+        done < "${rpc_incomplete_file}"
+    fi
+    rm -f "${rpc_incomplete_file}"
+
+    # 2. 扫描磁盘上所有 .aria2 控制文件对应的根目录与数据目标
     while IFS= read -r ctl; do
-        # 1. 控制文件自身路径
-        INCOMPLETE_PATHS["$ctl"]=1
-        # 2. 控制文件对应的主数据文件
-        local target_f="${ctl%.aria2}"
-        INCOMPLETE_PATHS["$target_f"]=1
-        # 3. 若多文件 BT 任务带有专属控制文件，记录其父目录特征
-        local dir_path
-        dir_path=$(dirname "$ctl")
-        if [ "$dir_path" != "$SRC_DIR" ]; then
-            INCOMPLETE_PATHS["$dir_path"]=1
+        INCOMPLETE_FILES["$ctl"]=1
+        local raw_target="${ctl%.aria2}"
+        INCOMPLETE_FILES["$raw_target"]=1
+        
+        # 针对 BT 任务：若目标为一个目录，标记其为未完工目录
+        if [ -d "$raw_target" ]; then
+            INCOMPLETE_FILES["$raw_target"]=1
+        fi
+        
+        # 记录父级目录
+        local p_dir
+        p_dir=$(dirname "$ctl")
+        if [ "$p_dir" != "$SRC_DIR" ]; then
+            INCOMPLETE_FILES["$p_dir"]=1
         fi
     done < <(find "${SRC_DIR}" -type f -name "*.aria2")
 
@@ -1279,37 +1346,44 @@ archive_completed_files() {
             local base_f
             base_f=$(basename "$f")
             
-            # 基础黑名单过滤: 隐藏文件、torrent文件、aria2控制文件
+            # 过滤垃圾与控制文件
             [[ "$base_f" == .* ]] && continue
             [[ "$base_f" == *.torrent ]] && continue
             [[ "$base_f" == *.aria2 ]] && continue
 
-            # 严格排除命中未完成黑名单的文件及所在目录
-            if [[ -n "${INCOMPLETE_PATHS[$f]}" ]]; then
+            # 严格排除未完成黑名单命中项
+            local abs_f
+            abs_f=$(readlink -f "$f" 2>/dev/null || echo "$f")
+            if [[ -n "${INCOMPLETE_FILES[$abs_f]}" ]] || [[ -n "${INCOMPLETE_FILES[$f]}" ]]; then
                 continue
             fi
             if [ -f "${f}.aria2" ]; then
                 continue
             fi
 
-            # 排除 0 字节空占位文件 (未下载完毕经常表现为空文件)
+            # 排除其所属文件夹存在 .aria2 的未完工项
+            local cur_p
+            cur_p=$(dirname "$f")
+            local is_parent_incomplete=false
+            while [ "$cur_p" != "$SRC_DIR" ] && [ "$cur_p" != "/" ] && [ "$cur_p" != "." ]; do
+                if [ -f "${cur_p}.aria2" ] || [[ -n "${INCOMPLETE_FILES[$cur_p]}" ]]; then
+                    is_parent_incomplete=true
+                    break
+                fi
+                cur_p=$(dirname "$cur_p")
+            done
+            [ "$is_parent_incomplete" = true ] && continue
+
+            # 体积门槛校验（排除空文件或未达标小文件）
             local f_size
             f_size=$(stat -c %s "$f" 2>/dev/null || stat -f %z "$f" 2>/dev/null || echo 0)
-            if [ "$f_size" -le 0 ]; then
+            if [ "$f_size" -lt "$min_bytes" ]; then
                 continue
             fi
 
             COMPLETED_ITEMS+=("${f#"${SRC_DIR}/"}")
         done < <(find "${SRC_DIR}" -type f)
     else
-        declare -A ACTIVE_FOLDERS
-        while IFS= read -r ctl; do
-            local target="${ctl%.aria2}"
-            local rel="${target#"${SRC_DIR}/"}"
-            local top_name="${rel%%/*}"
-            ACTIVE_FOLDERS["$top_name"]=1
-        done < <(find "${SRC_DIR}" -name "*.aria2")
-
         while IFS= read -r item; do
             local base_name
             base_name=$(basename "$item")
@@ -1317,21 +1391,29 @@ archive_completed_files() {
             [[ "$base_name" == *.torrent ]] && continue
             [[ "$base_name" == *.aria2 ]] && continue
 
-            if [[ -n "${ACTIVE_FOLDERS[$base_name]}" ]]; then
+            # 顶级文件夹内只要有任一 .aria2，跳过
+            if [ -f "${item}.aria2" ]; then
                 continue
             fi
+            if [ -d "$item" ] && find "$item" -type f -name "*.aria2" | grep -q .; then
+                continue
+            fi
+            if [[ -n "${INCOMPLETE_FILES[$item]}" ]]; then
+                continue
+            fi
+
             COMPLETED_ITEMS+=("${base_name}")
         done < <(find "${SRC_DIR}" -mindepth 1 -maxdepth 1)
     fi
 
     local ITEM_COUNT=${#COMPLETED_ITEMS[@]}
     if [ "$ITEM_COUNT" -eq 0 ]; then
-        echo ">> 提示: 未检索到任何完全下载完成的媒体数据 (所有内容均在活跃下载中或已被转移)。"
+        echo ">> 提示: 未检索到任何真实已下载完成且体积 >= ${MIN_ARCHIVE_MB}MB 的文件 (未完工文件已全部被精准排除)。"
         return 0
     fi
 
     echo ""
-    echo ">> 检索到以下 ${ITEM_COUNT} 个已完成文件可转移:"
+    echo ">> 检索到以下 ${ITEM_COUNT} 个已确认下载完成的文件可安全转移:"
     echo "--------------------------------------------------"
     local show_limit=25
     for ((i=0; i<ITEM_COUNT && i<show_limit; i++)); do
@@ -1368,7 +1450,7 @@ archive_completed_files() {
             rm -rf "${SRC_DIR}/${it}"
         done
         find "${SRC_DIR}" -mindepth 1 -type d -empty -delete 2>/dev/null || true
-        echo ">> 原磁盘已完成内容已清除，空间成功释放！未完成的任务继续正常下载。"
+        echo ">> 原磁盘已完成内容已清除，空间成功释放！所有未完成的任务继续正常下载。"
     else
         echo ">> 已保留源磁盘上的文件。"
     fi
