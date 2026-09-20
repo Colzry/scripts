@@ -785,7 +785,8 @@ manage_core_settings() {
         echo " 8. 一键快捷配置向导 (交互式快速配置以上所有项)"
         echo " 0. 保存并返回主菜单"
         echo "=========================================="
-        read -rp "请选择需要修改的配置项 [0-8]: " SET_OPT
+        read -rp "请选择需要修改的配置项 [0-8 默认: 0]: " SET_OPT
+        SET_OPT="${SET_OPT:-0}"
 
         case "$SET_OPT" in
             1)
@@ -926,10 +927,13 @@ update_trackers_menu() {
     echo "请选择操作:"
     echo " 1. 立即从网络自动拉取最新 Trackers (双源合并去重)"
     echo " 2. 手动自定义输入 Trackers 列表"
-    read -rp "请选择 [1-2 默认: 1]: " TRACKER_CHOICE
-    TRACKER_CHOICE="${TRACKER_CHOICE:-1}"
+    echo " 0. 返回上级菜单"
+    read -rp "请选择 [0-2 默认: 0]: " TRACKER_CHOICE
+    TRACKER_CHOICE="${TRACKER_CHOICE:-0}"
 
-    if [ "$TRACKER_CHOICE" == "1" ]; then
+    if [ "$TRACKER_CHOICE" == "0" ]; then
+        return 0
+    elif [ "$TRACKER_CHOICE" == "1" ]; then
         ensure_tracker_script
         echo ">> 正在执行 Tracker 更新脚本..."
         bash "${TRACKER_SCRIPT}"
@@ -983,7 +987,8 @@ manage_tracker_timer() {
     echo " 2. 停用并关闭开机自启 (Disable & Stop)"
     echo " 3. 查看定时器运行与下次触发时间"
     echo " 0. 返回上级菜单"
-    read -rp "请选择操作 [0-3]: " TIMER_CHOICE
+    read -rp "请选择操作 [0-3 默认: 0]: " TIMER_CHOICE
+    TIMER_CHOICE="${TIMER_CHOICE:-0}"
 
     case "$TIMER_CHOICE" in
         1)
@@ -1061,7 +1066,8 @@ manage_peer_blocker() {
     echo " 3. 立即手动执行一次更新"
     echo " 4. 查看当前拦截规则与定时任务状态"
     echo " 0. 返回上级菜单"
-    read -rp "请选择操作 [0-4]: " PEER_CHOICE
+    read -rp "请选择操作 [0-4 默认: 0]: " PEER_CHOICE
+    PEER_CHOICE="${PEER_CHOICE:-0}"
 
     case "$PEER_CHOICE" in
         1)
@@ -1158,14 +1164,24 @@ migrate_downloads() {
         return 1
     fi
 
-    install_packages rsync findutils
-
     echo "请先选择迁移范围:"
     echo " 1. 仅迁移未完成的下载任务 (自动识别 .aria2 校验块、数据与种子元数据)"
     echo " 2. 迁移整个下载目录的所有数据 (包含已完成与未完成，自动识别元数据)"
     echo " 3. 仅迁移指定文件/任务 (按关键词匹配，自动识别元数据)"
-    read -rp "请选择 [1-3 默认: 1]: " MIGRATE_TYPE
-    MIGRATE_TYPE="${MIGRATE_TYPE:-1}"
+    echo " 0. 返回上级菜单"
+    read -rp "请选择 [0-3 默认: 0]: " MIGRATE_TYPE
+    MIGRATE_TYPE="${MIGRATE_TYPE:-0}"
+
+    if [ "$MIGRATE_TYPE" == "0" ]; then
+        return 0
+    fi
+
+    if [[ ! "$MIGRATE_TYPE" =~ ^[123]$ ]]; then
+        echo "无效选项，已取消迁移。"
+        return 1
+    fi
+
+    install_packages rsync findutils
 
     FILE_KEYWORD=""
     if [ "$MIGRATE_TYPE" == "3" ]; then
@@ -2170,7 +2186,8 @@ manage_utils_menu() {
         echo " 4. 一键服务与网络健康诊断 (检查端口、进程、防火墙与定时器)"
         echo " 0. 返回上级菜单"
         echo "=========================================="
-        read -rp "请选择操作 [0-4]: " UTIL_CHOICE
+        read -rp "请选择操作 [0-4 默认: 0]: " UTIL_CHOICE
+        UTIL_CHOICE="${UTIL_CHOICE:-0}"
 
         case "$UTIL_CHOICE" in
             1)
@@ -2354,7 +2371,8 @@ manage_logs_menu() {
         echo " 7. 查看 BT 自动筛选服务运行日志"
         echo " 0. 返回上级菜单"
         echo "=========================================="
-        read -rp "请选择操作 [0-7]: " LOG_CHOICE
+        read -rp "请选择操作 [0-7 默认: 0]: " LOG_CHOICE
+        LOG_CHOICE="${LOG_CHOICE:-0}"
 
         case "$LOG_CHOICE" in
             1)
@@ -2570,7 +2588,8 @@ manage_video_filter() {
     echo " 2. 停止并禁用自动筛选守护服务"
     echo " 3. 查看实时筛选过滤日志"
     echo " 0. 返回上级菜单"
-    read -rp "请选择操作 [0-3]: " FILTER_CHOICE
+    read -rp "请选择操作 [0-3 默认: 0]: " FILTER_CHOICE
+    FILTER_CHOICE="${FILTER_CHOICE:-0}"
 
     case "$FILTER_CHOICE" in
         1)
@@ -2683,7 +2702,7 @@ EOF
     esac
 }
 
-# ==================== 模块 15: 扫描并清理小文件工具 (支持分页预览) ====================
+# ==================== 模块 15: 扫描并清理小文件工具 (支持分页预览 / 自动跳过 .torrent) ====================
 clean_small_files_menu() {
     echo ""
     echo "=========================================="
@@ -2712,7 +2731,7 @@ clean_small_files_menu() {
 
     echo ""
     echo ">> 正在扫描目录: ${TARGET_DIR}"
-    echo ">> 过滤条件: 体积小于 ${SIZE_MB}MB (自动保护 .aria2 及正在下载中的任务)..."
+    echo ">> 过滤条件: 体积小于 ${SIZE_MB}MB (自动保护 .aria2 / .torrent 及正在下载中的任务)..."
 
     declare -A ACTIVE_TASKS
     while IFS= read -r ctl; do
@@ -2724,7 +2743,9 @@ clean_small_files_menu() {
     local TOTAL_BYTES=0
 
     while IFS= read -r file; do
-        if [[ -n "${ACTIVE_TASKS[$file]}" ]] || [[ "$file" == *.aria2 ]]; then
+        # .aria2 校验块、.torrent 种子及活跃任务一律跳过:
+        # 种子元数据统一由主菜单 [9 -> 1] 的专用清理功能处理，避免误删有效种子
+        if [[ -n "${ACTIVE_TASKS[$file]}" ]] || [[ "$file" == *.aria2 ]] || [[ "$file" == *.torrent ]]; then
             continue
         fi
 
@@ -2801,6 +2822,7 @@ clean_small_files_menu() {
 
     echo ""
     echo ">> [成功] 已清理 ${FILE_COUNT} 个小文件，释放空间约 ${TOTAL_HUMAN} MB！"
+    echo "   提示: .torrent 种子文件已自动跳过，如需清理请使用主菜单 [9 -> 1]。"
 }
 
 # ==================== 模块 13: 完整卸载 (全部组件) ====================
