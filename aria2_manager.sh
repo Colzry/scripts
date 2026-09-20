@@ -603,7 +603,7 @@ EOF
     fi
 }
 
-# ==================== 模块 2: Aria2 常用核心设置 (下载目录/并发/做种/限速/文件保留) ====================
+# ==================== 模块 2: Aria2 常用核心设置 (下载目录/并发/做种/限速/占位清理) ====================
 manage_core_settings() {
     if [ ! -f "${CONF_FILE}" ]; then
         echo "未检测到配置文件: ${CONF_FILE}，请先执行安装 Aria2！"
@@ -1189,7 +1189,7 @@ migrate_downloads() {
     fi
 }
 
-# ==================== 模块 7: 转移已完成文件到外部/新磁盘 (支持断点续传腾空间) ====================
+# ==================== 模块 7: 转移已完成文件到外部/新磁盘 (深度扫描/排除种子/保持目录结构) ====================
 archive_completed_files() {
     echo ""
     echo "=========================================="
@@ -1228,66 +1228,101 @@ archive_completed_files() {
     fi
     chmod 755 "${DEST_DIR}" 2>/dev/null || true
 
-    echo ">> 正在安全分析 ${SRC_DIR} 中完全已下载完成的内容 (严格排除带 .aria2 控制文件的活跃任务)..."
+    echo ""
+    echo "请选择转移范围模式:"
+    echo " 1. 转移所有已下载完毕的文件及文件夹 (推荐: 自身下载完成即转移，保持原有子目录结构)"
+    echo " 2. 仅转移完全完成的顶级文件夹与独立文件 (整任务全部文件完工才转移)"
+    read -rp "请选择 [1-2 默认: 1]: " ARCHIVE_MODE
+    ARCHIVE_MODE="${ARCHIVE_MODE:-1}"
 
-    declare -A ACTIVE_TASKS
-    while IFS= read -r ctl; do
-        target="${ctl%.aria2}"
-        rel="${target#"${SRC_DIR}/"}"
-        top_name="${rel%%/*}"
-        ACTIVE_TASKS["$top_name"]=1
-    done < <(find "${SRC_DIR}" -name "*.aria2")
+    echo ">> 正在安全分析 ${SRC_DIR} 中完全已下载完成的内容 (排除活跃下载块与 .torrent 种子)..."
 
     declare -a COMPLETED_ITEMS=()
-    while IFS= read -r item; do
-        base_name=$(basename "$item")
-        [[ "$base_name" == .* ]] && continue
-        [[ "$base_name" == *.aria2 ]] && continue
 
-        if [[ -n "${ACTIVE_TASKS[$base_name]}" ]]; then
-            continue
-        fi
+    if [ "$ARCHIVE_MODE" == "1" ]; then
+        while IFS= read -r f; do
+            local base_f
+            base_f=$(basename "$f")
+            [[ "$base_f" == .* ]] && continue
+            [[ "$base_f" == *.torrent ]] && continue
+            [[ "$base_f" == *.aria2 ]] && continue
 
-        COMPLETED_ITEMS+=("$item")
-    done < <(find "${SRC_DIR}" -mindepth 1 -maxdepth 1)
+            if [ -f "${f}.aria2" ]; then
+                continue
+            fi
 
-    if [ ${#COMPLETED_ITEMS[@]} -eq 0 ]; then
-        echo ">> 提示: 当前目录下没有找到完全下载完成的独立文件或目录 (所有内容均在活跃下载中或目录为空)。"
+            COMPLETED_ITEMS+=("${f#"${SRC_DIR}/"}")
+        done < <(find "${SRC_DIR}" -type f)
+    else
+        declare -A ACTIVE_FOLDERS
+        while IFS= read -r ctl; do
+            local target="${ctl%.aria2}"
+            local rel="${target#"${SRC_DIR}/"}"
+            local top_name="${rel%%/*}"
+            ACTIVE_FOLDERS["$top_name"]=1
+        done < <(find "${SRC_DIR}" -name "*.aria2")
+
+        while IFS= read -r item; do
+            local base_name
+            base_name=$(basename "$item")
+            [[ "$base_name" == .* ]] && continue
+            [[ "$base_name" == *.torrent ]] && continue
+            [[ "$base_name" == *.aria2 ]] && continue
+
+            if [[ -n "${ACTIVE_FOLDERS[$base_name]}" ]]; then
+                continue
+            fi
+            COMPLETED_ITEMS+=("${base_name}")
+        done < <(find "${SRC_DIR}" -mindepth 1 -maxdepth 1)
+    fi
+
+    local ITEM_COUNT=${#COMPLETED_ITEMS[@]}
+    if [ "$ITEM_COUNT" -eq 0 ]; then
+        echo ">> 提示: 未检索到任何完全下载完成的媒体数据 (可能都在下载中或已被转移)。"
         return 0
     fi
 
     echo ""
-    echo ">> 检索到以下 ${#COMPLETED_ITEMS[@]} 个已完全下载的内容可转移腾出空间:"
-    for it in "${COMPLETED_ITEMS[@]}"; do
-        echo "   - $(basename "$it")"
+    echo ">> 检索到以下 ${ITEM_COUNT} 个已完成项可转移:"
+    echo "--------------------------------------------------"
+    local show_limit=25
+    for ((i=0; i<ITEM_COUNT && i<show_limit; i++)); do
+        echo "   - ${COMPLETED_ITEMS[$i]}"
     done
-    echo ""
-    echo "提示: 本操作使用 rsync 断点续传，若由于网络、空间或手动 Ctrl+C 导致中断，重新运行即可自动接着传！"
-    read -rp "确认开始断点移动以上文件到 ${DEST_DIR}? [Y/n 默认: Y]: " CONFIRM_MOVE
+    if [ "$ITEM_COUNT" -gt "$show_limit" ]; then
+        echo "   ... 以及其余 $((ITEM_COUNT - show_limit)) 项"
+    fi
+    echo "--------------------------------------------------"
+
+    read -rp "确认开始断点移动以上已完成数据到 ${DEST_DIR}? [Y/n 默认: Y]: " CONFIRM_MOVE
     CONFIRM_MOVE="${CONFIRM_MOVE:-Y}"
     if [[ ! "$CONFIRM_MOVE" =~ ^[Yy]$ ]]; then
         echo ">> 操作已取消。"
         return 0
     fi
 
-    echo ">> 正在断点同步数据..."
-    for it in "${COMPLETED_ITEMS[@]}"; do
-        echo "   -> 正在转移: $(basename "$it")..."
-        rsync -avP --partial --append-verify "${it}" "${DEST_DIR}/"
-    done
+    echo ">> 正在断点同步数据并保持目录结构..."
+    (
+        cd "${SRC_DIR}"
+        for it in "${COMPLETED_ITEMS[@]}"; do
+            echo "   -> 正在同步: ${it}..."
+            rsync -avP --partial -R "${it}" "${DEST_DIR}/"
+        done
+    )
 
     echo ""
-    echo ">> [成功] 数据已完整同步到新磁盘目标目录！"
-    read -rp "是否立即彻底删除源磁盘上对应的已完成文件以释放空间? [Y/n 默认: Y]: " CLEAN_SRC
+    echo ">> [成功] 数据已完整同步到目标新磁盘！"
+    read -rp "是否彻底删除原路径 (${SRC_DIR}) 上对应的已转移文件以释放空间? [Y/n 默认: Y]: " CLEAN_SRC
     CLEAN_SRC="${CLEAN_SRC:-Y}"
     if [[ "$CLEAN_SRC" =~ ^[Yy]$ ]]; then
-        echo ">> 正在释放源磁盘空间..."
+        echo ">> 正在安全清理原磁盘已转移数据..."
         for it in "${COMPLETED_ITEMS[@]}"; do
-            rm -rf "${it}"
+            rm -rf "${SRC_DIR}/${it}"
         done
-        echo ">> 源磁盘已完成内容已清空，空间成功释放！Aria2 剩余未完成任务继续正常下载。"
+        find "${SRC_DIR}" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+        echo ">> 原磁盘已完成内容已清除，空间已成功释放！剩余未完成任务继续正常下载。"
     else
-        echo ">> 已保留源磁盘上的原始文件。"
+        echo ">> 已保留源磁盘上的文件。"
     fi
 }
 
@@ -2138,7 +2173,7 @@ while true; do
     echo " 12. 单独卸载 AriaNg 前端"
     echo " 13. 完整卸载 (Aria2 + AriaNg + 防火墙规则 + 服务全清)"
     echo " 14. BT 自动筛选下载管理 (支持按大小及自定义后缀过滤)"
-    echo " 15. 扫描并清理下载目录下的小文件 (支持翻页预览 / 防误删)"
+    echo " 15. 扫描并清理下载目录下的小文件"
     echo " 0. 退出"
     echo "=========================================="
     read -rp "请选择操作 [0-15]: " MENU_CHOICE
