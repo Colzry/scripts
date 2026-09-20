@@ -455,7 +455,10 @@ install_aria2() {
     echo "顺带配置 AriaNg: $([[ "$WITH_ARIANG" =~ ^[Yy]$ ]] && echo "是" || echo "否")"
     echo "Trackers 自动更新: 默认开启 (每日定时)"
     echo "全局最大上传限制: 2M"
+    echo "全局下载速度限制: 不限速 (0)"
+    echo "BT 默认做种策略: 分享率达到 1.0 停止做种"
     echo "未选文件自动清理: 开启 (bt-remove-unselected-file=true)"
+    echo "吸血 Peer 防火墙: 默认自动开启 (ipset + iptables 拦截)"
     echo "======================"
     read -rp "确认应用并保存配置? [Y/n 默认: Y]: " CONFIRM
     CONFIRM="${CONFIRM:-Y}"
@@ -511,10 +514,12 @@ split=64
 disable-ipv6=true
 max-overall-upload-limit=2M
 max-upload-limit=2M
+max-overall-download-limit=0
+max-download-limit=0
 
 ## 做种与分享率设置 ##
 seed-time=0
-seed-ratio=0.0
+seed-ratio=1.0
 
 ## 进度保存设置 ##
 input-file=${SESSION_FILE}
@@ -605,16 +610,49 @@ EOF
     echo ">> 正在同步 Trackers 列表..."
     bash "${TRACKER_SCRIPT}" 2>/dev/null || true
 
+    # 默认自动开启吸血 Peer 防火墙
+    echo ">> 正在默认初始化开启吸血 Peer 防火墙拦截 (ipset + iptables)..."
+    install_packages ipset iptables
+    ensure_blocker_script
+
+    ${SUDO_CMD} bash -c "cat > /etc/systemd/system/aria2-peer-blocker.service" <<EOF
+[Unit]
+Description=Update Aria2 Peer Blacklist to Linux Firewall (ipset)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=${BLOCKER_SCRIPT}
+EOF
+
+    ${SUDO_CMD} bash -c "cat > /etc/systemd/system/aria2-peer-blocker.timer" <<EOF
+[Unit]
+Description=Daily update of Aria2 Peer Blacklist
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=24h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    ${SUDO_CMD} systemctl daemon-reload
+    ${SUDO_CMD} systemctl enable --now aria2-peer-blocker.timer
+    bash "${BLOCKER_SCRIPT}" 2>/dev/null || true
+
     if [ "$IS_ROOT" = false ] && command -v loginctl &>/dev/null; then
         sudo loginctl enable-linger "${CURRENT_USER}" 2>/dev/null || true
     fi
 
     echo ""
     echo ">> Aria2 后端配置并启动成功！"
-    echo "   程序路径: ${ARIA2C_BIN}"
     echo "   下载目录: ${DOWNLOAD_DIR}"
     echo "   RPC 端口: ${RPC_PORT}"
     echo "   RPC 密钥: ${RPC_SECRET}"
+    echo "   做种策略: 分享率达到 1.0 自动停止"
+    echo "   吸血拦截: 已自动启用每日封禁"
     echo "   服务状态: $(get_aria2_status)"
 
     if [[ "$WITH_ARIANG" =~ ^[Yy]$ ]]; then
@@ -630,12 +668,13 @@ manage_core_settings() {
     fi
 
     while true; do
-        local cur_dir cur_concurrent cur_up_limit cur_seed_time cur_seed_ratio cur_rm_unsel cur_save_meta
+        local cur_dir cur_concurrent cur_up_limit cur_down_limit cur_seed_time cur_seed_ratio cur_rm_unsel cur_save_meta
         cur_dir=$(get_current_download_dir)
         cur_concurrent=$(get_conf_value "max-concurrent-downloads" "5")
         cur_up_limit=$(get_conf_value "max-overall-upload-limit" "2M")
+        cur_down_limit=$(get_conf_value "max-overall-download-limit" "0")
         cur_seed_time=$(get_conf_value "seed-time" "0")
-        cur_seed_ratio=$(get_conf_value "seed-ratio" "0.0")
+        cur_seed_ratio=$(get_conf_value "seed-ratio" "1.0")
         cur_rm_unsel=$(get_conf_value "bt-remove-unselected-file" "true")
         cur_save_meta=$(get_conf_value "bt-save-metadata" "false")
 
@@ -646,19 +685,22 @@ manage_core_settings() {
         echo " 当前参数状态:"
         echo "  1. 默认下载目录:           ${cur_dir}"
         echo "  2. 最大同时下载任务数:     ${cur_concurrent}"
-        echo "  3. 全局最大上传限速:       ${cur_up_limit}"
-        if [ "$cur_seed_time" == "0" ] && [ "$cur_seed_ratio" == "0.0" ]; then
-            echo "  4. BT 做种策略:            下载完成后立即停止做种 (0分钟/0分享率)"
+        echo "  3. 全局最大下载限速:       $([ "$cur_down_limit" == "0" ] && echo "不限制" || echo "${cur_down_limit}")"
+        echo "  4. 全局最大上传限速:       $([ "$cur_up_limit" == "0" ] && echo "不限制" || echo "${cur_up_limit}")"
+        if [ "$cur_seed_ratio" != "0.0" ]; then
+            echo "  5. BT 做种策略:            分享率达到 ${cur_seed_ratio} 停止做种"
+        elif [ "$cur_seed_time" != "0" ]; then
+            echo "  5. BT 做种策略:            做种持续 ${cur_seed_time} 分钟停止"
         else
-            echo "  4. BT 做种策略:            做种时间 ${cur_seed_time} 分钟 / 分享率达到 ${cur_seed_ratio}"
+            echo "  5. BT 做种策略:            下载完成立即停止做种"
         fi
-        echo "  5. 清理未选择的占位文件:   $([ "$cur_rm_unsel" == "true" ] && echo "是 (自动删除)" || echo "否 (保留空占位)")"
-        echo "  6. 保存磁力下载的种子文件: $([ "$cur_save_meta" == "true" ] && echo "是 (保存 .torrent)" || echo "否 (不保留)")"
+        echo "  6. 清理未选择的占位文件:   $([ "$cur_rm_unsel" == "true" ] && echo "是 (自动删除)" || echo "否 (保留空占位)")"
+        echo "  7. 保存磁力下载的种子文件: $([ "$cur_save_meta" == "true" ] && echo "是 (保存 .torrent)" || echo "否 (不保留)")"
         echo "------------------------------------------"
-        echo " 7. 一键快捷配置向导 (交互式快速配置以上所有项)"
+        echo " 8. 一键快捷配置向导 (交互式快速配置以上所有项)"
         echo " 0. 保存并返回主菜单"
         echo "=========================================="
-        read -rp "请选择需要修改的配置项 [0-7]: " SET_OPT
+        read -rp "请选择需要修改的配置项 [0-8]: " SET_OPT
 
         case "$SET_OPT" in
             1)
@@ -678,6 +720,14 @@ manage_core_settings() {
                 fi
                 ;;
             3)
+                read -rp "请输入全局最大下载限速 (例如 10M, 5M, 0 为不限速) [当前: ${cur_down_limit}]: " NEW_DOWN
+                if [ -n "$NEW_DOWN" ]; then
+                    update_conf_kv "max-overall-download-limit" "${NEW_DOWN}"
+                    update_conf_kv "max-download-limit" "${NEW_DOWN}"
+                    echo ">> 下载限速已更新为: ${NEW_DOWN}"
+                fi
+                ;;
+            4)
                 read -rp "请输入全局最大上传限速 (例如 2M, 500K, 0 为不限速) [当前: ${cur_up_limit}]: " NEW_UP
                 if [ -n "$NEW_UP" ]; then
                     update_conf_kv "max-overall-upload-limit" "${NEW_UP}"
@@ -685,33 +735,33 @@ manage_core_settings() {
                     echo ">> 上传限速已更新为: ${NEW_UP}"
                 fi
                 ;;
-            4)
+            5)
                 echo ""
                 echo "请选择 BT 做种模式:"
-                echo " 1. 下载完成立即停止做种 (不浪费上传带宽 / 推荐)"
-                echo " 2. 自定义做种时间 (到达设定分钟后自动停止)"
-                echo " 3. 自定义分享率 (做种达到指定倍数后停止)"
+                echo " 1. 分享率做种 (达到指定倍数后停止 / 默认: 1.0)"
+                echo " 2. 时间做种 (到达设定分钟后自动停止)"
+                echo " 3. 下载完成立即停止做种 (不浪费上传带宽)"
                 read -rp "请选择模式 [1-3 默认: 1]: " SEED_CHOICE
                 SEED_CHOICE="${SEED_CHOICE:-1}"
                 if [ "$SEED_CHOICE" == "1" ]; then
+                    read -rp "请输入分享率阈值 (例如 1.0 或 2.0) [默认: 1.0]: " INPUT_RATIO
+                    INPUT_RATIO="${INPUT_RATIO:-1.0}"
+                    update_conf_kv "seed-ratio" "${INPUT_RATIO}"
                     update_conf_kv "seed-time" "0"
-                    update_conf_kv "seed-ratio" "0.0"
-                    echo ">> 已配置为下载完成后立即停止做种。"
+                    echo ">> 已配置为分享率达到 ${INPUT_RATIO} 后停止。"
                 elif [ "$SEED_CHOICE" == "2" ]; then
-                    read -rp "请输入做种时间 (单位: 分钟): " INPUT_TIME
+                    read -rp "请输入做种时间 (单位: 分钟) [默认: 30]: " INPUT_TIME
                     INPUT_TIME="${INPUT_TIME:-30}"
                     update_conf_kv "seed-time" "${INPUT_TIME}"
                     update_conf_kv "seed-ratio" "0.0"
                     echo ">> 已配置为完成做种 ${INPUT_TIME} 分钟后停止。"
                 elif [ "$SEED_CHOICE" == "3" ]; then
-                    read -rp "请输入分享率阈值 (例如 1.0 或 2.0): " INPUT_RATIO
-                    INPUT_RATIO="${INPUT_RATIO:-1.0}"
-                    update_conf_kv "seed-ratio" "${INPUT_RATIO}"
                     update_conf_kv "seed-time" "0"
-                    echo ">> 已配置为分享率达到 ${INPUT_RATIO} 后停止。"
+                    update_conf_kv "seed-ratio" "0.0"
+                    echo ">> 已配置为下载完成后立即停止做种。"
                 fi
                 ;;
-            5)
+            6)
                 read -rp "是否在下载完成后自动删除未勾选的占位文件? [Y/n 默认: Y]: " UNSEL_CHOICE
                 UNSEL_CHOICE="${UNSEL_CHOICE:-Y}"
                 if [[ "$UNSEL_CHOICE" =~ ^[Yy]$ ]]; then
@@ -722,7 +772,7 @@ manage_core_settings() {
                     echo ">> 已关闭: 保留所有文件的占位。"
                 fi
                 ;;
-            6)
+            7)
                 read -rp "磁力链下载时是否把种子文件 (.torrent) 保存到下载目录? [y/N 默认: N]: " META_CHOICE
                 META_CHOICE="${META_CHOICE:-N}"
                 if [[ "$META_CHOICE" =~ ^[Yy]$ ]]; then
@@ -733,7 +783,7 @@ manage_core_settings() {
                     echo ">> 已关闭: 不保留额外种子文件。"
                 fi
                 ;;
-            7)
+            8)
                 echo ""
                 echo "--- 开始交互式向导配置 ---"
                 read -rp "1. 默认下载目录 [当前: ${cur_dir}]: " IN_DIR
@@ -742,19 +792,22 @@ manage_core_settings() {
                 read -rp "2. 同时下载任务数 [当前: ${cur_concurrent}]: " IN_CONCURRENT
                 [ -n "$IN_CONCURRENT" ] && update_conf_kv "max-concurrent-downloads" "${IN_CONCURRENT}"
 
-                read -rp "3. 全局上传速度限制 [当前: ${cur_up_limit}]: " IN_UP
+                read -rp "3. 全局最大下载限速 (0为不限速) [当前: ${cur_down_limit}]: " IN_DOWN
+                [ -n "$IN_DOWN" ] && update_conf_kv "max-overall-download-limit" "${IN_DOWN}" && update_conf_kv "max-download-limit" "${IN_DOWN}"
+
+                read -rp "4. 全局最大上传限速 (例如 2M, 0为不限速) [当前: ${cur_up_limit}]: " IN_UP
                 [ -n "$IN_UP" ] && update_conf_kv "max-overall-upload-limit" "${IN_UP}" && update_conf_kv "max-upload-limit" "${IN_UP}"
 
-                read -rp "4. 完成后是否做种? (0=不借带宽直接停止, 或输入分钟数) [默认: 0]: " IN_SEED
-                IN_SEED="${IN_SEED:-0}"
-                update_conf_kv "seed-time" "${IN_SEED}"
-                [ "$IN_SEED" == "0" ] && update_conf_kv "seed-ratio" "0.0"
+                read -rp "5. BT 分享率做种阈值 (默认 1.0, 设为 0 表示不借带宽下载完即停) [当前: ${cur_seed_ratio}]: " IN_RATIO
+                IN_RATIO="${IN_RATIO:-1.0}"
+                update_conf_kv "seed-ratio" "${IN_RATIO}"
+                update_conf_kv "seed-time" "0"
 
-                read -rp "5. 自动清理未勾选的多余占位文件? [Y/n 默认: Y]: " IN_RM
+                read -rp "6. 自动清理未勾选的多余占位文件? [Y/n 默认: Y]: " IN_RM
                 IN_RM="${IN_RM:-Y}"
                 [[ "$IN_RM" =~ ^[Yy]$ ]] && update_conf_kv "bt-remove-unselected-file" "true" || update_conf_kv "bt-remove-unselected-file" "false"
 
-                read -rp "6. 保存磁力下载的 .torrent 种子? [y/N 默认: N]: " IN_SAVE_META
+                read -rp "7. 保存磁力下载的 .torrent 种子? [y/N 默认: N]: " IN_SAVE_META
                 IN_SAVE_META="${IN_SAVE_META:-N}"
                 [[ "$IN_SAVE_META" =~ ^[Yy]$ ]] && update_conf_kv "bt-save-metadata" "true" || update_conf_kv "bt-save-metadata" "false"
 
@@ -1208,7 +1261,7 @@ migrate_downloads() {
     fi
 }
 
-# ==================== 模块 7: 转移已完成文件到外部/新磁盘 (RPC 真实进度校验 + 深度防护) ====================
+# ==================== 模块 7: 转移已完成文件到外部/新磁盘 (精准识别/保持结构) ====================
 archive_completed_files() {
     echo ""
     echo "=========================================="
@@ -1247,20 +1300,12 @@ archive_completed_files() {
     fi
     chmod 755 "${DEST_DIR}" 2>/dev/null || true
 
-    echo ""
-    echo "请选择转移过滤模式:"
-    echo " 1. 转移真正下载完毕的大文件/视频 (严格校验 Aria2 进度，排除未完工 BT、0 字节及种子)"
-    echo " 2. 仅转移完全完成的顶级独立目录与文件 (整任务全部文件完工才转移)"
-    read -rp "请选择 [1-2 默认: 1]: " ARCHIVE_MODE
-    ARCHIVE_MODE="${ARCHIVE_MODE:-1}"
-
     read -rp "请输入转移文件的最小体积门槛 (MB) [默认: 10]: " MIN_ARCHIVE_MB
     MIN_ARCHIVE_MB="${MIN_ARCHIVE_MB:-10}"
     local min_bytes=$((MIN_ARCHIVE_MB * 1024 * 1024))
 
-    echo ">> 正在通过 Aria2 RPC 与磁盘控制文件双重核验未完成任务清单..."
+    echo ">> 正在通过 Aria2 运行时进度与磁盘校验块双重核验未完成文件..."
 
-    # 通过 Python 调用 RPC 精准抓取正在下载/等待中的任务涉及的全部文件列表
     local rpc_incomplete_file
     rpc_incomplete_file=$(mktemp)
     
@@ -1297,13 +1342,11 @@ def call(method, p):
     except:
         return []
 
-# 获取活跃和等待的任务 (未完成)
 active = call("aria2.tellActive", [["files", "status", "dir"]])
 waiting = call("aria2.tellWaiting", [0, 1000, ["files", "status", "dir"]])
 
 for task in (active + waiting):
     for f in task.get("files", []):
-        # 只要已完成长度小于总长度，或任务处于未完成队列，记录其绝对路径
         completed = int(f.get("completedLength", 0))
         length = int(f.get("length", 0))
         path = f.get("path", "")
@@ -1311,7 +1354,6 @@ for task in (active + waiting):
             print(os.path.abspath(path))
 EOF
 
-    # 1. 汇集所有未完成文件黑名单
     declare -A INCOMPLETE_FILES
     if [ -s "${rpc_incomplete_file}" ]; then
         while IFS= read -r inc_f; do
@@ -1320,18 +1362,13 @@ EOF
     fi
     rm -f "${rpc_incomplete_file}"
 
-    # 2. 扫描磁盘上所有 .aria2 控制文件对应的根目录与数据目标
     while IFS= read -r ctl; do
         INCOMPLETE_FILES["$ctl"]=1
         local raw_target="${ctl%.aria2}"
         INCOMPLETE_FILES["$raw_target"]=1
-        
-        # 针对 BT 任务：若目标为一个目录，标记其为未完工目录
         if [ -d "$raw_target" ]; then
             INCOMPLETE_FILES["$raw_target"]=1
         fi
-        
-        # 记录父级目录
         local p_dir
         p_dir=$(dirname "$ctl")
         if [ "$p_dir" != "$SRC_DIR" ]; then
@@ -1341,70 +1378,43 @@ EOF
 
     declare -a COMPLETED_ITEMS=()
 
-    if [ "$ARCHIVE_MODE" == "1" ]; then
-        while IFS= read -r f; do
-            local base_f
-            base_f=$(basename "$f")
-            
-            # 过滤垃圾与控制文件
-            [[ "$base_f" == .* ]] && continue
-            [[ "$base_f" == *.torrent ]] && continue
-            [[ "$base_f" == *.aria2 ]] && continue
+    while IFS= read -r f; do
+        local base_f
+        base_f=$(basename "$f")
+        
+        [[ "$base_f" == .* ]] && continue
+        [[ "$base_f" == *.torrent ]] && continue
+        [[ "$base_f" == *.aria2 ]] && continue
 
-            # 严格排除未完成黑名单命中项
-            local abs_f
-            abs_f=$(readlink -f "$f" 2>/dev/null || echo "$f")
-            if [[ -n "${INCOMPLETE_FILES[$abs_f]}" ]] || [[ -n "${INCOMPLETE_FILES[$f]}" ]]; then
-                continue
-            fi
-            if [ -f "${f}.aria2" ]; then
-                continue
-            fi
+        local abs_f
+        abs_f=$(readlink -f "$f" 2>/dev/null || echo "$f")
+        if [[ -n "${INCOMPLETE_FILES[$abs_f]}" ]] || [[ -n "${INCOMPLETE_FILES[$f]}" ]]; then
+            continue
+        fi
+        if [ -f "${f}.aria2" ]; then
+            continue
+        fi
 
-            # 排除其所属文件夹存在 .aria2 的未完工项
-            local cur_p
-            cur_p=$(dirname "$f")
-            local is_parent_incomplete=false
-            while [ "$cur_p" != "$SRC_DIR" ] && [ "$cur_p" != "/" ] && [ "$cur_p" != "." ]; do
-                if [ -f "${cur_p}.aria2" ] || [[ -n "${INCOMPLETE_FILES[$cur_p]}" ]]; then
-                    is_parent_incomplete=true
-                    break
-                fi
-                cur_p=$(dirname "$cur_p")
-            done
-            [ "$is_parent_incomplete" = true ] && continue
-
-            # 体积门槛校验（排除空文件或未达标小文件）
-            local f_size
-            f_size=$(stat -c %s "$f" 2>/dev/null || stat -f %z "$f" 2>/dev/null || echo 0)
-            if [ "$f_size" -lt "$min_bytes" ]; then
-                continue
+        local cur_p
+        cur_p=$(dirname "$f")
+        local is_parent_incomplete=false
+        while [ "$cur_p" != "$SRC_DIR" ] && [ "$cur_p" != "/" ] && [ "$cur_p" != "." ]; do
+            if [ -f "${cur_p}.aria2" ] || [[ -n "${INCOMPLETE_FILES[$cur_p]}" ]]; then
+                is_parent_incomplete=true
+                break
             fi
+            cur_p=$(dirname "$cur_p")
+        done
+        [ "$is_parent_incomplete" = true ] && continue
 
-            COMPLETED_ITEMS+=("${f#"${SRC_DIR}/"}")
-        done < <(find "${SRC_DIR}" -type f)
-    else
-        while IFS= read -r item; do
-            local base_name
-            base_name=$(basename "$item")
-            [[ "$base_name" == .* ]] && continue
-            [[ "$base_name" == *.torrent ]] && continue
-            [[ "$base_name" == *.aria2 ]] && continue
+        local f_size
+        f_size=$(stat -c %s "$f" 2>/dev/null || stat -f %z "$f" 2>/dev/null || echo 0)
+        if [ "$f_size" -lt "$min_bytes" ]; then
+            continue
+        fi
 
-            # 顶级文件夹内只要有任一 .aria2，跳过
-            if [ -f "${item}.aria2" ]; then
-                continue
-            fi
-            if [ -d "$item" ] && find "$item" -type f -name "*.aria2" | grep -q .; then
-                continue
-            fi
-            if [[ -n "${INCOMPLETE_FILES[$item]}" ]]; then
-                continue
-            fi
-
-            COMPLETED_ITEMS+=("${base_name}")
-        done < <(find "${SRC_DIR}" -mindepth 1 -maxdepth 1)
-    fi
+        COMPLETED_ITEMS+=("${f#"${SRC_DIR}/"}")
+    done < <(find "${SRC_DIR}" -type f)
 
     local ITEM_COUNT=${#COMPLETED_ITEMS[@]}
     if [ "$ITEM_COUNT" -eq 0 ]; then
@@ -2284,18 +2294,19 @@ while true; do
         echo "  RPC 端口: ${RPC_P}"
         RPC_SEC=$(get_conf_value "rpc-secret" "未设置")
         echo "  RPC 密钥: ${RPC_SEC}"
+        DOWN_LIMIT=$(get_conf_value "max-overall-download-limit" "0")
+        echo "  下载限速: $([ "$DOWN_LIMIT" == "0" ] && echo "不限制" || echo "$DOWN_LIMIT")"
         UP_LIMIT=$(get_conf_value "max-overall-upload-limit" "未限制")
-        echo "  上传限速: ${UP_LIMIT}"
+        echo "  上传限速: $([ "$UP_LIMIT" == "0" ] && echo "不限制" || echo "$UP_LIMIT")"
     fi
-    echo "  可执行程序: ${ARIA2C_BIN}"
     echo "=========================================="
     echo " 1. $([ -f "${ARIA2C_BIN}" ] && echo "重新配置 Aria2 后端 (自动带入当前设置)" || echo "安装 / 配置 Aria2 后端 (默认启用 Trackers 自动更新)")"
-    echo " 2. Aria2 常用核心设置 (下载目录 / 并发数 / 做种 / 上传限速 / 占位清理)"
+    echo " 2. Aria2 常用核心设置 (下载目录 / 并发数 / 做种 / 上下载限速 / 占位清理)"
     echo " 3. 手动更新 / 设置 BT Trackers (双源拉取 / 自定义)"
     echo " 4. 启用 / 停用 Trackers 自动更新"
-    echo " 5. BT 吸血 Peer 防火墙拦截管理 (ipset+iptables / 默认关闭 / 每日更新)"
+    echo " 5. BT 吸血 Peer 防火墙拦截管理 (ipset+iptables / 默认开启 / 每日更新)"
     echo " 6. 迁移下载任务到新磁盘 (迁移 未完成 / 全部 任务并切换工作路径)"
-    echo " 7. 转移已完成下载到新磁盘 (移动已完成文件释放磁盘空间)"
+    echo " 7. 转移已完成下载到新磁盘 (识别已完成文件 / 保持原有目录结构)"
     echo " 8. 扫描目录并恢复未完成种子断点下载"
     echo " 9. Aria2 实用辅助与清理工具箱 (清理已完成种子 / 碎片清理 / 健康自检)"
     echo " 10. Aria2 日志排查与故障分析 (实时日志 / 崩溃溯源 / 前台单测)"
