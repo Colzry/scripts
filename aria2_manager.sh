@@ -1260,7 +1260,7 @@ migrate_downloads() {
     fi
 }
 
-# ==================== 模块 7: 转移已完成下载到新磁盘 (彻底精准识别 100% 完成项) ====================
+# ==================== 模块 7: 转移已完成下载到新磁盘 (以 Aria2 任务状态为准) ====================
 archive_completed_files() {
     echo ""
     echo "=========================================="
@@ -1273,10 +1273,6 @@ archive_completed_files() {
     fi
 
     install_packages rsync findutils python3 curl
-
-    local rpc_port rpc_secret
-    rpc_port=$(get_conf_value "rpc-listen-port" "6800")
-    rpc_secret=$(get_conf_value "rpc-secret" "")
 
     if ! ${SYSTEMCTL_CMD} is-active --quiet aria2.service 2>/dev/null; then
         echo ">> 检测到 Aria2 服务未运行，正在启动以调取任务状态..."
@@ -1309,268 +1305,490 @@ archive_completed_files() {
     fi
     chmod 755 "${DEST_DIR}" 2>/dev/null || true
 
-    read -rp "请输入要检索转移的文件最小体积 (MB) [默认: 50]: " MIN_ARCHIVE_MB
-    MIN_ARCHIVE_MB="${MIN_ARCHIVE_MB:-50}"
-    local min_bytes=$((MIN_ARCHIVE_MB * 1024 * 1024))
+    echo ">> 正在向 Aria2 RPC 查询已完成 (含做种 / 已暂停) 的任务清单..."
+    local running_aria2
+    running_aria2=$(ps -ef 2>/dev/null | grep '[a]ria2c' | head -n 1 || true)
 
-    echo ">> 正在通过 RPC 与磁盘深度检索已完成文件..."
+    local scan_tmp files_file gids_file scan_rc
+    scan_tmp=$(mktemp -d)
+    files_file="${scan_tmp}/files.list"
+    gids_file="${scan_tmp}/gids.list"
 
-    # Python 解析引擎：彻底解决 RPC 参数语法问题、禁用系统代理，并精确分类已完成/下载中任务
-    local scan_output
-    scan_output=$(python3 - <<EOF 2>/dev/null || true
+    scan_rc=0
+    ARIA2_CONF_FILE="${CONF_FILE}" ARIA2_SRC_DIR="${SRC_DIR}" ARIA2_OUT_DIR="${scan_tmp}" \
+        python3 - <<'PYEOF' || scan_rc=$?
 import json
-import urllib.request
 import os
+import subprocess
 import sys
+import urllib.error
+import urllib.request
 
-port = "${rpc_port}"
-secret = "${rpc_secret}"
-url = f"http://127.0.0.1:{port}/jsonrpc"
-min_bytes = int("${min_bytes}")
+CONF_FILE = os.environ.get("ARIA2_CONF_FILE", "")
+SRC_DIR = os.path.realpath(os.environ.get("ARIA2_SRC_DIR", "."))
+OUT_DIR = os.environ.get("ARIA2_OUT_DIR", ".")
+RPC_TIMEOUT = 20
+FILE_PREVIEW_LIMIT = 15
+STATUS_TEXT = {
+    "active": "下载中/做种",
+    "waiting": "排队中",
+    "paused": "已暂停",
+    "complete": "已完成",
+    "error": "出错",
+    "removed": "已移除",
+}
 
-# 显式使用空代理，防止被系统的 http_proxy 劫持本地 127.0.0.1 请求
-opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+def read_conf(key, default):
+    """直接读取 aria2.conf，避免 shell 侧 cut 截断含等号的密钥。"""
+    try:
+        with open(CONF_FILE, "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key_name, value = line.split("=", 1)
+                if key_name.strip() == key:
+                    return value.strip()
+    except OSError:
+        pass
+    return default
+
+
+def num(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def human(size):
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.1f} {unit}"
+        value = value / 1024
+    return f"{value:.1f} TB"
+
+
+RPC_PORT = read_conf("rpc-listen-port", "6800") or "6800"
+RPC_SECRET = read_conf("rpc-secret", "")
+RPC_URL = "http://127.0.0.1:" + RPC_PORT + "/jsonrpc"
+# 显式使用空代理，防止本地 127.0.0.1 请求被系统 http_proxy 劫持
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+TRANSPORT = ["urllib"]
+NOTES = []
+
+
+def build_body(method, params=None):
+    call_params = ["token:" + RPC_SECRET] if RPC_SECRET else []
+    if params:
+        call_params.extend(params)
+    return json.dumps({"jsonrpc": "2.0", "id": "archive_scan", "method": method, "params": call_params})
+
+
+def call_urllib(body):
+    req = urllib.request.Request(RPC_URL, data=body.encode("utf-8"), headers={"Content-Type": "application/json"})
+    try:
+        with OPENER.open(req, timeout=RPC_TIMEOUT) as resp:
+            return resp.read().decode("utf-8", "replace"), None
+    except urllib.error.HTTPError as exc:
+        return None, f"HTTP {exc.code}"
+    except urllib.error.URLError as exc:
+        return None, f"无法连接 127.0.0.1:{RPC_PORT} ({getattr(exc, 'reason', exc)})"
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def call_curl(body):
+    """curl 直连 RPC：绕过 urllib 可能遇到的代理 / SSL / 环境差异问题。"""
+    try:
+        proc = subprocess.run(["curl", "-sS", "-m", str(RPC_TIMEOUT), "--noproxy", "*", "-X", "POST",
+                               "-H", "Content-Type: application/json", "--data-binary", "@-", RPC_URL],
+                              input=body.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=RPC_TIMEOUT + 10)
+    except FileNotFoundError:
+        return None, "未找到 curl 命令"
+    except Exception as exc:
+        return None, f"curl 执行异常: {exc}"
+    if proc.returncode != 0:
+        return None, f"curl 退出码 {proc.returncode} ({proc.stderr.decode('utf-8', 'replace').strip()})"
+    return proc.stdout.decode("utf-8", "replace"), None
+
+
+def parse_response(raw):
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None, f"响应不是合法 JSON: {raw[:200]}"
+    if not isinstance(data, dict):
+        return None, "响应格式异常"
+    if data.get("error"):
+        err = data["error"] if isinstance(data["error"], dict) else {}
+        return None, f"RPC 拒绝请求 [{err.get('code', '?')}] {err.get('message', '')}"
+    return data.get("result"), None
+
 
 def rpc(method, params=None):
-    p = []
-    if secret:
-        p.append(f"token:{secret}")
-    if params:
-        p.extend(params)
-    payload = {"jsonrpc": "2.0", "id": "archive_fetch", "method": method, "params": p}
-    try:
-        req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
-        with opener.open(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data.get("result", [])
-    except Exception as e:
-        return []
+    """返回 (结果, 错误描述)；urllib 失败时自动回退 curl，绝不静默吞掉错误。"""
+    body = build_body(method, params)
+    if TRANSPORT[0] == "curl":
+        raw, err = call_curl(body)
+        if err is None:
+            return parse_response(raw)
+        return None, err
+    raw, err = call_urllib(body)
+    if err is None:
+        return parse_response(raw)
+    raw2, err2 = call_curl(body)
+    if err2 is None:
+        TRANSPORT[0] = "curl"
+        NOTES.append(f"urllib 直连失败 ({err})，已自动改用 curl 与 RPC 通信")
+        return parse_response(raw2)
+    return None, f"{err}；curl 回退亦失败: {err2}"
 
-# 1. 获取正在下载的任务 (Active)
-active_tasks = rpc("aria2.tellActive") or []
-# 2. 获取排队中的任务 (Waiting)
-waiting_tasks = rpc("aria2.tellWaiting", [0, 1000]) or []
-# 3. 获取已停止/已完成的任务 (Stopped)，必须传 [offset, num]
-stopped_tasks = rpc("aria2.tellStopped", [0, 2000]) or []
 
-confirmed_files = set()
-downloading_files = set()
-seeding_gids = set()
+def files_of(task):
+    files = task.get("files")
+    return files if isinstance(files, list) else []
 
-# 处理正在运行中的任务 (Active)
-for t in active_tasks:
-    gid = t.get("gid", "")
-    total = int(t.get("totalLength", 0))
-    completed = int(t.get("completedLength", 0))
-    seeder = t.get("seeder", "false")
-    files = t.get("files", [])
 
-    # 如果该任务已经 100% 下载完毕，当前正在做种 (Seed 状态)
-    if (total > 0 and completed >= total) or seeder == "true":
-        seeding_gids.add(gid)
-        for f in files:
-            path = f.get("path", "")
-            length = int(f.get("length", 0))
-            if path and length >= min_bytes:
-                confirmed_files.add(os.path.realpath(path))
-    else:
-        # 该任务正在下载中！名下所有文件（哪怕是下好的几十KB广告文本）一律拉黑排除
-        for f in files:
-            path = f.get("path", "")
-            if path:
-                downloading_files.add(os.path.realpath(path))
-
-# 处理排队中的任务 (Waiting) -> 视为未完成
-for t in waiting_tasks:
-    for f in t.get("files", []):
-        path = f.get("path", "")
+def task_name(task):
+    info = task.get("bittorrent")
+    if isinstance(info, dict):
+        inner = info.get("info")
+        if isinstance(inner, dict) and inner.get("name"):
+            return inner["name"]
+    for f in files_of(task):
+        path = f.get("path") or ""
         if path:
-            downloading_files.add(os.path.realpath(path))
+            return os.path.basename(path)
+    return task.get("gid") or "未知任务"
 
-# 处理已完成/已停止任务 (Stopped)
-for t in stopped_tasks:
-    status = t.get("status", "")
-    if status == "error":
+
+def task_progress(task):
+    total = 0
+    done = 0
+    for f in files_of(task):
+        total += num(f.get("length"))
+        done += num(f.get("completedLength"))
+    return total, done
+
+
+def is_completed(task):
+    """与 AriaNg 一致的完成判定: 做种中 / 状态为 complete / 任务级进度已跑满。"""
+    if task.get("seeder") == "true":
+        return True
+    if (task.get("status") or "") == "complete":
+        return True
+    total = num(task.get("totalLength"))
+    done = num(task.get("completedLength"))
+    return total > 0 and done >= total
+
+
+def inside_src(real_path):
+    if real_path == SRC_DIR:
+        return False
+    return real_path.startswith(SRC_DIR + os.sep)
+
+
+def status_text(status):
+    return STATUS_TEXT.get(status, status)
+
+
+version, ver_err = rpc("aria2.getVersion")
+if ver_err:
+    print(f"!! 无法从 Aria2 获取任务状态: {ver_err}", file=sys.stderr)
+    print(f"   RPC 端点: {RPC_URL}", file=sys.stderr)
+    if "Unauthorized" in ver_err or "拒绝请求" in ver_err:
+        print("   常见原因: aria2.conf 里的 rpc-secret 与正在运行的 Aria2 实际使用的密钥不一致。", file=sys.stderr)
+    else:
+        print("   常见原因: Aria2 服务未运行 / rpc-listen-port 与运行中的实例不一致 / 端口未监听。", file=sys.stderr)
+    sys.exit(1)
+
+lines = []
+version_text = "版本未知"
+if isinstance(version, dict):
+    version_text = version.get("version", "版本未知")
+secret_text = "已匹配 rpc-secret" if RPC_SECRET else "未设置 rpc-secret"
+lines.append(f">> RPC 连接正常: 127.0.0.1:{RPC_PORT} (aria2 {version_text}, {secret_text})")
+for note in NOTES:
+    lines.append(f">> 提示: {note}")
+
+groups = []
+incomplete_tasks = []
+seen_paths = set()
+skipped_missing = 0
+skipped_outside = 0
+query_errors = 0
+
+for method, params, label in (("aria2.tellActive", None, "进行中"),
+                              ("aria2.tellWaiting", [0, 1000], "等待/暂停"),
+                              ("aria2.tellStopped", [0, 2000], "已停止")):
+    tasks, err = rpc(method, params)
+    if err:
+        query_errors += 1
+        lines.append(f"   !! {method} 查询失败: {err}")
         continue
-    files = t.get("files", [])
-    for f in files:
-        path = f.get("path", "")
-        if not path:
+    if not isinstance(tasks, list):
+        tasks = []
+
+    counts = {}
+    completed_count = 0
+    for task in tasks:
+        status = task.get("status") or "?"
+        counts[status] = counts.get(status, 0) + 1
+        if not is_completed(task):
+            incomplete_tasks.append((task_name(task), status, task_progress(task)))
             continue
-        abs_p = os.path.realpath(path)
-        length = int(f.get("length", 0))
-        comp = int(f.get("completedLength", 0))
+        completed_count += 1
+        picked_files = []
+        for f in files_of(task):
+            path = f.get("path") or ""
+            if not path:
+                continue
+            real = os.path.realpath(path)
+            if real in seen_paths:
+                continue
+            if not inside_src(real):
+                skipped_outside += 1
+                continue
+            if not os.path.isfile(real):
+                skipped_missing += 1
+                continue
+            seen_paths.add(real)
+            picked_files.append(real)
+        if picked_files:
+            groups.append((task_name(task), status, task.get("gid") or "",
+                           picked_files, method != "aria2.tellStopped"))
 
-        # 文件体积大于门槛，且单文件进度达到 100%
-        if length >= min_bytes and comp >= length and comp > 0:
-            confirmed_files.add(abs_p)
+    counts_text = ", ".join(f"{status_text(key)}:{count}" for key, count in sorted(counts.items()))
+    lines.append(f">> {label}: 共 {len(tasks)} 个任务 ({counts_text or '无'}), 其中已 100% 完成 {completed_count} 个")
 
-print("RPC_OK:true")
-print("CONFIRMED:" + json.dumps(list(confirmed_files)))
-print("DOWNLOADING:" + json.dumps(list(downloading_files)))
-print("SEEDING_GIDS:" + json.dumps(list(seeding_gids)))
-EOF
-)
+if query_errors:
+    lines.append(f"   !! 有 {query_errors} 项 RPC 查询失败，任务清单可能不完整。")
 
-    local is_rpc_ok confirmed_json downloading_json seeding_gids_json
-    is_rpc_ok=$(echo "$scan_output" | grep "^RPC_OK:" || true)
-    confirmed_json=$(echo "$scan_output" | grep "^CONFIRMED:" | sed 's/^CONFIRMED://')
-    downloading_json=$(echo "$scan_output" | grep "^DOWNLOADING:" | sed 's/^DOWNLOADING://')
-    seeding_gids_json=$(echo "$scan_output" | grep "^SEEDING_GIDS:" | sed 's/^SEEDING_GIDS://')
+total_files = 0
+total_size = 0
+lines.append("")
+lines.append(f">> 源目录: {SRC_DIR}")
+if groups:
+    lines.append(f">> 以下任务已 100% 下载完成，可转移 ({len(groups)} 个):")
+    lines.append("--------------------------------------------------")
+    for index, group in enumerate(groups):
+        name, status, _gid, picked_files, _removable = group
+        size = 0
+        for path in picked_files:
+            try:
+                size += os.path.getsize(path)
+            except OSError:
+                pass
+        total_files += len(picked_files)
+        total_size += size
+        lines.append(f"   - [{status_text(status)}] {name}  ({len(picked_files)} 个文件 / {human(size)})")
+        if index < FILE_PREVIEW_LIMIT:
+            for path in picked_files[:5]:
+                lines.append(f"       · {os.path.relpath(path, SRC_DIR)}")
+            if len(picked_files) > 5:
+                lines.append(f"       · ... 以及其余 {len(picked_files) - 5} 个文件")
+    lines.append("--------------------------------------------------")
+    lines.append(f">> 合计: {len(groups)} 个任务 / {total_files} 个文件 / {human(total_size)}")
+else:
+    lines.append(">> 没有找到已完全下载完成的任务数据。")
 
-    declare -A CONFIRMED_MAP=()
-    if [ -n "$confirmed_json" ] && [ "$confirmed_json" != "[]" ]; then
-        while IFS= read -r c_path; do
-            [ -n "$c_path" ] && CONFIRMED_MAP["$c_path"]=1
-        done < <(python3 -c "import json; [print(x) for x in json.loads('''$confirmed_json''')]" 2>/dev/null)
-    fi
+if skipped_outside:
+    lines.append(f">> 提示: 有 {skipped_outside} 个已完成文件不在源目录内，已跳过。")
+if skipped_missing:
+    lines.append(f">> 提示: 有 {skipped_missing} 个已完成文件在磁盘上不存在，已跳过。")
 
-    declare -A DOWNLOADING_MAP=()
-    if [ -n "$downloading_json" ] && [ "$downloading_json" != "[]" ]; then
-        while IFS= read -r d_path; do
-            [ -n "$d_path" ] && DOWNLOADING_MAP["$d_path"]=1
-        done < <(python3 -c "import json; [print(x) for x in json.loads('''$downloading_json''')]" 2>/dev/null)
-    fi
+if incomplete_tasks and not groups:
+    lines.append("")
+    lines.append(">> Aria2 中未判定为完成的任务 (最多显示 15 个，便于与 AriaNg 对照):")
+    for name, status, progress in incomplete_tasks[:15]:
+        total, done = progress
+        percent = (done * 100.0 / total) if total > 0 else 0.0
+        lines.append(f"   - [{status_text(status)}] {name}  {percent:.1f}%")
+    if len(incomplete_tasks) > 15:
+        lines.append(f"   ... 以及其余 {len(incomplete_tasks) - 15} 个任务")
 
-    # 扫描磁盘上所有属于正在下载特征的 .aria2 控制文件（物理层面二次防误判）
-    declare -A DISK_CONTROL_MARKS=()
-    while IFS= read -r ctl; do
-        local abs_c
-        abs_c=$(readlink -f "$ctl" 2>/dev/null || echo "$ctl")
-        DISK_CONTROL_MARKS["$abs_c"]=1
-        DISK_CONTROL_MARKS["${abs_c%.aria2}"]=1
-    done < <(find "${SRC_DIR}" -type f -name "*.aria2" 2>/dev/null)
+# 先落盘再输出报告: 即使报告文本出错，也不会影响已确认的转移清单
+with open(os.path.join(OUT_DIR, "files.list"), "wb") as fh:
+    for _name, _status, _gid, picked_files, _removable in groups:
+        for path in picked_files:
+            fh.write(os.path.relpath(path, SRC_DIR).encode("utf-8", "surrogateescape") + b"\x00")
 
-    declare -a COMPLETED_ITEMS=()
-    local real_src
-    real_src=$(readlink -f "${SRC_DIR}" 2>/dev/null || echo "${SRC_DIR}")
+with open(os.path.join(OUT_DIR, "gids.list"), "wb") as fh:
+    for _name, _status, gid, _picked_files, removable in groups:
+        if gid and removable:
+            fh.write(gid.encode("utf-8", "surrogateescape") + b"\x00")
 
-    # 深度遍历源目录下的物理实体文件
-    while IFS= read -r f; do
-        local base_f
-        base_f=$(basename "$f")
+for line in lines:
+    print(line)
+PYEOF
 
-        # 忽略元数据、种子和 .aria2
-        [[ "$base_f" == .* ]] && continue
-        [[ "$base_f" == *.torrent ]] && continue
-        [[ "$base_f" == *.aria2 ]] && continue
-
-        local real_f
-        real_f=$(readlink -f "$f" 2>/dev/null || echo "$f")
-
-        # 必须是非空实体文件
-        [ ! -s "$real_f" ] && continue
-
-        # 规则 1: 坚决排除属于正在下载任务中的切片/广告文件
-        if [[ -n "${DOWNLOADING_MAP[$real_f]}" ]]; then
-            continue
-        fi
-
-        # 规则 2: 文件本身带有同名 .aria2 控制文件，坚决跳过
-        if [ -f "${f}.aria2" ] || [[ -n "${DISK_CONTROL_MARKS[$real_f]}" ]]; then
-            continue
-        fi
-
-        # 规则 3: 体积检查，必须满足门槛（默认 50MB）
-        local f_size
-        f_size=$(stat -c %s "$f" 2>/dev/null || stat -f %z "$f" 2>/dev/null || echo 0)
-        if [ "$f_size" -lt "$min_bytes" ]; then
-            continue
-        fi
-
-        # 规则 4: 检查多层级父目录是否带有 .aria2 控制文件（代表上层 BT 正在下载中）
-        local parent_dir
-        parent_dir=$(dirname "$real_f")
-        local is_parent_busy=false
-        while [ "$parent_dir" != "$real_src" ] && [ "$parent_dir" != "/" ]; do
-            if [ -f "${parent_dir}.aria2" ] || [[ -n "${DISK_CONTROL_MARKS[${parent_dir}.aria2]}" ]]; then
-                is_parent_busy=true
-                break
-            fi
-            parent_dir=$(dirname "$parent_dir")
-        done
-
-        # 如果父级在下载中，且该子文件不在 Aria2 已完成白名单内，坚决跳过
-        if [ "$is_parent_busy" = true ] && [[ -z "${CONFIRMED_MAP[$real_f]}" ]]; then
-            continue
-        fi
-
-        # 判定成功：加入转移清单
-        COMPLETED_ITEMS+=("${real_f#"${real_src}/"}")
-    done < <(find "${SRC_DIR}" -type f)
-
-    local ITEM_COUNT=${#COMPLETED_ITEMS[@]}
-    if [ "$ITEM_COUNT" -eq 0 ]; then
+    if [ "$scan_rc" -ne 0 ]; then
         echo ""
-        echo ">> 提示: 未在 ${SRC_DIR} 下找到任何 >= ${MIN_ARCHIVE_MB}MB 且 100% 下载完毕的有效文件。"
-        echo "   (排查建议: 若文件小于 ${MIN_ARCHIVE_MB}MB 请在提示时调小数值，或者检查源目录是否输入正确)"
+        echo ">> [失败] 未能从 Aria2 取得任务状态，未做任何转移。请按上方提示排查后重试。"
+        echo "   ---- 诊断信息 ----"
+        echo "   使用的配置文件: ${CONF_FILE}"
+        if [ -n "${running_aria2}" ]; then
+            echo "   运行中的 Aria2: ${running_aria2}"
+        else
+            echo "   运行中的 Aria2: 未检测到 aria2c 进程"
+        fi
+        if command -v ss >/dev/null 2>&1; then
+            local listen_ports
+            listen_ports=$(ss -tln 2>/dev/null | grep -oE '(127\.0\.0\.1|0\.0\.0\.0|\*):[0-9]+' | sort -u | paste -sd ' ' - 2>/dev/null || true)
+            if [ -n "${listen_ports}" ]; then
+                echo "   本机监听端口: ${listen_ports}"
+            fi
+        fi
+        echo "   ------------------"
+        rm -rf "${scan_tmp}"
+        return 1
+    fi
+
+    declare -a COMPLETED_FILES=()
+    if [ -s "${files_file}" ]; then
+        if ! mapfile -d '' -t COMPLETED_FILES < "${files_file}" 2>/dev/null; then
+            echo "   !! 当前 bash 版本过低 (需要 4.4+ 才能按 NUL 解析文件清单)，请升级 bash 后重试。"
+            rm -rf "${scan_tmp}"
+            return 1
+        fi
+    fi
+
+    local FILE_COUNT=${#COMPLETED_FILES[@]}
+    if [ "$FILE_COUNT" -eq 0 ]; then
+        echo ""
+        echo ">> 没有可转移的数据: Aria2 中没有已 100% 完成、且数据位于 ${SRC_DIR} 内的任务。"
+        echo "   (对比上方各项统计: 若 AriaNg 明明显示已完成却统计为 0，说明脚本连到的 Aria2 实例与 AriaNg 不是同一个，或源目录选错了。)"
+        rm -rf "${scan_tmp}"
         return 0
     fi
 
     echo ""
-    echo ">> 检索成功！共找到以下 ${ITEM_COUNT} 个 100% 已完结的文件 (>= ${MIN_ARCHIVE_MB}MB):"
-    echo "--------------------------------------------------"
-    local show_limit=30
-    for ((i=0; i<ITEM_COUNT && i<show_limit; i++)); do
-        echo "   - ${COMPLETED_ITEMS[$i]}"
-    done
-    if [ "$ITEM_COUNT" -gt "$show_limit" ]; then
-        echo "   ... 以及其余 $((ITEM_COUNT - show_limit)) 项"
-    fi
-    echo "--------------------------------------------------"
-
-    read -rp "确认开始断点同步移动以上已完成数据到 ${DEST_DIR}? [Y/n 默认: Y]: " CONFIRM_MOVE
+    read -rp "确认开始同步移动以上已完成任务的数据到 ${DEST_DIR}? [Y/n 默认: Y]: " CONFIRM_MOVE
     CONFIRM_MOVE="${CONFIRM_MOVE:-Y}"
     if [[ ! "$CONFIRM_MOVE" =~ ^[Yy]$ ]]; then
         echo ">> 操作已取消。"
+        rm -rf "${scan_tmp}"
         return 0
     fi
 
-    # 如果有正处于做种状态的任务，先通过 RPC 安全解除占用
-    if [ -n "$seeding_gids_json" ] && [ "$seeding_gids_json" != "[]" ]; then
-        echo ">> 正在安全解除相关做种任务的文件占用..."
-        python3 - <<EOF 2>/dev/null || true
-import json, urllib.request
-port = "${rpc_port}"
-secret = "${rpc_secret}"
-url = f"http://127.0.0.1:{port}/jsonrpc"
-opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-gids = json.loads('''$seeding_gids_json''')
-for g in gids:
-    p = []
-    if secret: p.append(f"token:{secret}")
-    p.append(g)
-    payload = {"jsonrpc": "2.0", "id": "stop_seed", "method": "aria2.forceRemove", "params": p}
+    # 做种中 / 已暂停的完成任务仍被 Aria2 占用着文件，先通过 RPC 安全解除占用
+    if [ -s "${gids_file}" ]; then
+        echo ">> 正在安全解除做种 / 暂停任务的文件占用..."
+        ARIA2_CONF_FILE="${CONF_FILE}" ARIA2_GIDS_FILE="${gids_file}" python3 - <<'PYEOF' || true
+import json
+import os
+import subprocess
+import urllib.request
+
+
+def read_conf(key, default):
     try:
-        req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
-        opener.open(req, timeout=3)
-    except Exception: pass
-EOF
+        with open(os.environ.get("ARIA2_CONF_FILE", ""), "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key_name, value = line.split("=", 1)
+                if key_name.strip() == key:
+                    return value.strip()
+    except OSError:
+        pass
+    return default
+
+
+port = read_conf("rpc-listen-port", "6800") or "6800"
+secret = read_conf("rpc-secret", "")
+url = "http://127.0.0.1:" + port + "/jsonrpc"
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+with open(os.environ["ARIA2_GIDS_FILE"], "rb") as fh:
+    gids = [item.decode("utf-8", "surrogateescape") for item in fh.read().split(b"\x00") if item]
+
+results = []
+
+
+def remove_gid(gid):
+    call_params = ["token:" + secret] if secret else []
+    call_params.append(gid)
+    body = json.dumps({"jsonrpc": "2.0", "id": "stop_seed", "method": "aria2.forceRemove", "params": call_params})
+    try:
+        req = urllib.request.Request(url, data=body.encode("utf-8"), headers={"Content-Type": "application/json"})
+        with opener.open(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        if isinstance(data, dict) and data.get("error"):
+            err = data["error"] if isinstance(data["error"], dict) else {}
+            return f"RPC 拒绝: {err.get('message', '')}"
+        return ""
+    except Exception:
+        pass
+    try:
+        proc = subprocess.run(["curl", "-sS", "-m", "10", "--noproxy", "*", "-X", "POST",
+                               "-H", "Content-Type: application/json", "--data-binary", "@-", url],
+                              input=body.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=20)
+        if proc.returncode != 0:
+            return f"curl 退出码 {proc.returncode}"
+        data = json.loads(proc.stdout.decode("utf-8", "replace"))
+        if isinstance(data, dict) and data.get("error"):
+            err = data["error"] if isinstance(data["error"], dict) else {}
+            return f"RPC 拒绝: {err.get('message', '')}"
+        return ""
+    except Exception as exc:
+        return f"异常: {exc}"
+
+
+removed = 0
+for gid in gids:
+    failure = remove_gid(gid)
+    if failure:
+        results.append(f"   !! GID {gid} 解除占用失败: {failure}")
+    else:
+        removed += 1
+results.append(f">> 已解除 {removed} / {len(gids)} 个任务的占用。")
+
+for line in results:
+    print(line)
+PYEOF
     fi
 
     echo ">> 正在同步数据并保持相对目录层级结构..."
     (
         cd "${SRC_DIR}"
-        for it in "${COMPLETED_ITEMS[@]}"; do
+        for it in "${COMPLETED_FILES[@]}"; do
             echo "   -> 正在转移: ${it}..."
             rsync -avP --partial -R "${it}" "${DEST_DIR}/"
         done
     )
 
     echo ""
-    echo ">> [成功] 数据已全部完整同步到目标新磁盘！"
+    echo ">> [成功] 已完成任务的数据已全部同步到目标新磁盘！"
     read -rp "是否彻底删除原路径 (${SRC_DIR}) 上已转移的文件以释放空间? [Y/n 默认: Y]: " CLEAN_SRC
     CLEAN_SRC="${CLEAN_SRC:-Y}"
     if [[ "$CLEAN_SRC" =~ ^[Yy]$ ]]; then
         echo ">> 正在清理原路径上的已转移数据..."
-        for it in "${COMPLETED_ITEMS[@]}"; do
+        for it in "${COMPLETED_FILES[@]}"; do
             rm -f "${SRC_DIR}/${it}"
         done
         find "${SRC_DIR}" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+
+        # 数据已不在原盘上的 .aria2 控制标记属于失效碎片，一并清掉
+        while IFS= read -r ctl; do
+            if [ ! -e "${ctl%.aria2}" ]; then
+                rm -f "$ctl"
+            fi
+        done < <(find "${SRC_DIR}" -type f -name "*.aria2" 2>/dev/null)
+
         echo ">> 原磁盘空间已释放！所有正在下载的任务继续正常运行。"
     else
         echo ">> 已保留源磁盘上的文件。"
     fi
+
+    rm -rf "${scan_tmp}"
 }
 
 # ==================== 模块 8: 扫描并恢复未完成种子任务 ====================
@@ -2413,7 +2631,7 @@ while true; do
     echo " 4. 启用 / 停用 Trackers 自动更新"
     echo " 5. BT 吸血 Peer 防火墙拦截管理 (ipset+iptables / 默认开启 / 每日更新)"
     echo " 6. 迁移下载任务到新磁盘 (迁移 未完成 / 全部 任务并切换工作路径)"
-    echo " 7. 转移已完成下载到新磁盘 (支持大小筛选 / 识别已完结 / 排除下载中广告)"
+    echo " 7. 转移已完成下载到新磁盘 (以 Aria2 完成状态为准 / 含做种与已暂停任务)"
     echo " 8. 扫描目录并恢复未完成种子断点下载"
     echo " 9. Aria2 实用辅助与清理工具箱 (清理已完成种子 / 碎片清理 / 健康自检)"
     echo " 10. Aria2 日志排查与故障分析 (实时日志 / 崩溃溯源 / 前台单测)"
