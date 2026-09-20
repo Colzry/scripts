@@ -35,16 +35,36 @@ DEFAULT_ARIANG_PORT="6880"
 GH_PROXY="https://gitpy.223327.xyz/https://github.com"
 ARIANG_DIR="${ARIA2_CONF_DIR}/ariang"
 
-# ==================== 基础依赖检测 ====================
+# ==================== 基础依赖检测 (仅缺失时精准安装，不刷源) ====================
 install_packages() {
     local pkgs=("$@")
-    echo ">> 检查并安装依赖: ${pkgs[*]}..."
+    local missing_pkgs=()
+
+    for pkg in "${pkgs[@]}"; do
+        if command -v apt-get &>/dev/null; then
+            if ! dpkg -s "$pkg" &>/dev/null; then
+                missing_pkgs+=("$pkg")
+            fi
+        elif ! command -v "$pkg" &>/dev/null; then
+            missing_pkgs+=("$pkg")
+        fi
+    done
+
+    if [ ${#missing_pkgs[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    echo ">> 发现缺少依赖，正在安装: ${missing_pkgs[*]}..."
     if command -v apt-get &>/dev/null; then
-        ${SUDO_CMD} apt-get update -y && ${SUDO_CMD} apt-get install -y "${pkgs[@]}"
+        ${SUDO_CMD} apt-get install -y --no-install-recommends "${missing_pkgs[@]}" || {
+            echo ">> 尝试单包更新并重装..."
+            ${SUDO_CMD} apt-get update -o Dir::Etc::sourcelist="sources.list" -y || true
+            ${SUDO_CMD} apt-get install -y "${missing_pkgs[@]}"
+        }
     elif command -v pacman &>/dev/null; then
-        ${SUDO_CMD} pacman -Sy --noconfirm "${pkgs[@]}"
+        ${SUDO_CMD} pacman -Sy --noconfirm "${missing_pkgs[@]}"
     elif command -v dnf &>/dev/null; then
-        ${SUDO_CMD} dnf install -y "${pkgs[@]}"
+        ${SUDO_CMD} dnf install -y "${missing_pkgs[@]}"
     fi
 }
 
@@ -116,11 +136,10 @@ ensure_caddy() {
 
     echo ">> 正在安装 Caddy..."
     if command -v apt-get &>/dev/null; then
-        ${SUDO_CMD} apt-get update -y
         ${SUDO_CMD} apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gpg
         curl -1sLf --connect-timeout 10 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | ${SUDO_CMD} gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
         curl -1sLf --connect-timeout 10 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | ${SUDO_CMD} tee /etc/apt/sources.list.d/caddy-stable.list
-        ${SUDO_CMD} apt-get update -y
+        ${SUDO_CMD} apt-get update -o Dir::Etc::sourcelist="sources.list.d/caddy-stable.list" -y || ${SUDO_CMD} apt-get update -y
         ${SUDO_CMD} apt-get install -y caddy
     elif command -v pacman &>/dev/null; then
         ${SUDO_CMD} pacman -Sy --noconfirm caddy
@@ -1189,7 +1208,7 @@ migrate_downloads() {
     fi
 }
 
-# ==================== 模块 7: 转移已完成文件到外部/新磁盘 (深度扫描/排除种子/保持目录结构) ====================
+# ==================== 模块 7: 转移已完成文件到外部/新磁盘 (深度扫描与精准排除) ====================
 archive_completed_files() {
     echo ""
     echo "=========================================="
@@ -1230,12 +1249,28 @@ archive_completed_files() {
 
     echo ""
     echo "请选择转移范围模式:"
-    echo " 1. 转移所有已下载完毕的文件及文件夹 (推荐: 自身下载完成即转移，保持原有子目录结构)"
-    echo " 2. 仅转移完全完成的顶级文件夹与独立文件 (整任务全部文件完工才转移)"
+    echo " 1. 精准转移已完成的媒体数据 (排除未完工、0 字节及 .torrent 种子，保持子目录结构)"
+    echo " 2. 仅转移完全完成的顶级任务文件夹与独立文件 (整任务全部文件完工才转移)"
     read -rp "请选择 [1-2 默认: 1]: " ARCHIVE_MODE
     ARCHIVE_MODE="${ARCHIVE_MODE:-1}"
 
-    echo ">> 正在安全分析 ${SRC_DIR} 中完全已下载完成的内容 (排除活跃下载块与 .torrent 种子)..."
+    echo ">> 正在深度分析 ${SRC_DIR} 下的文件状态..."
+
+    # 构建未完成任务关联特征黑名单
+    declare -A INCOMPLETE_PATHS
+    while IFS= read -r ctl; do
+        # 1. 控制文件自身路径
+        INCOMPLETE_PATHS["$ctl"]=1
+        # 2. 控制文件对应的主数据文件
+        local target_f="${ctl%.aria2}"
+        INCOMPLETE_PATHS["$target_f"]=1
+        # 3. 若多文件 BT 任务带有专属控制文件，记录其父目录特征
+        local dir_path
+        dir_path=$(dirname "$ctl")
+        if [ "$dir_path" != "$SRC_DIR" ]; then
+            INCOMPLETE_PATHS["$dir_path"]=1
+        fi
+    done < <(find "${SRC_DIR}" -type f -name "*.aria2")
 
     declare -a COMPLETED_ITEMS=()
 
@@ -1243,11 +1278,24 @@ archive_completed_files() {
         while IFS= read -r f; do
             local base_f
             base_f=$(basename "$f")
+            
+            # 基础黑名单过滤: 隐藏文件、torrent文件、aria2控制文件
             [[ "$base_f" == .* ]] && continue
             [[ "$base_f" == *.torrent ]] && continue
             [[ "$base_f" == *.aria2 ]] && continue
 
+            # 严格排除命中未完成黑名单的文件及所在目录
+            if [[ -n "${INCOMPLETE_PATHS[$f]}" ]]; then
+                continue
+            fi
             if [ -f "${f}.aria2" ]; then
+                continue
+            fi
+
+            # 排除 0 字节空占位文件 (未下载完毕经常表现为空文件)
+            local f_size
+            f_size=$(stat -c %s "$f" 2>/dev/null || stat -f %z "$f" 2>/dev/null || echo 0)
+            if [ "$f_size" -le 0 ]; then
                 continue
             fi
 
@@ -1278,12 +1326,12 @@ archive_completed_files() {
 
     local ITEM_COUNT=${#COMPLETED_ITEMS[@]}
     if [ "$ITEM_COUNT" -eq 0 ]; then
-        echo ">> 提示: 未检索到任何完全下载完成的媒体数据 (可能都在下载中或已被转移)。"
+        echo ">> 提示: 未检索到任何完全下载完成的媒体数据 (所有内容均在活跃下载中或已被转移)。"
         return 0
     fi
 
     echo ""
-    echo ">> 检索到以下 ${ITEM_COUNT} 个已完成项可转移:"
+    echo ">> 检索到以下 ${ITEM_COUNT} 个已完成文件可转移:"
     echo "--------------------------------------------------"
     local show_limit=25
     for ((i=0; i<ITEM_COUNT && i<show_limit; i++)); do
@@ -1320,7 +1368,7 @@ archive_completed_files() {
             rm -rf "${SRC_DIR}/${it}"
         done
         find "${SRC_DIR}" -mindepth 1 -type d -empty -delete 2>/dev/null || true
-        echo ">> 原磁盘已完成内容已清除，空间已成功释放！剩余未完成任务继续正常下载。"
+        echo ">> 原磁盘已完成内容已清除，空间成功释放！未完成的任务继续正常下载。"
     else
         echo ">> 已保留源磁盘上的文件。"
     fi
@@ -2173,7 +2221,7 @@ while true; do
     echo " 12. 单独卸载 AriaNg 前端"
     echo " 13. 完整卸载 (Aria2 + AriaNg + 防火墙规则 + 服务全清)"
     echo " 14. BT 自动筛选下载管理 (支持按大小及自定义后缀过滤)"
-    echo " 15. 扫描并清理下载目录下的小文件"
+    echo " 15. 扫描并清理下载目录下的小文件 (支持翻页预览 / 防误删)"
     echo " 0. 退出"
     echo "=========================================="
     read -rp "请选择操作 [0-15]: " MENU_CHOICE
