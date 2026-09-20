@@ -11,6 +11,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+BOLD='\033[1m'
 NC='\033[0m'
 
 ACME_HOME="${HOME}/.acme.sh"
@@ -40,7 +41,168 @@ CERTS_DIR="${CONFIG_DIR}/certs"
 CLIENT_SERVICE_FILE="${SYSTEMD_DIR}/rathole-client@.service"
 SERVER_SERVICE_FILE="${SYSTEMD_DIR}/rathole-server@.service"
 
+# ======================= 交互状态文本辅助函数 =======================
+# 执行身份说明文本 (Root 系统级 / 普通用户 用户级)
+rathole_mode_text() {
+    if [[ "$IS_ROOT" == true ]]; then
+        printf 'Root (系统级服务)'
+    else
+        printf '普通用户 %s (用户级服务)' "${USER:-$(id -un 2>/dev/null || printf 'user')}"
+    fi
+}
+
+# 是否已安装 (以可执行文件为准)
+rathole_installed() {
+    [[ -x "$BIN_PATH" ]]
+}
+
+# 版本号文本 (仅保留版本号, 未安装或解析失败时输出 未安装)
+rathole_version_text() {
+    local out=""
+    if rathole_installed; then
+        out=$("$BIN_PATH" --version 2>/dev/null | head -n1) || out=""
+    fi
+    out="${out//$'\r'/}"
+    out=$(printf '%s' "$out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.+-]*' | head -n1 || true)
+    if [[ -n "$out" ]]; then
+        printf '%s' "$out"
+    else
+        printf '未安装'
+    fi
+}
+
+# 配置文件数量 ($CONFIG_DIR/*.toml)
+rathole_config_count() {
+    local files=("$CONFIG_DIR"/*.toml)
+    if [[ ! -e "${files[0]}" ]]; then
+        printf '0'
+    else
+        printf '%s' "${#files[@]}"
+    fi
+}
+
+# 汇总所有实例名 (配置文件为准, systemd 单元兜底, 去重排序)
+rathole_instance_names() {
+    local -a names=()
+    local f="" name="" unit=""
+
+    for f in "$CONFIG_DIR"/*.toml; do
+        [[ -e "$f" ]] || continue
+        name=$(basename "$f" .toml)
+        [[ -n "$name" ]] || continue
+        names+=("$name")
+    done
+
+    while IFS= read -r unit; do
+        [[ -n "$unit" ]] || continue
+        name="${unit%.service}"
+        name="${name#rathole-client@}"
+        name="${name#rathole-server@}"
+        [[ -n "$name" ]] || continue
+        names+=("$name")
+    done < <($SYSTEMCTL_CMD list-units --type=service --all --no-legend 2>/dev/null \
+        | awk '/rathole-client@|rathole-server@/{for (i = 1; i <= NF; i++) if ($i ~ /^rathole-(client|server)@/) { print $i; break }}' || true)
+
+    if [[ ${#names[@]} -eq 0 ]]; then
+        return 0
+    fi
+    printf '%s\n' "${names[@]}" | sort -u
+}
+
+# 统计实例状态: 输出 "运行中数 实例总数 已自启数"
+# 同一实例名对应 client/server 两个单元, 任一运行即视为该实例运行中
+rathole_instance_stats() {
+    local -a names=()
+    local name="" unit="" running=0 total=0 enabled=0 is_run=false is_en=false
+
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        names+=("$name")
+    done < <(rathole_instance_names)
+
+    total=${#names[@]}
+    if (( total > 0 )); then
+        for name in "${names[@]}"; do
+            is_run=false
+            is_en=false
+            for unit in "rathole-client@${name}" "rathole-server@${name}"; do
+                if $SYSTEMCTL_CMD is-active --quiet "$unit" 2>/dev/null; then
+                    is_run=true
+                fi
+                if $SYSTEMCTL_CMD is-enabled --quiet "$unit" 2>/dev/null; then
+                    is_en=true
+                fi
+            done
+            if [[ "$is_run" == true ]]; then
+                running=$((running + 1))
+            fi
+            if [[ "$is_en" == true ]]; then
+                enabled=$((enabled + 1))
+            fi
+        done
+    fi
+
+    printf '%s %s %s\n' "$running" "$total" "$enabled"
+}
+
+# 实例运行状态文本
+rathole_service_state_text() {
+    if ! rathole_installed; then
+        printf '%b' "${YELLOW}未安装${NC}"
+        return 0
+    fi
+
+    local stats="" running=0 total=0
+    stats=$(rathole_instance_stats)
+    running="${stats%% *}"
+    total="${stats#* }"
+    total="${total%% *}"
+    running="${running:-0}"
+    total="${total:-0}"
+
+    if (( total == 0 )); then
+        printf '%b' "${YELLOW}未配置${NC} (共 ${total} 个实例)"
+    elif (( running == total )); then
+        printf '%b' "${GREEN}运行中 ${running}/${total}${NC}"
+    elif (( running == 0 )); then
+        printf '%b' "${RED}已停止 0/${total}${NC}"
+    else
+        printf '%b' "${YELLOW}部分运行 ${running}/${total}${NC}"
+    fi
+}
+
+# 实例开机自启状态文本
+rathole_boot_state_text() {
+    if ! rathole_installed; then
+        printf '%b' "${YELLOW}未安装${NC}"
+        return 0
+    fi
+
+    local stats="" enabled=0 total=0
+    stats=$(rathole_instance_stats)
+    enabled="${stats##* }"
+    total="${stats#* }"
+    total="${total%% *}"
+    enabled="${enabled:-0}"
+    total="${total:-0}"
+
+    if (( total == 0 )); then
+        printf '%b' "${RED}已停用 0/0${NC}"
+    elif (( enabled == total )); then
+        printf '%b' "${GREEN}已启用 ${enabled}/${total}${NC}"
+    elif (( enabled == 0 )); then
+        printf '%b' "${RED}已停用 0/${total}${NC}"
+    else
+        printf '%b' "${YELLOW}部分启用 ${enabled}/${total}${NC}"
+    fi
+}
+
 # ======================= 交互校验工具函数 =======================
+pause_menu() {
+    local __dummy=""
+    read -rp "按回车键返回菜单..." __dummy || exit 0
+}
+
 prompt_required() {
     local prompt_msg="$1"
     local var_name="$2"
@@ -1122,35 +1284,124 @@ manage_services() {
     esac
 }
 
+# ======================= 完整卸载 Rathole =======================
+uninstall_rathole() {
+    echo ""
+    echo "=========================================="
+    echo -e "          ${BOLD}卸载 Rathole${NC}"
+    echo "=========================================="
+    echo "执行身份: $(rathole_mode_text)"
+
+    if ! rathole_installed; then
+        echo -e "${YELLOW}[-] 未检测到已安装的 Rathole。${NC}"
+        return 0
+    fi
+
+    local confirm=""
+    read -rp "确定要卸载 Rathole 吗? [y/N]: " confirm || true
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}已取消卸载。${NC}"
+        return 0
+    fi
+
+    echo "[1/4] 停止并禁用所有实例服务..."
+    local -a units=()
+    local f="" name="" unit=""
+    for f in "$CONFIG_DIR"/*.toml; do
+        [[ -e "$f" ]] || continue
+        name=$(basename "$f" .toml)
+        [[ -n "$name" ]] || continue
+        units+=("rathole-client@${name}" "rathole-server@${name}")
+    done
+    # 兜底补充：配置文件已被删除但 systemd 单元仍残留的情况
+    while IFS= read -r unit; do
+        [[ -n "$unit" ]] || continue
+        units+=("$unit")
+    done < <($SYSTEMCTL_CMD list-units --type=service --all --no-legend 2>/dev/null \
+        | awk '/rathole-client@|rathole-server@/{for (i = 1; i <= NF; i++) if ($i ~ /^rathole-(client|server)@/) { print $i; break }}' || true)
+
+    if [[ ${#units[@]} -gt 0 ]]; then
+        for unit in "${units[@]}"; do
+            $SYSTEMCTL_CMD stop "$unit" 2>/dev/null || true
+            $SYSTEMCTL_CMD disable "$unit" 2>/dev/null || true
+        done
+    fi
+
+    echo "[2/4] 清除 systemd 模板单元与二进制文件..."
+    rm -f "$CLIENT_SERVICE_FILE" "$SERVER_SERVICE_FILE"
+    $SYSTEMCTL_CMD daemon-reload 2>/dev/null || true
+    $SYSTEMCTL_CMD reset-failed 'rathole-client@*' 'rathole-server@*' 2>/dev/null || true
+    rm -f "$BIN_PATH"
+
+    echo "[3/4] 处理配置目录 (含 certs 与 PKCS#12 产物)..."
+    local del_conf=""
+    read -rp "是否删除配置目录 ${CONFIG_DIR} (含 certs 与 PKCS#12 产物)? [y/N]: " del_conf || true
+    if [[ "$del_conf" =~ ^[Yy]$ ]]; then
+        if [[ -z "$CONFIG_DIR" || "$CONFIG_DIR" == "/" || "$CONFIG_DIR" == "/root" || "$CONFIG_DIR" == "/etc" || "$CONFIG_DIR" == "/usr" || "$CONFIG_DIR" == "/var" || "$CONFIG_DIR" == "/home" || "$CONFIG_DIR" == "$HOME" ]]; then
+            echo -e "${RED}警告: 检测到关键系统/家目录，禁止整目录删除！请手动处理其中的文件。${NC}"
+        elif [[ ! -d "$CONFIG_DIR" ]]; then
+            echo -e "${YELLOW}[-] 配置目录不存在，跳过删除。${NC}"
+        else
+            rm -rf "$CONFIG_DIR"
+            echo -e "${GREEN}[✓] 已删除配置目录: ${CONFIG_DIR}${NC}"
+        fi
+    else
+        echo "[-] 保留配置目录: ${CONFIG_DIR}"
+    fi
+
+    echo "[4/4] 清理完成。"
+    echo -e "${YELLOW}提示: acme.sh 的续期 Hook 不会随本次卸载自动清理，可稍后使用菜单 6 进行清理。${NC}"
+
+    echo ""
+    echo "=========================================="
+    echo -e "        ${GREEN}Rathole 已成功卸载完成！${NC}"
+    echo "=========================================="
+    return 0
+}
+
 # ======================= 主菜单 =======================
 menu() {
+    local choice=""
     while true; do
-        local mode_desc="[Root 系统全局模式]"
-        if [[ "$IS_ROOT" == false ]]; then
-            mode_desc="[非 Root 用户模式 (${USER})]"
-        fi
-
-        echo -e "\n${GREEN}================ Rathole 多实例管理面板 ${mode_desc} ================${NC}"
-        echo "1. 检查最新版本并安装/更新 Rathole"
-        echo "2. 添加新的主配置文件 (新建通道与基础服务)"
-        echo "3. 向现有配置追加转发端口/服务"
-        echo "4. 删除配置文件并清理服务"
-        echo "5. 服务启停控制与状态看板 (支持运行/自启管理)"
-        echo "6. Acme.sh 证书申请与管理 (支持 PKCS#12 转换与续期挂载)"
-        echo "0. 退出管理脚本"
-        echo "========================================================================="
-        read -rp "请输入序号 [0-6]: " choice
+        echo ""
+        echo "=========================================="
+        echo -e "   ${BOLD}Rathole 管理脚本${NC}"
+        echo "   身份: $(rathole_mode_text)"
+        echo "   版本: $(rathole_version_text)"
+        echo "=========================================="
+        echo -e " 服务状态: $(rathole_service_state_text)    开机自启: $(rathole_boot_state_text)"
+        echo " 配置文件数量: $(rathole_config_count)    配置目录: ${CONFIG_DIR}    二进制: ${BIN_PATH}"
+        echo "------------------------------------------"
+        echo " 1. 检查最新版本并安装/更新 Rathole"
+        echo " 2. 添加新的主配置文件 (新建通道与基础服务)"
+        echo " 3. 向现有配置追加转发端口/服务"
+        echo " 4. 删除配置文件并清理服务"
+        echo " 5. 服务启停控制与状态看板 (支持运行/自启管理)"
+        echo " 6. Acme.sh 证书申请与管理 (支持 PKCS#12 转换与续期挂载)"
+        echo " 7. 完整卸载 Rathole (停止并删除所有实例服务/单元/二进制)"
+        echo " 0. 退出"
+        echo "=========================================="
+        read -rp "请输入操作编号 [0-7 默认: 0]: " choice
+        choice="${choice:-0}"
 
         case "$choice" in
-            1) install_or_update ;;
-            2) add_config ;;
-            3) append_service_config ;;
-            4) delete_config ;;
-            5) manage_services ;;
-            6) acme_manager ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}输入无效，请重新输入。${NC}" ;;
+            1) install_or_update || true ;;
+            2) add_config || true ;;
+            3) append_service_config || true ;;
+            4) delete_config || true ;;
+            5) manage_services || true ;;
+            6) acme_manager || true ;;
+            7) uninstall_rathole || true ;;
+            0)
+                echo "退出脚本。"
+                exit 0
+                ;;
+            *) echo -e "${RED}输入无效，请重新选择。${NC}" ;;
         esac
+
+        if [[ "$choice" != "0" ]]; then
+            pause_menu
+        fi
     done
 }
 

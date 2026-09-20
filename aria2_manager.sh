@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
 set -e
 
+# ---------------------------- 终端色彩定义 ----------------------------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
 # ==================== 环境与权限自适应 ====================
-CURRENT_USER="$USER"
+# 当前执行用户（精简环境下可能不存在 USER 变量）
+CURRENT_USER="${USER:-$(id -un 2>/dev/null || printf 'user')}"
 USER_HOME="$HOME"
 IS_ROOT=false
 
@@ -70,14 +80,44 @@ install_packages() {
     fi
 }
 
+# ==================== 通用交互辅助 ====================
+# 暂停并等待用户回车
+pause_menu() {
+    local __dummy=""
+    read -rp "按回车键返回菜单..." __dummy || exit 0
+}
+
 # ==================== 状态与配置检查辅助函数 ====================
+# 运行状态（带颜色）
 get_aria2_status() {
     if [ ! -f "${ARIA2C_BIN}" ]; then
-        echo -e "\033[37m未安装\033[0m"
+        printf '%b' "${YELLOW}未安装${NC}"
     elif ${SYSTEMCTL_CMD} is-active --quiet aria2.service 2>/dev/null; then
-        echo -e "\033[32m运行中 (Active)\033[0m"
+        printf '%b' "${GREEN}运行中${NC}"
     else
-        echo -e "\033[31m已停止 (Stopped)\033[0m"
+        printf '%b' "${RED}已停止${NC}"
+    fi
+}
+
+# 开机自启状态（带颜色）
+get_aria2_boot_status() {
+    if [ ! -f "${ARIA2C_BIN}" ]; then
+        printf '%b' "${YELLOW}未安装${NC}"
+    elif ${SYSTEMCTL_CMD} is-enabled --quiet aria2.service 2>/dev/null; then
+        printf '%b' "${GREEN}已启用${NC}"
+    else
+        printf '%b' "${RED}已停用${NC}"
+    fi
+}
+
+# 已安装的 aria2c 版本号，未安装或读取失败时返回 "未安装"
+get_aria2_version_text() {
+    local ver=""
+    ver=$("$ARIA2C_BIN" --version 2>/dev/null | head -n1 | sed -nE 's/.*[Vv]ersion[[:space:]]+([0-9][0-9A-Za-z.-]*).*/\1/p') || true
+    if [ -n "$ver" ]; then
+        printf '%s' "$ver"
+    else
+        printf '未安装'
     fi
 }
 
@@ -2845,21 +2885,20 @@ uninstall_all() {
 while true; do
     echo ""
     echo "=========================================="
-    echo "          Aria2 & AriaNg 综合管理          "
-    echo "  当前用户: ${CURRENT_USER} ($([ "$IS_ROOT" = true ] && echo "Root 模式" || echo "普通用户模式"))"
-    echo "  服务状态: $(get_aria2_status)"
-    if [ -f "${CONF_FILE}" ]; then
-        echo "  下载路径: $(get_current_download_dir)"
-        RPC_P=$(get_conf_value "rpc-listen-port" "6800")
-        echo "  RPC 端口: ${RPC_P}"
-        RPC_SEC=$(get_conf_value "rpc-secret" "未设置")
-        echo "  RPC 密钥: ${RPC_SEC}"
-        DOWN_LIMIT=$(get_conf_value "max-overall-download-limit" "0")
-        echo "  下载限速: $([ "$DOWN_LIMIT" == "0" ] && echo "不限制" || echo "$DOWN_LIMIT")"
-        UP_LIMIT=$(get_conf_value "max-overall-upload-limit" "未限制")
-        echo "  上传限速: $([ "$UP_LIMIT" == "0" ] && echo "不限制" || echo "$UP_LIMIT")"
-    fi
+    echo -e "   ${BOLD}Aria2 & AriaNg 管理脚本${NC}"
+    echo "   身份: $([ "$IS_ROOT" = true ] && echo "Root (系统级服务)" || echo "普通用户 ${CURRENT_USER} (用户级服务)")"
+    echo "   版本: $(get_aria2_version_text)"
     echo "=========================================="
+    echo -e " 服务状态: $(get_aria2_status)    开机自启: $(get_aria2_boot_status)"
+    if [ -f "${CONF_FILE}" ]; then
+        RPC_P=$(get_conf_value "rpc-listen-port" "6800")
+        RPC_SEC=$(get_conf_value "rpc-secret" "未设置")
+        DOWN_LIMIT=$(get_conf_value "max-overall-download-limit" "0")
+        UP_LIMIT=$(get_conf_value "max-overall-upload-limit" "未限制")
+        echo " 下载路径: $(get_current_download_dir)    RPC 端口: ${RPC_P}    RPC 密钥: ${RPC_SEC}"
+        echo " 下载限速: $([ "$DOWN_LIMIT" == "0" ] && echo "不限制" || echo "$DOWN_LIMIT")    上传限速: $([ "$UP_LIMIT" == "0" ] && echo "不限制" || echo "$UP_LIMIT")"
+    fi
+    echo "------------------------------------------"
     echo " 1. $([ -f "${ARIA2C_BIN}" ] && echo "重新配置 Aria2 后端 (自动带入当前设置)" || echo "安装 / 配置 Aria2 后端 (默认启用 Trackers 自动更新)")"
     echo " 2. Aria2 常用核心设置 (下载目录 / 并发数 / 做种 / 上下载限速 / 占位清理)"
     echo " 3. 手动更新 / 设置 BT Trackers (双源拉取 / 自定义)"
@@ -2872,30 +2911,35 @@ while true; do
     echo " 10. Aria2 日志排查与故障分析 (实时日志 / 崩溃溯源 / 前台单测)"
     echo " 11. 单独安装 / 更新 AriaNg 前端 (Caddy 反代模式)"
     echo " 12. 单独卸载 AriaNg 前端"
-    echo " 13. 完整卸载 (Aria2 + AriaNg + 防火墙规则 + 服务全清)"
-    echo " 14. BT 自动筛选下载管理 (支持按大小及自定义后缀过滤)"
-    echo " 15. 扫描并清理下载目录下的小文件 (支持翻页预览 / 防误删)"
+    echo " 13. BT 自动筛选下载管理 (支持按大小及自定义后缀过滤)"
+    echo " 14. 扫描并清理下载目录下的小文件 (支持翻页预览 / 防误删)"
+    echo " 15. 完整卸载 (Aria2 + AriaNg + 防火墙规则 + 服务全清)"
     echo " 0. 退出"
     echo "=========================================="
-    read -rp "请选择操作 [0-15]: " MENU_CHOICE
+    read -rp "请输入操作编号 [0-15 默认: 0]: " MENU_CHOICE
+    MENU_CHOICE="${MENU_CHOICE:-0}"
 
     case "$MENU_CHOICE" in
-        1) install_aria2 ;;
-        2) manage_core_settings ;;
-        3) update_trackers_menu ;;
-        4) manage_tracker_timer ;;
-        5) manage_peer_blocker ;;
-        6) migrate_downloads ;;
-        7) archive_completed_files ;;
-        8) scan_and_resume_torrents ;;
-        9) manage_utils_menu ;;
-        10) manage_logs_menu ;;
-        11) install_ariang ;;
-        12) uninstall_ariang ;;
-        13) uninstall_all; break ;;
-        14) manage_video_filter ;;
-        15) clean_small_files_menu ;;
+        1) install_aria2 || true ;;
+        2) manage_core_settings || true ;;
+        3) update_trackers_menu || true ;;
+        4) manage_tracker_timer || true ;;
+        5) manage_peer_blocker || true ;;
+        6) migrate_downloads || true ;;
+        7) archive_completed_files || true ;;
+        8) scan_and_resume_torrents || true ;;
+        9) manage_utils_menu || true ;;
+        10) manage_logs_menu || true ;;
+        11) install_ariang || true ;;
+        12) uninstall_ariang || true ;;
+        13) manage_video_filter || true ;;
+        14) clean_small_files_menu || true ;;
+        15) uninstall_all || true ;;
         0) echo "已退出。"; exit 0 ;;
         *) echo "无效选项，请重新选择。" ;;
     esac
+
+    if [[ "${MENU_CHOICE:-0}" != "0" ]]; then
+        pause_menu
+    fi
 done

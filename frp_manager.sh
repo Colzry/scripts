@@ -11,6 +11,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+BOLD='\033[1m'
 NC='\033[0m'
 
 ACME_HOME="${HOME}/.acme.sh"
@@ -41,6 +42,12 @@ FRPC_BIN="${BIN_DIR}/frpc"
 CERTS_DIR="${CONFIG_DIR}/certs"
 CLIENT_SERVICE_FILE="${SYSTEMD_DIR}/frpc@.service"
 SERVER_SERVICE_FILE="${SYSTEMD_DIR}/frps@.service"
+
+# 当前执行身份描述（菜单与卸载横幅展示用）
+RUN_MODE_TEXT="Root (系统级服务)"
+if [[ "$IS_ROOT" == false ]]; then
+    RUN_MODE_TEXT="普通用户 ${USER:-$(id -un 2>/dev/null || printf 'user')} (用户级服务)"
+fi
 
 # ======================= 交互校验工具函数 =======================
 prompt_required() {
@@ -867,35 +874,351 @@ manage_services() {
     esac
 }
 
+# ======================= 交互与状态辅助函数 =======================
+# 读取一行输入（失败即退出，避免 EOF 造成死循环），用法: prompt "提示" 变量名
+prompt() {
+    local __text="$1" __var="$2" __val=""
+    if ! read -rp "$__text" __val; then
+        echo ""
+        echo -e "${YELLOW}输入已中断，退出脚本。${NC}"
+        exit 0
+    fi
+    printf -v "$__var" '%s' "$__val"
+}
+
+# 暂停等待回车后返回菜单
+pause_menu() {
+    local __dummy=""
+    read -rp "按回车键返回菜单..." __dummy || exit 0
+}
+
+# 是否已安装 FRP (frps / frpc 任一二进制存在即可)
+frp_installed() {
+    [[ -x "$FRPS_BIN" || -x "$FRPC_BIN" ]]
+}
+
+# FRP 版本号文本，未安装时输出 未安装
+frp_version_text() {
+    local out="" ver=""
+    if [[ -x "$FRPC_BIN" ]]; then
+        out=$("$FRPC_BIN" --version 2>/dev/null | head -n 1) || out=""
+    fi
+    if [[ -z "$out" && -x "$FRPS_BIN" ]]; then
+        out=$("$FRPS_BIN" --version 2>/dev/null | head -n 1) || out=""
+    fi
+
+    ver=$(printf '%s' "$out" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || true)
+    ver="${ver//$'\r'/}"
+
+    if [[ -n "$ver" ]]; then
+        printf '%s' "$ver"
+    else
+        printf '未安装'
+    fi
+}
+
+# 统计配置目录中的实例配置数量
+frp_config_count() {
+    local count=0 f=""
+    for f in "$CONFIG_DIR"/*.toml; do
+        [[ -e "$f" ]] || continue
+        count=$(( count + 1 ))
+    done
+    printf '%s' "$count"
+}
+
+# 汇总全部实例名称（配置目录 *.toml 为主，systemd 单元列表兜底），每行一个
+frp_instance_names() {
+    local f="" name="" unit="" raw="" item="" exist=""
+    local names=() result=()
+    local found="false"
+
+    for f in "$CONFIG_DIR"/*.toml; do
+        [[ -e "$f" ]] || continue
+        names+=("$(basename "$f" .toml)")
+    done
+
+    local units_raw=""
+    units_raw=$($SYSTEMCTL_CMD list-units --type=service --all --no-legend 'frpc@*' 'frps@*' 2>/dev/null || true)
+    if [[ -n "$units_raw" ]]; then
+        while IFS= read -r unit; do
+            [[ -n "$unit" ]] || continue
+            raw="${unit%.service}"
+            raw="${raw#frpc@}"
+            raw="${raw#frps@}"
+            names+=("$raw")
+        done < <(printf '%s\n' "$units_raw" | awk '/frpc@|frps@/{for (i = 1; i <= NF; i++) if ($i ~ /^frp[cs]@/) { print $i; break }}')
+    fi
+
+    # 同一名字对应 frpc@name / frps@name 两个单元，只保留为一个实例
+    if [[ ${#names[@]} -gt 0 ]]; then
+        for item in "${names[@]}"; do
+            [[ -n "$item" ]] || continue
+            found="false"
+            if [[ ${#result[@]} -gt 0 ]]; then
+                for exist in "${result[@]}"; do
+                    if [[ "$exist" == "$item" ]]; then
+                        found="true"
+                        break
+                    fi
+                done
+            fi
+            if [[ "$found" == "false" ]]; then
+                result+=("$item")
+            fi
+        done
+    fi
+
+    if [[ ${#result[@]} -gt 0 ]]; then
+        printf '%s\n' "${result[@]}"
+    fi
+}
+
+# 输出: 运行中数 实例总数 已自启数（空格分隔，便于调用方解析）
+frp_instance_stats() {
+    local name="" state=""
+    local names_raw=""
+    local running=0 total=0 boot=0
+
+    names_raw=$(frp_instance_names)
+    if [[ -n "$names_raw" ]]; then
+        while IFS= read -r name; do
+            [[ -n "$name" ]] || continue
+            total=$(( total + 1 ))
+
+            state=$($SYSTEMCTL_CMD is-active "frpc@${name}" 2>/dev/null | head -n 1 | tr -d ' \r\n' || true)
+            if [[ "$state" != "active" ]]; then
+                state=$($SYSTEMCTL_CMD is-active "frps@${name}" 2>/dev/null | head -n 1 | tr -d ' \r\n' || true)
+            fi
+            if [[ "$state" == "active" ]]; then
+                running=$(( running + 1 ))
+            fi
+
+            state=$($SYSTEMCTL_CMD is-enabled "frpc@${name}" 2>/dev/null | head -n 1 | tr -d ' \r\n' || true)
+            if [[ "$state" != "enabled" ]]; then
+                state=$($SYSTEMCTL_CMD is-enabled "frps@${name}" 2>/dev/null | head -n 1 | tr -d ' \r\n' || true)
+            fi
+            if [[ "$state" == "enabled" ]]; then
+                boot=$(( boot + 1 ))
+            fi
+        done < <(printf '%s\n' "$names_raw")
+    fi
+
+    printf '%s %s %s\n' "$running" "$total" "$boot"
+}
+
+# 服务状态彩色文本: 未安装 / 未配置 / 运行中 N/N / 部分运行 x/N / 已停止 0/N
+frp_service_state_text() {
+    if ! frp_installed; then
+        printf '%b' "${YELLOW}未安装${NC}"
+        return 0
+    fi
+
+    local stats="" rest="" total=0 running=0
+    stats=$(frp_instance_stats)
+    running="${stats%% *}"
+    rest="${stats#* }"
+    total="${rest%% *}"
+
+    if [[ "$total" -eq 0 ]]; then
+        printf '%b' "${YELLOW}未配置${NC} (总数 ${total})"
+    elif [[ "$running" -eq "$total" ]]; then
+        printf '%b' "${GREEN}运行中 ${running}/${total}${NC}"
+    elif [[ "$running" -gt 0 ]]; then
+        printf '%b' "${YELLOW}部分运行 ${running}/${total}${NC}"
+    else
+        printf '%b' "${RED}已停止 0/${total}${NC}"
+    fi
+}
+
+# 开机自启彩色文本: 未安装 / 已启用 N/N / 部分启用 x/N / 已停用 0/N
+frp_boot_state_text() {
+    if ! frp_installed; then
+        printf '%b' "${YELLOW}未安装${NC}"
+        return 0
+    fi
+
+    local stats="" rest="" total=0 boot=0
+    stats=$(frp_instance_stats)
+    rest="${stats#* }"
+    total="${rest%% *}"
+    boot="${rest#* }"
+
+    if [[ "$total" -gt 0 && "$boot" -eq "$total" ]]; then
+        printf '%b' "${GREEN}已启用 ${boot}/${total}${NC}"
+    elif [[ "$boot" -eq 0 ]]; then
+        printf '%b' "${RED}已停用 0/${total}${NC}"
+    else
+        printf '%b' "${YELLOW}部分启用 ${boot}/${total}${NC}"
+    fi
+}
+
+# 危险路径防护: 返回 0 表示命中受保护目录（禁止整目录删除）
+frp_is_protected_path() {
+    local target="$1"
+    [[ -n "$target" ]] || return 0
+    case "$target" in
+        /|/root|/etc|/usr|/var|/home|"$HOME") return 0 ;;
+    esac
+    return 1
+}
+
+# ======================= 完整卸载 =======================
+uninstall_frp() {
+    echo ""
+    echo "=========================================="
+    echo -e "          ${BOLD}完整卸载 FRP${NC}"
+    echo "=========================================="
+    echo "执行身份: ${RUN_MODE_TEXT}"
+
+    if ! frp_installed && [[ ! -f "$CLIENT_SERVICE_FILE" ]] && [[ ! -f "$SERVER_SERVICE_FILE" ]] && [[ ! -d "$CONFIG_DIR" ]]; then
+        echo -e "${YELLOW}[-] 未检测到已安装的 FRP。${NC}"
+        return 0
+    fi
+
+    local confirm=""
+    read -rp "确定要卸载 FRP 吗? [y/N]: " confirm || confirm=""
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}已取消卸载。${NC}"
+        return 0
+    fi
+
+    echo "[1/4] 停止并禁用所有 FRP 实例服务..."
+    local f="" name="" unit="" exist="" skip="false"
+    local units=() seen_units=()
+    for f in "$CONFIG_DIR"/*.toml; do
+        [[ -e "$f" ]] || continue
+        name=$(basename "$f" .toml)
+        units+=("frpc@${name}" "frps@${name}")
+    done
+
+    # 兜底补充未在配置目录中出现的单元
+    local fallback_raw=""
+    fallback_raw=$($SYSTEMCTL_CMD list-units --type=service --all --no-legend 2>/dev/null \
+        | awk '/frpc@|frps@/{for (i = 1; i <= NF; i++) if ($i ~ /^frp[cs]@/) { print $i; break }}' || true)
+    if [[ -n "$fallback_raw" ]]; then
+        while IFS= read -r unit; do
+            [[ -n "$unit" ]] || continue
+            units+=("${unit%.service}")
+        done < <(printf '%s\n' "$fallback_raw")
+    fi
+
+    if [[ ${#units[@]} -gt 0 ]]; then
+        for unit in "${units[@]}"; do
+            [[ -n "$unit" ]] || continue
+            skip="false"
+            if [[ ${#seen_units[@]} -gt 0 ]]; then
+                for exist in "${seen_units[@]}"; do
+                    if [[ "$exist" == "$unit" ]]; then
+                        skip="true"
+                        break
+                    fi
+                done
+            fi
+            if [[ "$skip" == "true" ]]; then
+                continue
+            fi
+            seen_units+=("$unit")
+            $SYSTEMCTL_CMD stop "$unit" 2>/dev/null || true
+            $SYSTEMCTL_CMD disable "$unit" 2>/dev/null || true
+            echo "[-] 已停止并禁用: ${unit}"
+        done
+    else
+        echo "[-] 未发现任何 FRP 实例单元。"
+    fi
+
+    echo "[2/4] 删除 systemd 模板单元与二进制文件..."
+    rm -f "$CLIENT_SERVICE_FILE" "$SERVER_SERVICE_FILE"
+    $SYSTEMCTL_CMD daemon-reload 2>/dev/null || true
+    $SYSTEMCTL_CMD reset-failed 2>/dev/null || true
+    rm -f "$FRPS_BIN" "$FRPC_BIN"
+
+    echo "[3/4] 处理配置目录..."
+    local del_conf=""
+    read -rp "是否删除配置目录 ${CONFIG_DIR} (含 certs 等全部配置)? [y/N]: " del_conf || del_conf=""
+    if [[ "$del_conf" =~ ^[Yy]$ ]]; then
+        if frp_is_protected_path "$CONFIG_DIR"; then
+            echo -e "${RED}警告: 检测到关键系统/家目录，禁止整目录删除！请手动处理其中的文件。${NC}"
+        else
+            rm -rf "$CONFIG_DIR"
+            echo -e "${GREEN}[✓] 已删除配置目录: ${CONFIG_DIR}${NC}"
+        fi
+    else
+        echo "[-] 保留配置目录: ${CONFIG_DIR}"
+    fi
+
+    echo "[4/4] 处理证书目录..."
+    if [[ ! -d "$CERTS_DIR" ]]; then
+        echo "[-] 证书目录不存在或已随配置目录删除: ${CERTS_DIR}"
+    else
+        local del_certs=""
+        read -rp "是否删除证书目录 ${CERTS_DIR} (含已部署的证书与私钥)? [y/N]: " del_certs || del_certs=""
+        if [[ "$del_certs" =~ ^[Yy]$ ]]; then
+            if frp_is_protected_path "$CERTS_DIR"; then
+                echo -e "${RED}警告: 检测到关键系统/家目录，禁止整目录删除！请手动处理其中的文件。${NC}"
+            else
+                rm -rf "$CERTS_DIR"
+                echo -e "${GREEN}[✓] 已删除证书目录: ${CERTS_DIR}${NC}"
+            fi
+        else
+            echo "[-] 保留证书目录: ${CERTS_DIR}"
+        fi
+    fi
+
+    echo ""
+    echo -e "${YELLOW}提示: acme.sh 的续期 Hook (--reloadcmd) 未在此处清理，可在重新运行本脚本后用菜单 6 处理。${NC}"
+    echo -e "${YELLOW}提示: loginctl / linger 相关配置未做任何改动。${NC}"
+
+    echo ""
+    echo "=========================================="
+    echo -e "         ${GREEN}FRP 已成功卸载完成！${NC}"
+    echo "=========================================="
+    return 0
+}
+
 # ======================= 主菜单 =======================
 menu() {
+    local choice=""
     while true; do
-        local mode_desc="[Root 系统全局模式]"
-        if [[ "$IS_ROOT" == false ]]; then
-            mode_desc="[非 Root 用户模式 (${USER})]"
-        fi
-
-        echo -e "\n${GREEN}================ FRP 多实例管理面板 ${mode_desc} ================${NC}"
-        echo "1. 检查最新版本并安装/更新 FRP (frps & frpc)"
-        echo "2. 添加新的主配置文件 (支持服务端 / 客户端)"
-        echo "3. 向现有客户端追加映射规则 (TCP/UDP/HTTP/HTTPS)"
-        echo "4. 删除配置文件并清理服务"
-        echo "5. 服务启停控制与状态看板 (支持运行/自启管理)"
-        echo "6. Acme.sh 证书申请与管理 (支持自动部署到 FRP)"
-        echo "0. 退出管理脚本"
-        echo "========================================================================="
-        read -rp "请输入序号 [0-6]: " choice
+        echo ""
+        echo "=========================================="
+        echo -e "   ${BOLD}FRP 管理脚本${NC}"
+        echo "   身份: ${RUN_MODE_TEXT}"
+        echo "   版本: $(frp_version_text)"
+        echo "=========================================="
+        echo -e " 服务状态: $(frp_service_state_text)    开机自启: $(frp_boot_state_text)"
+        echo " 配置文件数量: $(frp_config_count)    配置目录: ${CONFIG_DIR}    二进制: ${BIN_DIR}/frp{c,s}"
+        echo "------------------------------------------"
+        echo " 1. 检查最新版本并安装 / 更新 FRP (frps & frpc)"
+        echo " 2. 添加新的主配置文件 (支持服务端 / 客户端)"
+        echo " 3. 向现有客户端追加映射规则 (TCP/UDP/HTTP/HTTPS)"
+        echo " 4. 删除配置文件并清理对应服务"
+        echo " 5. 服务启停控制与状态看板 (支持运行 / 开机自启管理)"
+        echo " 6. Acme.sh 证书申请与管理 (支持自动部署到 FRP)"
+        echo " 7. 完整卸载 FRP (停止并删除所有实例服务/单元/二进制)"
+        echo " 0. 退出"
+        echo "=========================================="
+        prompt "请输入操作编号 [0-7 默认: 0]: " choice
+        choice="${choice:-0}"
 
         case "$choice" in
-            1) install_or_update ;;
-            2) add_config ;;
-            3) append_service_config ;;
-            4) delete_config ;;
-            5) manage_services ;;
-            6) acme_manager ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}输入无效，请重新输入。${NC}" ;;
+            1) install_or_update || true ;;
+            2) add_config || true ;;
+            3) append_service_config || true ;;
+            4) delete_config || true ;;
+            5) manage_services || true ;;
+            6) acme_manager || true ;;
+            7) uninstall_frp || true ;;
+            0)
+                echo "退出脚本。"
+                exit 0
+                ;;
+            *) echo -e "${RED}输入无效，请重新选择。${NC}" ;;
         esac
+
+        if [[ "$choice" != "0" ]]; then
+            pause_menu
+        fi
     done
 }
 
