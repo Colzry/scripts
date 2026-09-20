@@ -56,11 +56,13 @@ install_packages() {
 
     echo ">> 发现缺少依赖，正在安装: ${missing_pkgs[*]}..."
     if command -v apt-get &>/dev/null; then
-        ${SUDO_CMD} apt-get install -y --no-install-recommends "${missing_pkgs[@]}" || {
-            echo ">> 尝试单包更新并重装..."
-            ${SUDO_CMD} apt-get update -o Dir::Etc::sourcelist="sources.list" -y || true
-            ${SUDO_CMD} apt-get install -y "${missing_pkgs[@]}"
-        }
+        # 仅在确实缺包时才刷新一次软件源索引 (安静模式)，日常进入菜单不会触发，避免刷屏
+        echo ">> 正在刷新软件源索引 (apt-get update -qq)..."
+        ${SUDO_CMD} apt-get update -qq 2>/dev/null || true
+        if ! ${SUDO_CMD} apt-get install -y --no-install-recommends "${missing_pkgs[@]}"; then
+            echo ">> !! 依赖安装失败: ${missing_pkgs[*]}，请检查网络或软件源后重试。"
+            return 1
+        fi
     elif command -v pacman &>/dev/null; then
         ${SUDO_CMD} pacman -Sy --noconfirm "${missing_pkgs[@]}"
     elif command -v dnf &>/dev/null; then
@@ -82,7 +84,7 @@ get_aria2_status() {
 get_current_download_dir() {
     if [ -f "${CONF_FILE}" ]; then
         local configured_dir
-        configured_dir=$(grep -E "^dir=" "${CONF_FILE}" 2>/dev/null | cut -d'=' -f2 | tr -d '\r')
+        configured_dir=$(grep -E "^dir=" "${CONF_FILE}" 2>/dev/null | cut -d'=' -f2- | tr -d '\r')
         if [ -n "$configured_dir" ]; then
             echo "$configured_dir"
             return
@@ -96,7 +98,7 @@ get_conf_value() {
     local default_val="$2"
     if [ -f "${CONF_FILE}" ]; then
         local val
-        val=$(grep -E "^${key}=" "${CONF_FILE}" 2>/dev/null | cut -d'=' -f2 | tr -d '\r')
+        val=$(grep -E "^${key}=" "${CONF_FILE}" 2>/dev/null | cut -d'=' -f2- | tr -d '\r')
         if [ -n "$val" ]; then
             echo "$val"
             return
@@ -108,11 +110,50 @@ get_conf_value() {
 update_conf_kv() {
     local key="$1"
     local val="$2"
-    if grep -q "^${key}=" "${CONF_FILE}"; then
-        sed -i "s|^${key}=.*|${key}=${val}|g" "${CONF_FILE}"
+    if grep -q "^${key}=" "${CONF_FILE}" 2>/dev/null; then
+        local tmp
+        tmp=$(mktemp)
+        if KV_KEY="${key}" KV_VAL="${val}" awk '
+            BEGIN { key = ENVIRON["KV_KEY"] "=" }
+            index($0, key) == 1 { print ENVIRON["KV_KEY"] "=" ENVIRON["KV_VAL"]; next }
+            { print }
+        ' "${CONF_FILE}" > "${tmp}"; then
+            cp "${tmp}" "${CONF_FILE}"
+        else
+            echo "   !! 写入 ${CONF_FILE} 失败 (${key})" >&2
+        fi
+        rm -f "${tmp}"
     else
-        echo "${key}=${val}" >> "${CONF_FILE}"
+        printf '%s=%s\n' "${key}" "${val}" >> "${CONF_FILE}"
     fi
+}
+
+# 按字面量替换文件内容 (不做正则/转义解释)，用于改写 session 中的路径映射
+replace_literal_in_file() {
+    local file="$1"
+    local from="$2"
+    local to="$3"
+    [ -f "${file}" ] || return 0
+    [ -n "${from}" ] || return 0
+    local tmp
+    tmp=$(mktemp)
+    if LIT_FROM="${from}" LIT_TO="${to}" awk '
+        BEGIN { from = ENVIRON["LIT_FROM"]; to = ENVIRON["LIT_TO"]; n = length(from) }
+        {
+            line = $0
+            out = ""
+            while ((p = index(line, from)) > 0) {
+                out = out substr(line, 1, p - 1) to
+                line = substr(line, p + n)
+            }
+            print out line
+        }
+    ' "${file}" > "${tmp}"; then
+        cp "${tmp}" "${file}"
+    else
+        echo "   !! 改写 ${file} 失败" >&2
+    fi
+    rm -f "${tmp}"
 }
 
 # ==================== 进程安全停机与等待 ====================
@@ -195,9 +236,14 @@ tracker_list=\$( (curl -sSL --connect-timeout 10 -m 30 "\${TRACKER_URL1}"; echo 
 
 if [ -n "\$tracker_list" ]; then
     if grep -q "^bt-tracker=" "\$CONF_FILE"; then
-        sed -i "s|^bt-tracker=.*|bt-tracker=\${tracker_list}|g" "\$CONF_FILE"
+        # 用 awk 按字面量写入，避免 tracker 中的 & | \ 被 sed 当作特殊字符
+        KV_VAL="\$tracker_list" awk '
+            BEGIN { key = "bt-tracker=" }
+            index(\$0, key) == 1 { print key ENVIRON["KV_VAL"]; next }
+            { print }
+        ' "\$CONF_FILE" > "\${CONF_FILE}.tmp" && mv "\${CONF_FILE}.tmp" "\$CONF_FILE"
     else
-        echo "bt-tracker=\${tracker_list}" >> "\$CONF_FILE"
+        printf 'bt-tracker=%s\n' "\$tracker_list" >> "\$CONF_FILE"
     fi
     echo "Tracker 列表更新成功！"
     ${SYSTEMCTL_CMD} restart aria2.service
@@ -413,9 +459,9 @@ install_aria2() {
     local CURRENT_PORT=""
     local CURRENT_SECRET=""
     if [ -f "${CONF_FILE}" ]; then
-        CURRENT_DIR=$(grep -E "^dir=" "${CONF_FILE}" 2>/dev/null | cut -d'=' -f2 | tr -d '\r')
-        CURRENT_PORT=$(grep -E "^rpc-listen-port=" "${CONF_FILE}" 2>/dev/null | cut -d'=' -f2 | tr -d '\r')
-        CURRENT_SECRET=$(grep -E "^rpc-secret=" "${CONF_FILE}" 2>/dev/null | cut -d'=' -f2 | tr -d '\r')
+        CURRENT_DIR=$(grep -E "^dir=" "${CONF_FILE}" 2>/dev/null | cut -d'=' -f2- | tr -d '\r')
+        CURRENT_PORT=$(grep -E "^rpc-listen-port=" "${CONF_FILE}" 2>/dev/null | cut -d'=' -f2- | tr -d '\r')
+        CURRENT_SECRET=$(grep -E "^rpc-secret=" "${CONF_FILE}" 2>/dev/null | cut -d'=' -f2- | tr -d '\r')
     fi
 
     local DEF_DIR="${CURRENT_DIR:-$DEFAULT_DOWNLOAD_DIR}"
@@ -863,11 +909,7 @@ update_trackers_menu() {
             return 0
         fi
 
-        if grep -q "^bt-tracker=" "${CONF_FILE}"; then
-            sed -i "s|^bt-tracker=.*|bt-tracker=${formatted_trackers}|g" "${CONF_FILE}"
-        else
-            echo "bt-tracker=${formatted_trackers}" >> "${CONF_FILE}"
-        fi
+        update_conf_kv "bt-tracker" "${formatted_trackers}"
 
         ${SYSTEMCTL_CMD} restart aria2.service
         echo ">> 自定义 Trackers 已成功写入并重启 Aria2 服务！"
@@ -1211,14 +1253,14 @@ migrate_downloads() {
     if [ -f "${SESSION_FILE}" ] && [ -s "${SESSION_FILE}" ]; then
         echo ">> 正在更新会话文件 (${SESSION_FILE}) 中的路径映射..."
         cp "${SESSION_FILE}" "${SESSION_FILE}.bak"
-        sed -i "s|${SRC_DIR}|${DEST_DIR}|g" "${SESSION_FILE}"
+        replace_literal_in_file "${SESSION_FILE}" "${SRC_DIR}" "${DEST_DIR}"
     fi
 
     echo ""
     read -rp "是否将未来默认下载目录也同步修改为新路径? [Y/n 默认: Y]: " SYNC_DEFAULT
     SYNC_DEFAULT="${SYNC_DEFAULT:-Y}"
     if [[ "$SYNC_DEFAULT" =~ ^[Yy]$ ]]; then
-        sed -i "s|^dir=.*|dir=${DEST_DIR}|g" "${CONF_FILE}"
+        update_conf_kv "dir" "${DEST_DIR}"
         echo ">> 已更新 aria2.conf 默认下载目录为: ${DEST_DIR}"
     fi
 
@@ -1309,10 +1351,94 @@ archive_completed_files() {
     local running_aria2
     running_aria2=$(ps -ef 2>/dev/null | grep '[a]ria2c' | head -n 1 || true)
 
-    local scan_tmp files_file gids_file scan_rc
+    local scan_tmp files_file records_file scan_rc
     scan_tmp=$(mktemp -d)
     files_file="${scan_tmp}/files.list"
-    gids_file="${scan_tmp}/gids.list"
+    records_file="${scan_tmp}/tasks.rec"
+
+    # 通过 RPC 批量处理 GID：aria2.forceRemove (解除占用) / aria2.removeDownloadResult (清除记录)
+    _aria2_gid_action() {
+        local gids_file="$1"
+        local method="$2"
+        local label="$3"
+        [ -s "${gids_file}" ] || return 0
+        ARIA2_CONF_FILE="${CONF_FILE}" ARIA2_GIDS_FILE="${gids_file}" ARIA2_GID_METHOD="${method}" ARIA2_GID_LABEL="${label}" \
+            python3 - <<'PYEOF' || true
+import json
+import os
+import subprocess
+import urllib.request
+
+
+def read_conf(key, default):
+    try:
+        with open(os.environ.get("ARIA2_CONF_FILE", ""), "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key_name, value = line.split("=", 1)
+                if key_name.strip() == key:
+                    return value.strip()
+    except OSError:
+        pass
+    return default
+
+
+port = read_conf("rpc-listen-port", "6800") or "6800"
+secret = read_conf("rpc-secret", "")
+url = "http://127.0.0.1:" + port + "/jsonrpc"
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+method = os.environ.get("ARIA2_GID_METHOD") or "aria2.forceRemove"
+label = os.environ.get("ARIA2_GID_LABEL") or "处理"
+
+with open(os.environ["ARIA2_GIDS_FILE"], "rb") as fh:
+    gids = [item.decode("utf-8", "surrogateescape") for item in fh.read().split(b"\x00") if item]
+
+
+def call(body):
+    """先 urllib，失败再 curl；返回 (响应, 错误描述)。"""
+    first_error = ""
+    try:
+        req = urllib.request.Request(url, data=body.encode("utf-8"), headers={"Content-Type": "application/json"})
+        with opener.open(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace")), None
+    except Exception as exc:
+        first_error = str(exc)
+    try:
+        proc = subprocess.run(["curl", "-sS", "-m", "10", "--noproxy", "*", "-X", "POST",
+                               "-H", "Content-Type: application/json", "--data-binary", "@-", url],
+                              input=body.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=20)
+        if proc.returncode != 0:
+            return None, f"{first_error}; curl 退出码 {proc.returncode}"
+        return json.loads(proc.stdout.decode("utf-8", "replace")), None
+    except Exception as exc2:
+        return None, f"{first_error}; curl: {exc2}"
+
+
+results = []
+success = 0
+for gid in gids:
+    params = ["token:" + secret] if secret else []
+    params.append(gid)
+    body = json.dumps({"jsonrpc": "2.0", "id": "gid_action", "method": method, "params": params})
+    data, err = call(body)
+    if err:
+        results.append(f"   !! GID {gid} {label}失败: {err}")
+        continue
+    if isinstance(data, dict) and data.get("error"):
+        info = data["error"] if isinstance(data["error"], dict) else {}
+        results.append(f"   !! GID {gid} {label}失败: {info.get('message', '')}")
+        continue
+    success += 1
+
+for line in results:
+    print(line)
+print(f">> {label}: 成功 {success} / {len(gids)} 个任务。")
+PYEOF
+        return 0
+    }
 
     scan_rc=0
     ARIA2_CONF_FILE="${CONF_FILE}" ARIA2_SRC_DIR="${SRC_DIR}" ARIA2_OUT_DIR="${scan_tmp}" \
@@ -1329,6 +1455,7 @@ SRC_DIR = os.path.realpath(os.environ.get("ARIA2_SRC_DIR", "."))
 OUT_DIR = os.environ.get("ARIA2_OUT_DIR", ".")
 RPC_TIMEOUT = 20
 FILE_PREVIEW_LIMIT = 15
+FIELD_SEP = "\x1f"
 STATUS_TEXT = {
     "active": "下载中/做种",
     "waiting": "排队中",
@@ -1454,12 +1581,19 @@ def files_of(task):
     return files if isinstance(files, list) else []
 
 
-def task_name(task):
+def torrent_name(task):
     info = task.get("bittorrent")
     if isinstance(info, dict):
         inner = info.get("info")
         if isinstance(inner, dict) and inner.get("name"):
             return inner["name"]
+    return ""
+
+
+def task_name(task):
+    name = torrent_name(task)
+    if name:
+        return name
     for f in files_of(task):
         path = f.get("path") or ""
         if path:
@@ -1491,6 +1625,31 @@ def inside_src(real_path):
     if real_path == SRC_DIR:
         return False
     return real_path.startswith(SRC_DIR + os.sep)
+
+
+def find_torrent(task, picked_files):
+    """找出与任务同名的 .torrent 元数据文件 (必须在源目录内)，找不到返回空串。"""
+    name = torrent_name(task)
+    if not name:
+        return ""
+    candidates = []
+    task_dir = task.get("dir") or ""
+    if task_dir:
+        candidates.append(os.path.join(task_dir, name + ".torrent"))
+    # 单文件种子: <文件>.torrent；多文件种子: 数据根目录同级的 <根目录名>.torrent
+    for path in picked_files[:1]:
+        candidates.append(path + ".torrent")
+        parent = os.path.dirname(path)
+        while parent.startswith(SRC_DIR) and parent != SRC_DIR:
+            if os.path.basename(parent) == name:
+                candidates.append(parent + ".torrent")
+                break
+            parent = os.path.dirname(parent)
+    for candidate in candidates:
+        real = os.path.realpath(candidate)
+        if os.path.isfile(real) and inside_src(real):
+            return os.path.relpath(real, SRC_DIR)
+    return ""
 
 
 def status_text(status):
@@ -1544,6 +1703,7 @@ for method, params, label in (("aria2.tellActive", None, "进行中"),
             continue
         completed_count += 1
         picked_files = []
+        size = 0
         for f in files_of(task):
             path = f.get("path") or ""
             if not path:
@@ -1559,9 +1719,18 @@ for method, params, label in (("aria2.tellActive", None, "进行中"),
                 continue
             seen_paths.add(real)
             picked_files.append(real)
+            try:
+                size += os.path.getsize(real)
+            except OSError:
+                pass
         if picked_files:
+            # 种子文件探测失败不应影响转移，任何异常都按“无同名种子”处理
+            try:
+                torrent_file = find_torrent(task, picked_files)
+            except Exception:
+                torrent_file = ""
             groups.append((task_name(task), status, task.get("gid") or "",
-                           picked_files, method != "aria2.tellStopped"))
+                           picked_files, method != "aria2.tellStopped", size, torrent_file))
 
     counts_text = ", ".join(f"{status_text(key)}:{count}" for key, count in sorted(counts.items()))
     lines.append(f">> {label}: 共 {len(tasks)} 个任务 ({counts_text or '无'}), 其中已 100% 完成 {completed_count} 个")
@@ -1576,22 +1745,17 @@ lines.append(f">> 源目录: {SRC_DIR}")
 if groups:
     lines.append(f">> 以下任务已 100% 下载完成，可转移 ({len(groups)} 个):")
     lines.append("--------------------------------------------------")
-    for index, group in enumerate(groups):
-        name, status, _gid, picked_files, _removable = group
-        size = 0
-        for path in picked_files:
-            try:
-                size += os.path.getsize(path)
-            except OSError:
-                pass
+    for index, group in enumerate(groups, start=1):
+        name, status, _gid, picked_files, removable, size, _torrent = group
         total_files += len(picked_files)
         total_size += size
-        lines.append(f"   - [{status_text(status)}] {name}  ({len(picked_files)} 个文件 / {human(size)})")
-        if index < FILE_PREVIEW_LIMIT:
+        marker = "  << 做种/暂停中，转移前会先停止它" if removable else ""
+        lines.append(f"   [{index:>2}] [{status_text(status)}] {name}  ({len(picked_files)} 个文件 / {human(size)}){marker}")
+        if index <= FILE_PREVIEW_LIMIT:
             for path in picked_files[:5]:
-                lines.append(f"       · {os.path.relpath(path, SRC_DIR)}")
+                lines.append(f"         · {os.path.relpath(path, SRC_DIR)}")
             if len(picked_files) > 5:
-                lines.append(f"       · ... 以及其余 {len(picked_files) - 5} 个文件")
+                lines.append(f"         · ... 以及其余 {len(picked_files) - 5} 个文件")
     lines.append("--------------------------------------------------")
     lines.append(f">> 合计: {len(groups)} 个任务 / {total_files} 个文件 / {human(total_size)}")
 else:
@@ -1614,14 +1778,17 @@ if incomplete_tasks and not groups:
 
 # 先落盘再输出报告: 即使报告文本出错，也不会影响已确认的转移清单
 with open(os.path.join(OUT_DIR, "files.list"), "wb") as fh:
-    for _name, _status, _gid, picked_files, _removable in groups:
+    for _name, _status, _gid, picked_files, _removable, _size, _torrent in groups:
         for path in picked_files:
             fh.write(os.path.relpath(path, SRC_DIR).encode("utf-8", "surrogateescape") + b"\x00")
 
-with open(os.path.join(OUT_DIR, "gids.list"), "wb") as fh:
-    for _name, _status, gid, _picked_files, removable in groups:
-        if gid and removable:
-            fh.write(gid.encode("utf-8", "surrogateescape") + b"\x00")
+# 每个任务一条记录: 序号 / 名称 / 状态 / GID / 是否仍在运行(需先解除占用) / 文件数 / 字节数 / 同名种子文件
+with open(os.path.join(OUT_DIR, "tasks.rec"), "wb") as fh:
+    for index, group in enumerate(groups, start=1):
+        name, status, gid, picked_files, removable, size, torrent = group
+        fields = [str(index), name, status, gid, "1" if removable else "0",
+                  str(len(picked_files)), str(size), torrent]
+        fh.write(FIELD_SEP.join(fields).encode("utf-8", "surrogateescape") + b"\x00")
 
 for line in lines:
     print(line)
@@ -1649,17 +1816,22 @@ PYEOF
         return 1
     fi
 
-    declare -a COMPLETED_FILES=()
+    declare -a ALL_FILES=() TASK_RECORDS=()
     if [ -s "${files_file}" ]; then
-        if ! mapfile -d '' -t COMPLETED_FILES < "${files_file}" 2>/dev/null; then
+        if ! mapfile -d '' -t ALL_FILES < "${files_file}" 2>/dev/null; then
             echo "   !! 当前 bash 版本过低 (需要 4.4+ 才能按 NUL 解析文件清单)，请升级 bash 后重试。"
             rm -rf "${scan_tmp}"
             return 1
         fi
     fi
+    if [ -s "${records_file}" ]; then
+        mapfile -d '' -t TASK_RECORDS < "${records_file}" 2>/dev/null || TASK_RECORDS=()
+    fi
 
-    local FILE_COUNT=${#COMPLETED_FILES[@]}
-    if [ "$FILE_COUNT" -eq 0 ]; then
+    local FILE_COUNT=${#ALL_FILES[@]}
+    local TASK_TOTAL=${#TASK_RECORDS[@]}
+
+    if [ "$FILE_COUNT" -eq 0 ] || [ "$TASK_TOTAL" -eq 0 ]; then
         echo ""
         echo ">> 没有可转移的数据: Aria2 中没有已 100% 完成、且数据位于 ${SRC_DIR} 内的任务。"
         echo "   (对比上方各项统计: 若 AriaNg 明明显示已完成却统计为 0，说明脚本连到的 Aria2 实例与 AriaNg 不是同一个，或源目录选错了。)"
@@ -1667,7 +1839,126 @@ PYEOF
         return 0
     fi
 
+    # 解析每个任务的元数据 (序号 / 名称 / 状态 / GID / 是否需解除占用 / 文件数 / 字节数)
+    declare -a T_NAME=() T_STATUS=() T_GID=() T_REMOVABLE=() T_COUNT=() T_SIZE=() T_TORRENT=()
+    local rec r_index r_name r_status r_gid r_removable r_count r_size r_torrent
+    local SUM_FILES=0
+    for rec in "${TASK_RECORDS[@]}"; do
+        IFS=$'\x1f' read -r r_index r_name r_status r_gid r_removable r_count r_size r_torrent <<< "$rec"
+        T_NAME+=("$r_name")
+        T_STATUS+=("$r_status")
+        T_GID+=("$r_gid")
+        T_REMOVABLE+=("$r_removable")
+        T_COUNT+=("${r_count:-0}")
+        T_SIZE+=("${r_size:-0}")
+        T_TORRENT+=("${r_torrent:-}")
+        SUM_FILES=$((SUM_FILES + ${r_count:-0}))
+    done
+
+    if [ "$SUM_FILES" -ne "$FILE_COUNT" ]; then
+        echo ""
+        echo ">> [失败] 任务清单与文件清单数量不一致 (任务记录 ${SUM_FILES} 个文件 / 清单 ${FILE_COUNT} 个文件)，为避免误移已中止。"
+        rm -rf "${scan_tmp}"
+        return 1
+    fi
+
     echo ""
+    read -rp "请输入要转移的任务编号 (空格或逗号分隔，例如 1 3 5；直接回车 = 全部 ${TASK_TOTAL} 个): " SELECTION
+    declare -A CHOSEN_MAP=()
+    local i token
+    if [ -z "$SELECTION" ]; then
+        for ((i=0; i<TASK_TOTAL; i++)); do
+            CHOSEN_MAP[$i]=1
+        done
+    else
+        local -a TOKENS=()
+        read -ra TOKENS <<< "${SELECTION//,/ }"
+        for token in "${TOKENS[@]}"; do
+            if [[ ! "$token" =~ ^[0-9]+$ ]]; then
+                echo "   >> 忽略无效编号: ${token}"
+                continue
+            fi
+            if [ "$token" -lt 1 ] || [ "$token" -gt "$TASK_TOTAL" ]; then
+                echo "   >> 忽略超出范围的编号: ${token} (有效范围 1-${TASK_TOTAL})"
+                continue
+            fi
+            CHOSEN_MAP[$((token - 1))]=1
+        done
+    fi
+
+    if [ ${#CHOSEN_MAP[@]} -eq 0 ]; then
+        echo ">> 未选择任何任务，已取消。"
+        rm -rf "${scan_tmp}"
+        return 0
+    fi
+
+    # 按任务切片出实际要转移的文件，并挑出需要先解除占用 / 之后清除记录的 GID
+    declare -a COMPLETED_FILES=() FORCE_GIDS=() ALL_GIDS=()
+    local offset=0 count chosen_count=0 chosen_bytes=0
+    for ((i=0; i<TASK_TOTAL; i++)); do
+        count="${T_COUNT[$i]}"
+        if [ -n "${CHOSEN_MAP[$i]}" ]; then
+            if [ "$count" -gt 0 ]; then
+                COMPLETED_FILES+=("${ALL_FILES[@]:offset:count}")
+            fi
+            chosen_count=$((chosen_count + 1))
+            chosen_bytes=$((chosen_bytes + T_SIZE[i]))
+            if [ -n "${T_GID[$i]}" ]; then
+                ALL_GIDS+=("${T_GID[$i]}")
+                if [ "${T_REMOVABLE[$i]}" = "1" ]; then
+                    FORCE_GIDS+=("${T_GID[$i]}")
+                fi
+            fi
+        fi
+        offset=$((offset + count))
+    done
+
+    # 可选: 连同同名 .torrent 元数据一起转移 (默认不搬，仍可用主菜单 9 -> 1 清理)
+    declare -a TORRENT_FILES=()
+    declare -A TORRENT_SEEN=()
+    local torrent_path
+    for ((i=0; i<TASK_TOTAL; i++)); do
+        [ -n "${CHOSEN_MAP[$i]}" ] || continue
+        torrent_path="${T_TORRENT[$i]}"
+        [ -n "$torrent_path" ] || continue
+        [ -n "${TORRENT_SEEN[$torrent_path]}" ] && continue
+        TORRENT_SEEN[$torrent_path]=1
+        TORRENT_FILES+=("$torrent_path")
+    done
+
+    if [ ${#TORRENT_FILES[@]} -gt 0 ]; then
+        echo ""
+        echo ">> 检测到 ${#TORRENT_FILES[@]} 个已选任务带有同名 .torrent 元数据文件:"
+        for torrent_path in "${TORRENT_FILES[@]:0:10}"; do
+            echo "   - ${torrent_path}"
+        done
+        if [ ${#TORRENT_FILES[@]} -gt 10 ]; then
+            echo "   ... 以及其余 $(( ${#TORRENT_FILES[@]} - 10 )) 个"
+        fi
+        read -rp "是否连同这些 .torrent 一并转移到新磁盘? [y/N 默认: N]: " MOVE_TORRENTS
+        MOVE_TORRENTS="${MOVE_TORRENTS:-N}"
+        if [[ "$MOVE_TORRENTS" =~ ^[Yy]$ ]]; then
+            COMPLETED_FILES+=("${TORRENT_FILES[@]}")
+            echo ">> 已加入转移清单。"
+        else
+            echo ">> 已跳过 .torrent (可稍后用主菜单 9 -> 1 清理已完成任务的种子文件)。"
+        fi
+    fi
+
+    local SEL_FILES=${#COMPLETED_FILES[@]}
+    local SEL_GB
+    SEL_GB=$(awk "BEGIN {printf \"%.2f\", ${chosen_bytes}/1024/1024/1024}")
+    echo ""
+    echo ">> 已选择 ${chosen_count} 个任务 / ${SEL_FILES} 个文件 / 约 ${SEL_GB} GB"
+    if [ ${#FORCE_GIDS[@]} -gt 0 ]; then
+        echo ">> 其中以下任务仍在做种/暂停中，转移前会先停止它们 (之后需重新添加种子才能继续做种):"
+        for ((i=0; i<TASK_TOTAL; i++)); do
+            if [ -n "${CHOSEN_MAP[$i]}" ] && [ "${T_REMOVABLE[$i]}" = "1" ]; then
+                echo "   - ${T_NAME[$i]}"
+            fi
+        done
+    fi
+
     read -rp "确认开始同步移动以上已完成任务的数据到 ${DEST_DIR}? [Y/n 默认: Y]: " CONFIRM_MOVE
     CONFIRM_MOVE="${CONFIRM_MOVE:-Y}"
     if [[ ! "$CONFIRM_MOVE" =~ ^[Yy]$ ]]; then
@@ -1676,84 +1967,10 @@ PYEOF
         return 0
     fi
 
-    # 做种中 / 已暂停的完成任务仍被 Aria2 占用着文件，先通过 RPC 安全解除占用
-    if [ -s "${gids_file}" ]; then
+    if [ ${#FORCE_GIDS[@]} -gt 0 ]; then
+        printf '%s\0' "${FORCE_GIDS[@]}" > "${scan_tmp}/force.gids"
         echo ">> 正在安全解除做种 / 暂停任务的文件占用..."
-        ARIA2_CONF_FILE="${CONF_FILE}" ARIA2_GIDS_FILE="${gids_file}" python3 - <<'PYEOF' || true
-import json
-import os
-import subprocess
-import urllib.request
-
-
-def read_conf(key, default):
-    try:
-        with open(os.environ.get("ARIA2_CONF_FILE", ""), "r", encoding="utf-8", errors="ignore") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key_name, value = line.split("=", 1)
-                if key_name.strip() == key:
-                    return value.strip()
-    except OSError:
-        pass
-    return default
-
-
-port = read_conf("rpc-listen-port", "6800") or "6800"
-secret = read_conf("rpc-secret", "")
-url = "http://127.0.0.1:" + port + "/jsonrpc"
-opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
-with open(os.environ["ARIA2_GIDS_FILE"], "rb") as fh:
-    gids = [item.decode("utf-8", "surrogateescape") for item in fh.read().split(b"\x00") if item]
-
-results = []
-
-
-def remove_gid(gid):
-    call_params = ["token:" + secret] if secret else []
-    call_params.append(gid)
-    body = json.dumps({"jsonrpc": "2.0", "id": "stop_seed", "method": "aria2.forceRemove", "params": call_params})
-    try:
-        req = urllib.request.Request(url, data=body.encode("utf-8"), headers={"Content-Type": "application/json"})
-        with opener.open(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8", "replace"))
-        if isinstance(data, dict) and data.get("error"):
-            err = data["error"] if isinstance(data["error"], dict) else {}
-            return f"RPC 拒绝: {err.get('message', '')}"
-        return ""
-    except Exception:
-        pass
-    try:
-        proc = subprocess.run(["curl", "-sS", "-m", "10", "--noproxy", "*", "-X", "POST",
-                               "-H", "Content-Type: application/json", "--data-binary", "@-", url],
-                              input=body.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              timeout=20)
-        if proc.returncode != 0:
-            return f"curl 退出码 {proc.returncode}"
-        data = json.loads(proc.stdout.decode("utf-8", "replace"))
-        if isinstance(data, dict) and data.get("error"):
-            err = data["error"] if isinstance(data["error"], dict) else {}
-            return f"RPC 拒绝: {err.get('message', '')}"
-        return ""
-    except Exception as exc:
-        return f"异常: {exc}"
-
-
-removed = 0
-for gid in gids:
-    failure = remove_gid(gid)
-    if failure:
-        results.append(f"   !! GID {gid} 解除占用失败: {failure}")
-    else:
-        removed += 1
-results.append(f">> 已解除 {removed} / {len(gids)} 个任务的占用。")
-
-for line in results:
-    print(line)
-PYEOF
+        _aria2_gid_action "${scan_tmp}/force.gids" "aria2.forceRemove" "解除占用"
     fi
 
     echo ">> 正在同步数据并保持相对目录层级结构..."
@@ -1784,8 +2001,22 @@ PYEOF
         done < <(find "${SRC_DIR}" -type f -name "*.aria2" 2>/dev/null)
 
         echo ">> 原磁盘空间已释放！所有正在下载的任务继续正常运行。"
+
+        # 原文件已删除，Aria2 里的这些记录已失效 (AriaNg 会显示文件缺失)，可选择一并清除
+        if [ ${#ALL_GIDS[@]} -gt 0 ]; then
+            echo ""
+            echo ">> 提示: 这些任务的原文件已删除，Aria2 中仍保留其记录 (会显示在 AriaNg 的『已停止』列表且文件缺失)。"
+            read -rp "是否同时清除这些任务的下载记录? [Y/n 默认: Y]: " PURGE_RECORDS
+            PURGE_RECORDS="${PURGE_RECORDS:-Y}"
+            if [[ "$PURGE_RECORDS" =~ ^[Yy]$ ]]; then
+                printf '%s\0' "${ALL_GIDS[@]}" > "${scan_tmp}/purge.gids"
+                _aria2_gid_action "${scan_tmp}/purge.gids" "aria2.removeDownloadResult" "清除记录"
+            else
+                echo ">> 已保留 Aria2 中的下载记录。"
+            fi
+        fi
     else
-        echo ">> 已保留源磁盘上的文件。"
+        echo ">> 已保留源磁盘上的文件 (Aria2 中的任务记录也保持原样)。"
     fi
 
     rm -rf "${scan_tmp}"
@@ -1805,9 +2036,9 @@ scan_and_resume_torrents() {
 
     install_packages curl
 
-    RPC_PORT=$(grep -E "^rpc-listen-port=" "${CONF_FILE}" | cut -d'=' -f2 | tr -d ' \r')
+    RPC_PORT=$(grep -E "^rpc-listen-port=" "${CONF_FILE}" | cut -d'=' -f2- | tr -d ' \r')
     RPC_PORT="${RPC_PORT:-$DEFAULT_PORT}"
-    RPC_SECRET=$(grep -E "^rpc-secret=" "${CONF_FILE}" | cut -d'=' -f2 | tr -d ' \r')
+    RPC_SECRET=$(grep -E "^rpc-secret=" "${CONF_FILE}" | cut -d'=' -f2- | tr -d ' \r')
 
     if ! ${SYSTEMCTL_CMD} is-active --quiet aria2.service 2>/dev/null; then
         echo ">> 检测到 Aria2 服务未运行，正在启动..."
@@ -2018,7 +2249,7 @@ manage_utils_menu() {
                 fi
 
                 echo -n "2. RPC 端口监听: "
-                RPC_P=$(grep -E "^rpc-listen-port=" "${CONF_FILE}" 2>/dev/null | cut -d'=' -f2 | tr -d ' \r')
+                RPC_P=$(grep -E "^rpc-listen-port=" "${CONF_FILE}" 2>/dev/null | cut -d'=' -f2- | tr -d ' \r')
                 RPC_P="${RPC_P:-6800}"
                 if ss -tuln | grep -q ":${RPC_P} "; then
                     echo -e "\033[32m[端口 ${RPC_P} 正常监听]\033[0m"
@@ -2174,7 +2405,7 @@ install_ariang() {
 
     if [ -z "$target_rpc_port" ]; then
         if [ -f "${CONF_FILE}" ]; then
-            target_rpc_port=$(grep -E "^rpc-listen-port=" "${CONF_FILE}" | cut -d'=' -f2 | tr -d ' \r')
+            target_rpc_port=$(grep -E "^rpc-listen-port=" "${CONF_FILE}" | cut -d'=' -f2- | tr -d ' \r')
         fi
         target_rpc_port="${target_rpc_port:-$DEFAULT_PORT}"
         read -rp "请输入后端的 Aria2 RPC 端口 [默认: ${target_rpc_port}]: " INPUT_TARGET_PORT
@@ -2307,6 +2538,10 @@ manage_video_filter() {
             
             read -rp "请输入需要保留的文件最小体积 (MB) [默认: 50]: " INPUT_MIN_MB
             INPUT_MIN_MB="${INPUT_MIN_MB:-50}"
+            if ! [[ "$INPUT_MIN_MB" =~ ^[0-9]+$ ]] || [ "$INPUT_MIN_MB" -le 0 ]; then
+                echo ">> 输入无效，已回退为默认值 50 MB。"
+                INPUT_MIN_MB=50
+            fi
 
             echo ""
             echo "请选择文件类型过滤模式:"
