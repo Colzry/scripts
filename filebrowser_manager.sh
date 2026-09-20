@@ -30,6 +30,35 @@ fi
 
 BIN_PATH="$BIN_DIR/filebrowser"
 
+# ----------------- 服务状态探测 -----------------
+# 返回 0 表示服务正在运行，非 0 表示未运行
+is_service_active() {
+    $SYSTEMCTL_CMD is-active --quiet filebrowser.service 2>/dev/null
+}
+
+# 返回 0 表示已启用开机自启，非 0 表示未启用
+is_service_enabled() {
+    $SYSTEMCTL_CMD is-enabled --quiet filebrowser.service 2>/dev/null
+}
+
+# 输出当前运行状态文本
+service_active_text() {
+    if is_service_active; then
+        echo "运行中"
+    else
+        echo "已停止"
+    fi
+}
+
+# 输出当前开机自启状态文本
+service_enabled_text() {
+    if is_service_enabled; then
+        echo "已启用"
+    else
+        echo "已停用"
+    fi
+}
+
 # ----------------- FFmpeg 探测与安装 -----------------
 install_ffmpeg() {
     if command -v ffmpeg >/dev/null 2>&1; then
@@ -297,16 +326,72 @@ EOF
     echo "=========================================="
 }
 
+# ----------------- 启用 / 停用服务 -----------------
+enable_filebrowser() {
+    echo "=========================================="
+    echo "      启用 FileBrowser Quantum 服务"
+    echo "=========================================="
+
+    if [ ! -f "$SYSTEMD_SERVICE_FILE" ] || [ ! -f "$BIN_PATH" ]; then
+        echo "[-] 未检测到完整安装（缺少服务文件或二进制程序），请先执行安装。"
+        return 1
+    fi
+
+    $SYSTEMCTL_CMD daemon-reload 2>/dev/null || true
+    if ! $SYSTEMCTL_CMD enable filebrowser.service; then
+        echo "[-] 设置开机自启失败，请检查服务配置。"
+    fi
+    if ! $SYSTEMCTL_CMD start filebrowser.service 2>/dev/null; then
+        $SYSTEMCTL_CMD restart filebrowser.service 2>/dev/null || true
+    fi
+
+    echo "[✓] 服务已启用开机自启并尝试启动。"
+    echo "服务状态: $(service_active_text)"
+    echo "开机自启: $(service_enabled_text)"
+    echo "常用命令："
+    if [ "$IS_ROOT" = true ]; then
+        echo "  - 查看实时日志: journalctl -u filebrowser -f"
+    else
+        echo "  - 查看实时日志: journalctl --user -u filebrowser -f"
+    fi
+    echo "=========================================="
+}
+
+disable_filebrowser() {
+    echo "=========================================="
+    echo "      停用 FileBrowser Quantum 服务"
+    echo "=========================================="
+
+    if $SYSTEMCTL_CMD is-active --quiet filebrowser.service 2>/dev/null; then
+        $SYSTEMCTL_CMD stop filebrowser.service
+    fi
+    if $SYSTEMCTL_CMD is-enabled --quiet filebrowser.service 2>/dev/null; then
+        $SYSTEMCTL_CMD disable filebrowser.service
+    fi
+
+    echo "[✓] 服务已停止并取消开机自启，数据与配置保持不变。"
+    echo "服务状态: $(service_active_text)"
+    echo "开机自启: $(service_enabled_text)"
+    echo "=========================================="
+}
+
 # ----------------- 菜单入口 -----------------
 echo "=========================================="
 echo "      FileBrowser Quantum 管理脚本"
 echo "      当前执行身份: $([ "$IS_ROOT" = true ] && echo "Root" || echo "普通用户 ($USER)")"
 echo "=========================================="
+echo " 服务状态: $(service_active_text)    开机自启: $(service_enabled_text)"
+echo "------------------------------------------"
 echo " 1. 安装 / 重新配置 FileBrowser Quantum"
-echo " 2. 卸载 FileBrowser Quantum"
+if is_service_enabled; then
+    echo " 2. 停用 FileBrowser Quantum 服务"
+else
+    echo " 2. 启用 FileBrowser Quantum 服务"
+fi
+echo " 3. 卸载 FileBrowser Quantum"
 echo " 0. 退出"
 echo "=========================================="
-read -rp "请输入操作编号 [1/2/0 默认: 1]: " ACTION_CHOICE
+read -rp "请输入操作编号 [1/2/3/0 默认: 1]: " ACTION_CHOICE
 ACTION_CHOICE="${ACTION_CHOICE:-1}"
 
 case "$ACTION_CHOICE" in
@@ -314,6 +399,13 @@ case "$ACTION_CHOICE" in
         install_filebrowser
         ;;
     2)
+        if is_service_enabled; then
+            disable_filebrowser
+        else
+            enable_filebrowser
+        fi
+        ;;
+    3)
         uninstall_filebrowser
         ;;
     0)
