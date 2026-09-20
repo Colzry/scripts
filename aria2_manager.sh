@@ -48,7 +48,7 @@ install_packages() {
     fi
 }
 
-# ==================== 状态检查辅助函数 ====================
+# ==================== 状态与配置检查辅助函数 ====================
 get_aria2_status() {
     if [ ! -f "${ARIA2C_BIN}" ]; then
         echo -e "\033[37m未安装\033[0m"
@@ -69,6 +69,30 @@ get_current_download_dir() {
         fi
     fi
     echo "$DEFAULT_DOWNLOAD_DIR"
+}
+
+get_conf_value() {
+    local key="$1"
+    local default_val="$2"
+    if [ -f "${CONF_FILE}" ]; then
+        local val
+        val=$(grep -E "^${key}=" "${CONF_FILE}" 2>/dev/null | cut -d'=' -f2 | tr -d '\r')
+        if [ -n "$val" ]; then
+            echo "$val"
+            return
+        fi
+    fi
+    echo "$default_val"
+}
+
+update_conf_kv() {
+    local key="$1"
+    local val="$2"
+    if grep -q "^${key}=" "${CONF_FILE}"; then
+        sed -i "s|^${key}=.*|${key}=${val}|g" "${CONF_FILE}"
+    else
+        echo "${key}=${val}" >> "${CONF_FILE}"
+    fi
 }
 
 # ==================== 进程安全停机与等待 ====================
@@ -469,6 +493,10 @@ disable-ipv6=true
 max-overall-upload-limit=2M
 max-upload-limit=2M
 
+## 做种与分享率设置 ##
+seed-time=0
+seed-ratio=0.0
+
 ## 进度保存设置 ##
 input-file=${SESSION_FILE}
 save-session=${SESSION_FILE}
@@ -575,44 +603,155 @@ EOF
     fi
 }
 
-# ==================== 模块 2: 单独修改下载目录 ====================
-modify_download_dir() {
-    echo ""
-    echo "=========================================="
-    echo "         单独配置 Aria2 下载目录          "
-    echo "=========================================="
-
+# ==================== 模块 2: Aria2 常用核心设置 (下载目录/并发/做种/限速/文件保留) ====================
+manage_core_settings() {
     if [ ! -f "${CONF_FILE}" ]; then
         echo "未检测到配置文件: ${CONF_FILE}，请先执行安装 Aria2！"
         return 1
     fi
 
-    CURRENT_DIR=$(grep -E "^dir=" "${CONF_FILE}" | cut -d'=' -f2 | tr -d '\r')
-    echo "当前默认下载目录: ${CURRENT_DIR:-未设置}"
-    echo ""
+    while true; do
+        local cur_dir cur_concurrent cur_up_limit cur_seed_time cur_seed_ratio cur_rm_unsel cur_save_meta
+        cur_dir=$(get_current_download_dir)
+        cur_concurrent=$(get_conf_value "max-concurrent-downloads" "5")
+        cur_up_limit=$(get_conf_value "max-overall-upload-limit" "2M")
+        cur_seed_time=$(get_conf_value "seed-time" "0")
+        cur_seed_ratio=$(get_conf_value "seed-ratio" "0.0")
+        cur_rm_unsel=$(get_conf_value "bt-remove-unselected-file" "true")
+        cur_save_meta=$(get_conf_value "bt-save-metadata" "false")
 
-    read -rp "请输入新的下载目录绝对路径 [留空取消]: " NEW_DIR
-    if [ -z "$NEW_DIR" ]; then
-        echo "输入为空，未做任何修改。"
-        return 0
-    fi
-    NEW_DIR="${NEW_DIR%/}"
+        echo ""
+        echo "=========================================="
+        echo "        Aria2 常用下载与做种核心配置      "
+        echo "=========================================="
+        echo " 当前参数状态:"
+        echo "  1. 默认下载目录:           ${cur_dir}"
+        echo "  2. 最大同时下载任务数:     ${cur_concurrent}"
+        echo "  3. 全局最大上传限速:       ${cur_up_limit}"
+        if [ "$cur_seed_time" == "0" ] && [ "$cur_seed_ratio" == "0.0" ]; then
+            echo "  4. BT 做种策略:            下载完成后立即停止做种 (0分钟/0分享率)"
+        else
+            echo "  4. BT 做种策略:            做种时间 ${cur_seed_time} 分钟 / 分享率达到 ${cur_seed_ratio}"
+        fi
+        echo "  5. 清理未选择的占位文件:   $([ "$cur_rm_unsel" == "true" ] && echo "是 (自动删除)" || echo "否 (保留空占位)")"
+        echo "  6. 保存磁力下载的种子文件: $([ "$cur_save_meta" == "true" ] && echo "是 (保存 .torrent)" || echo "否 (不保留)")"
+        echo "------------------------------------------"
+        echo " 7. 一键快捷配置向导 (交互式快速配置以上所有项)"
+        echo " 0. 保存并返回主菜单"
+        echo "=========================================="
+        read -rp "请选择需要修改的配置项 [0-7]: " SET_OPT
 
-    echo ">> 正在检查并创建目录: ${NEW_DIR}..."
-    mkdir -p "${NEW_DIR}"
+        case "$SET_OPT" in
+            1)
+                read -rp "请输入新的下载目录绝对路径 [留空取消]: " NEW_DIR
+                if [ -n "$NEW_DIR" ]; then
+                    NEW_DIR="${NEW_DIR%/}"
+                    mkdir -p "${NEW_DIR}"
+                    update_conf_kv "dir" "${NEW_DIR}"
+                    echo ">> 下载目录已更新为: ${NEW_DIR}"
+                fi
+                ;;
+            2)
+                read -rp "请输入最大同时下载任务数 (默认 5) [当前: ${cur_concurrent}]: " NEW_CONCURRENT
+                if [ -n "$NEW_CONCURRENT" ] && [[ "$NEW_CONCURRENT" =~ ^[0-9]+$ ]]; then
+                    update_conf_kv "max-concurrent-downloads" "${NEW_CONCURRENT}"
+                    echo ">> 最大同时下载任务数已更新为: ${NEW_CONCURRENT}"
+                fi
+                ;;
+            3)
+                read -rp "请输入全局最大上传限速 (例如 2M, 500K, 0 为不限速) [当前: ${cur_up_limit}]: " NEW_UP
+                if [ -n "$NEW_UP" ]; then
+                    update_conf_kv "max-overall-upload-limit" "${NEW_UP}"
+                    update_conf_kv "max-upload-limit" "${NEW_UP}"
+                    echo ">> 上传限速已更新为: ${NEW_UP}"
+                fi
+                ;;
+            4)
+                echo ""
+                echo "请选择 BT 做种模式:"
+                echo " 1. 下载完成立即停止做种 (不浪费上传带宽 / 推荐)"
+                echo " 2. 自定义做种时间 (到达设定分钟后自动停止)"
+                echo " 3. 自定义分享率 (做种达到指定倍数后停止)"
+                read -rp "请选择模式 [1-3 默认: 1]: " SEED_CHOICE
+                SEED_CHOICE="${SEED_CHOICE:-1}"
+                if [ "$SEED_CHOICE" == "1" ]; then
+                    update_conf_kv "seed-time" "0"
+                    update_conf_kv "seed-ratio" "0.0"
+                    echo ">> 已配置为下载完成后立即停止做种。"
+                elif [ "$SEED_CHOICE" == "2" ]; then
+                    read -rp "请输入做种时间 (单位: 分钟): " INPUT_TIME
+                    INPUT_TIME="${INPUT_TIME:-30}"
+                    update_conf_kv "seed-time" "${INPUT_TIME}"
+                    update_conf_kv "seed-ratio" "0.0"
+                    echo ">> 已配置为完成做种 ${INPUT_TIME} 分钟后停止。"
+                elif [ "$SEED_CHOICE" == "3" ]; then
+                    read -rp "请输入分享率阈值 (例如 1.0 或 2.0): " INPUT_RATIO
+                    INPUT_RATIO="${INPUT_RATIO:-1.0}"
+                    update_conf_kv "seed-ratio" "${INPUT_RATIO}"
+                    update_conf_kv "seed-time" "0"
+                    echo ">> 已配置为分享率达到 ${INPUT_RATIO} 后停止。"
+                fi
+                ;;
+            5)
+                read -rp "是否在下载完成后自动删除未勾选的占位文件? [Y/n 默认: Y]: " UNSEL_CHOICE
+                UNSEL_CHOICE="${UNSEL_CHOICE:-Y}"
+                if [[ "$UNSEL_CHOICE" =~ ^[Yy]$ ]]; then
+                    update_conf_kv "bt-remove-unselected-file" "true"
+                    echo ">> 已开启: 自动删除未选中的文件占位。"
+                else
+                    update_conf_kv "bt-remove-unselected-file" "false"
+                    echo ">> 已关闭: 保留所有文件的占位。"
+                fi
+                ;;
+            6)
+                read -rp "磁力链下载时是否把种子文件 (.torrent) 保存到下载目录? [y/N 默认: N]: " META_CHOICE
+                META_CHOICE="${META_CHOICE:-N}"
+                if [[ "$META_CHOICE" =~ ^[Yy]$ ]]; then
+                    update_conf_kv "bt-save-metadata" "true"
+                    echo ">> 已开启: 磁力链解析成功后将保留 .torrent 种子文件。"
+                else
+                    update_conf_kv "bt-save-metadata" "false"
+                    echo ">> 已关闭: 不保留额外种子文件。"
+                fi
+                ;;
+            7)
+                echo ""
+                echo "--- 开始交互式向导配置 ---"
+                read -rp "1. 默认下载目录 [当前: ${cur_dir}]: " IN_DIR
+                [ -n "$IN_DIR" ] && IN_DIR="${IN_DIR%/}" && mkdir -p "${IN_DIR}" && update_conf_kv "dir" "${IN_DIR}"
 
-    if grep -q "^dir=" "${CONF_FILE}"; then
-        sed -i "s|^dir=.*|dir=${NEW_DIR}|g" "${CONF_FILE}"
-    else
-        echo "dir=${NEW_DIR}" >> "${CONF_FILE}"
-    fi
+                read -rp "2. 同时下载任务数 [当前: ${cur_concurrent}]: " IN_CONCURRENT
+                [ -n "$IN_CONCURRENT" ] && update_conf_kv "max-concurrent-downloads" "${IN_CONCURRENT}"
 
-    echo ">> 正在重启 Aria2 服务以应用新路径..."
-    ${SYSTEMCTL_CMD} restart aria2.service
+                read -rp "3. 全局上传速度限制 [当前: ${cur_up_limit}]: " IN_UP
+                [ -n "$IN_UP" ] && update_conf_kv "max-overall-upload-limit" "${IN_UP}" && update_conf_kv "max-upload-limit" "${IN_UP}"
 
-    echo ""
-    echo ">> 默认下载目录已成功修改为: ${NEW_DIR}"
-    echo ">> Aria2 服务重启完成。"
+                read -rp "4. 完成后是否做种? (0=不借带宽直接停止, 或输入分钟数) [默认: 0]: " IN_SEED
+                IN_SEED="${IN_SEED:-0}"
+                update_conf_kv "seed-time" "${IN_SEED}"
+                [ "$IN_SEED" == "0" ] && update_conf_kv "seed-ratio" "0.0"
+
+                read -rp "5. 自动清理未勾选的多余占位文件? [Y/n 默认: Y]: " IN_RM
+                IN_RM="${IN_RM:-Y}"
+                [[ "$IN_RM" =~ ^[Yy]$ ]] && update_conf_kv "bt-remove-unselected-file" "true" || update_conf_kv "bt-remove-unselected-file" "false"
+
+                read -rp "6. 保存磁力下载的 .torrent 种子? [y/N 默认: N]: " IN_SAVE_META
+                IN_SAVE_META="${IN_SAVE_META:-N}"
+                [[ "$IN_SAVE_META" =~ ^[Yy]$ ]] && update_conf_kv "bt-save-metadata" "true" || update_conf_kv "bt-save-metadata" "false"
+
+                echo ">> 向导配置已完整写入！"
+                ;;
+            0)
+                echo ">> 正在重启 Aria2 服务以应用修改..."
+                ${SYSTEMCTL_CMD} restart aria2.service
+                echo ">> Aria2 服务重启完毕，配置已生效！"
+                break
+                ;;
+            *)
+                echo "无效选项，请重新选择。"
+                ;;
+        esac
+    done
 }
 
 # ==================== 模块 3: 单独设置/更新 Trackers ====================
@@ -1776,7 +1915,6 @@ clean_small_files_menu() {
     echo "      清理下载目录下的小文件 (防误删)     "
     echo "=========================================="
 
-    # 1. 默认路径为当前配置的下载路径
     local DEF_CLEAN_DIR
     DEF_CLEAN_DIR=$(get_current_download_dir)
 
@@ -1789,7 +1927,6 @@ clean_small_files_menu() {
         return 1
     fi
 
-    # 2. 输入大小门槛，默认 50MB
     read -rp "请输入文件大小门槛 (小于该大小的文件将被清理, 单位 MB) [默认: 50]: " SIZE_MB
     SIZE_MB="${SIZE_MB:-50}"
 
@@ -1802,14 +1939,12 @@ clean_small_files_menu() {
     echo ">> 正在扫描目录: ${TARGET_DIR}"
     echo ">> 过滤条件: 体积小于 ${SIZE_MB}MB (自动保护 .aria2 及正在下载中的任务)..."
 
-    # 3. 收集所有未完成任务的控制标识，防止误删正在下载的数据块
     declare -A ACTIVE_TASKS
     while IFS= read -r ctl; do
         ACTIVE_TASKS["$ctl"]=1
         ACTIVE_TASKS["${ctl%.aria2}"]=1
     done < <(find "${TARGET_DIR}" -type f -name "*.aria2" 2>/dev/null)
 
-    # 4. 扫描小于阈值的文件
     declare -a FILES_TO_DELETE=()
     local TOTAL_BYTES=0
 
@@ -1836,7 +1971,6 @@ clean_small_files_menu() {
     echo ""
     echo ">> 扫描完成！共找到 ${FILE_COUNT} 个符合条件的文件 (总计约 ${TOTAL_HUMAN} MB)。"
 
-    # 5. 分页查看机制
     if [ "$FILE_COUNT" -gt 20 ]; then
         read -rp "匹配到的文件较多 (${FILE_COUNT} 个)，是否翻页查看清单? [y/N 默认: N]: " VIEW_PAGER
         VIEW_PAGER="${VIEW_PAGER:-N}"
@@ -1869,7 +2003,6 @@ clean_small_files_menu() {
         echo "--------------------------------------------------"
     fi
 
-    # 6. 二次确认删除
     echo ""
     read -rp "确认彻底删除以上 ${FILE_COUNT} 个小于 ${SIZE_MB}MB 的文件以释放空间? [y/N 默认: N]: " CONFIRM_DEL
     CONFIRM_DEL="${CONFIRM_DEL:-N}"
@@ -1884,7 +2017,6 @@ clean_small_files_menu() {
         rm -f "$file"
     done
 
-    # 7. 可选清理空文件夹
     read -rp "是否顺带清理因删除小文件后遗留的空文件夹? [Y/n 默认: Y]: " CLEAN_EMPTY_DIR
     CLEAN_EMPTY_DIR="${CLEAN_EMPTY_DIR:-Y}"
     if [[ "$CLEAN_EMPTY_DIR" =~ ^[Yy]$ ]]; then
@@ -1983,15 +2115,17 @@ while true; do
     echo "  服务状态: $(get_aria2_status)"
     if [ -f "${CONF_FILE}" ]; then
         echo "  下载路径: $(get_current_download_dir)"
-        RPC_P=$(grep -E "^rpc-listen-port=" "${CONF_FILE}" 2>/dev/null | cut -d'=' -f2 | tr -d ' \r')
-        echo "  RPC 端口: ${RPC_P:-6800}"
-        UP_LIMIT=$(grep -E "^max-overall-upload-limit=" "${CONF_FILE}" 2>/dev/null | cut -d'=' -f2 | tr -d ' \r')
-        echo "  上传限速: ${UP_LIMIT:-未限制}"
+        RPC_P=$(get_conf_value "rpc-listen-port" "6800")
+        echo "  RPC 端口: ${RPC_P}"
+        RPC_SEC=$(get_conf_value "rpc-secret" "未设置")
+        echo "  RPC 密钥: ${RPC_SEC}"
+        UP_LIMIT=$(get_conf_value "max-overall-upload-limit" "未限制")
+        echo "  上传限速: ${UP_LIMIT}"
     fi
     echo "  可执行程序: ${ARIA2C_BIN}"
     echo "=========================================="
     echo " 1. $([ -f "${ARIA2C_BIN}" ] && echo "重新配置 Aria2 后端 (自动带入当前设置)" || echo "安装 / 配置 Aria2 后端 (默认启用 Trackers 自动更新)")"
-    echo " 2. 修改默认下载目录"
+    echo " 2. Aria2 常用核心设置 (下载目录 / 并发数 / 做种 / 上传限速 / 占位清理)"
     echo " 3. 手动更新 / 设置 BT Trackers (双源拉取 / 自定义)"
     echo " 4. 启用 / 停用 Trackers 自动更新"
     echo " 5. BT 吸血 Peer 防火墙拦截管理 (ipset+iptables / 默认关闭 / 每日更新)"
@@ -2004,14 +2138,14 @@ while true; do
     echo " 12. 单独卸载 AriaNg 前端"
     echo " 13. 完整卸载 (Aria2 + AriaNg + 防火墙规则 + 服务全清)"
     echo " 14. BT 自动筛选下载管理 (支持按大小及自定义后缀过滤)"
-    echo " 15. 扫描并清理下载目录下的小文件"
+    echo " 15. 扫描并清理下载目录下的小文件 (支持翻页预览 / 防误删)"
     echo " 0. 退出"
     echo "=========================================="
     read -rp "请选择操作 [0-15]: " MENU_CHOICE
 
     case "$MENU_CHOICE" in
         1) install_aria2 ;;
-        2) modify_download_dir ;;
+        2) manage_core_settings ;;
         3) update_trackers_menu ;;
         4) manage_tracker_timer ;;
         5) manage_peer_blocker ;;
