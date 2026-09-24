@@ -2671,6 +2671,7 @@ import urllib.parse
 import urllib.request
 
 CONF_FILE = os.environ.get("ARIA2_CONF_FILE", "")
+OUT_DIR = os.environ.get("ARIA2_OUT_DIR", ".")
 RPC_TIMEOUT = 20
 
 RED = "\033[0;31m"
@@ -3053,7 +3054,7 @@ PYEOF
 
     if [ "$scan_rc" -ne 0 ]; then
         echo ""
-        echo ">> [失败] 未能从 Aria2 获取任务状态，未做任何变更。"
+        echo ">> [失败] 任务扫描未完成 (请查看上方 Python 报错信息) 或无法连接 Aria2，未做任何变更。"
         rm -rf "${scan_tmp}"
         return 1
     fi
