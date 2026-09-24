@@ -2654,7 +2654,13 @@ resume_stopped_tasks() {
     echo ">> 正在分析 Aria2『已停止』列表: 只筛选未下载完整(报错 / 被移除 / 磁盘写满等)的任务..."
     echo "   (正常下载完成的 100% 任务会被自动跳过)"
 
-    ARIA2_CONF_FILE="${CONF_FILE}" python3 - <<'PYEOF'
+    local scan_tmp scan_rc
+    scan_tmp=$(mktemp -d)
+    scan_rc=0
+    # 注意: python3 是从 stdin(即 heredoc)读取脚本的，所以交互提示必须放在 bash 侧，
+    #       否则 python 里的 input() 会直接读到 EOF，导致静默取消、任务永远加不进去。
+    ARIA2_CONF_FILE="${CONF_FILE}" ARIA2_OUT_DIR="${scan_tmp}" \
+        python3 - <<'PYEOF' || scan_rc=$?
 import base64
 import json
 import os
@@ -2875,12 +2881,6 @@ def file_uris(task):
     return result
 
 
-def can_retry(task):
-    if task.get("infoHash"):
-        return True
-    return len(file_uris(task)) > 0
-
-
 def find_local_torrent(task):
     """尽可能找到本地 .torrent 元数据，用它重加比磁力链接更可靠。"""
     candidates = []
@@ -2978,6 +2978,44 @@ for task in stopped:
     total, done = task_progress(task)
     candidates.append((task, max(total - done, 0)))
 
+# 先落盘: 候选 GID 列表 + 每个可重试任务的 JSON-RPC 请求体(供 bash 侧直接发送)
+req_dir = os.path.join(OUT_DIR, "req")
+try:
+    os.makedirs(req_dir, exist_ok=True)
+except OSError:
+    pass
+
+try:
+    with open(os.path.join(OUT_DIR, "stopped.gids"), "wb") as fh:
+        for task, _left in candidates:
+            gid = task.get("gid") or ""
+            if gid:
+                fh.write(gid.encode("utf-8", "surrogateescape") + b"\x00")
+except OSError as exc:
+    print("!! 无法写入临时文件: %s" % exc)
+    sys.exit(1)
+
+for task, _left in candidates:
+    gid = task.get("gid") or ""
+    if not gid:
+        continue
+    method, params, desc = build_readd(task)
+    if method is None:
+        continue
+    add_params = ["token:" + RPC_SECRET] if RPC_SECRET else []
+    add_params.extend(params)
+    purge_params = ["token:" + RPC_SECRET] if RPC_SECRET else []
+    purge_params.append(gid)
+    try:
+        with open(os.path.join(req_dir, gid + ".add.json"), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"jsonrpc": "2.0", "id": "readd", "method": method, "params": add_params}))
+        with open(os.path.join(req_dir, gid + ".purge.json"), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"jsonrpc": "2.0", "id": "purge", "method": "aria2.removeDownloadResult", "params": purge_params}))
+        with open(os.path.join(req_dir, gid + ".meta"), "w", encoding="utf-8") as fh:
+            fh.write("%s|%s" % (task_name(task), desc))
+    except OSError:
+        pass
+
 skip_text = "、".join("%s x%d" % (k, v) for k, v in sorted(skipped_reasons.items())) if skipped_reasons else "无"
 print(">> RPC 连接正常: 127.0.0.1:%s" % RPC_PORT)
 print(">> 已停止任务 %d 个: 跳过 %s，需继续下载 %d 个。"
@@ -3005,102 +3043,133 @@ for index, item in enumerate(candidates, start=1):
         print("        错误: %s%s" % (message, (" (code %s)" % code) if code else ""))
     if (task.get("status") or "") == "removed":
         print("        %s注意: 该任务是被移除的(可能由手动操作或转移脚本触发)%s" % (YELLOW, NC))
-    if not can_retry(task):
+    _gid = task.get("gid") or ""
+    if not _gid or not os.path.isfile(os.path.join(req_dir, _gid + ".add.json")):
         print("        %s无法自动重试: 缺少种子 / 链接信息%s" % (YELLOW, NC))
 print("   " + "-" * 76)
 
 
-def ask(prompt):
-    try:
-        return input(prompt)
-    except (EOFError, KeyboardInterrupt):
-        print("")
-        return None
-
-
-answer = ask("请输入要重试的任务编号 (空格或逗号分隔；直接回车 = 全部 %d 个；输入 0 取消): " % len(candidates))
-if answer is None:
-    print(">> 输入已中断，操作取消。")
-    sys.exit(0)
-answer = answer.strip()
-if answer == "0":
-    print(">> 操作已取消。")
-    sys.exit(0)
-
-chosen = []
-if answer == "":
-    chosen = list(range(len(candidates)))
-else:
-    for token in answer.replace(",", " ").split():
-        if not token.isdigit():
-            print("   >> 忽略无效编号: %s" % token)
-            continue
-        number = int(token)
-        if number < 1 or number > len(candidates):
-            print("   >> 忽略超出范围的编号: %s" % token)
-            continue
-        if (number - 1) not in chosen:
-            chosen.append(number - 1)
-
-if not chosen:
-    print(">> 未选择任何任务，操作取消。")
-    sys.exit(0)
-
-confirm = ask("确认重新加入以上 %d 个任务以继续下载? [Y/n 默认: Y]: " % len(chosen))
-if confirm is None:
-    print(">> 输入已中断，操作取消。")
-    sys.exit(0)
-confirm = confirm.strip().lower()
-if confirm and not confirm.startswith("y"):
-    print(">> 操作已取消。")
-    sys.exit(0)
-
-print("")
-print(">> 正在重新加入任务 (已下载的数据通过断点续传保留，不会从头重新下载)...")
-ok_count = 0
-fail_count = 0
-for index in chosen:
-    task = candidates[index][0]
-    gid = task.get("gid") or ""
-    name = task_name(task)
-
-    # 重新取一次最新状态，避免列表展示后状态发生变化
-    fresh, fresh_err = rpc("aria2.tellStatus", [gid])
-    if fresh_err or not isinstance(fresh, dict):
-        print("   %s!!%s %s: 读取任务状态失败 (%s)" % (RED, NC, name, fresh_err or "无数据"))
-        fail_count += 1
-        continue
-    if is_normal_complete(fresh):
-        print("   %s✓%s %s: 已下载完整，无需重试" % (GREEN, NC, name))
-        continue
-
-    method, params, desc = build_readd(fresh)
-    if method is None:
-        print("   %s!%s %s: %s" % (YELLOW, NC, name, desc))
-        fail_count += 1
-        continue
-
-    result, add_err = rpc(method, params)
-    if add_err:
-        print("   %s!!%s %s: 重新加入失败 (%s)" % (RED, NC, name, add_err))
-        fail_count += 1
-        continue
-
-    ok_count += 1
-    print("   %s✓%s %s: 已重新加入队列 [%s] -> 新 GID %s" % (GREEN, NC, name, desc, result))
-
-    # 旧记录已失效，清理以免在『已停止』列表里重复出现
-    _ignored, purge_err = rpc("aria2.removeDownloadResult", [gid])
-    if purge_err:
-        print("      (提示: 旧记录清理失败: %s，可用菜单 9 -> 3 清理)" % purge_err)
-
-print("")
-if ok_count:
-    print("%s>> 完成: %d 个任务已重新加入下载队列，正在断点续传。%s" % (GREEN, ok_count, NC))
-if fail_count:
-    print("%s>> 有 %d 个任务未能自动重试，请参考上方原因处理。%s" % (YELLOW, fail_count, NC))
-print(">> 可打开 AriaNg 查看: 任务会先『检查中 (Checking)』，随后自动断点续传。")
 PYEOF
+
+    if [ "$scan_rc" -ne 0 ]; then
+        echo ""
+        echo ">> [失败] 未能从 Aria2 获取任务状态，未做任何变更。"
+        rm -rf "${scan_tmp}"
+        return 1
+    fi
+
+    local gids_file="${scan_tmp}/stopped.gids"
+    if [ ! -s "${gids_file}" ]; then
+        rm -rf "${scan_tmp}"
+        return 0
+    fi
+
+    declare -a CAND_GIDS=()
+    mapfile -d '' -t CAND_GIDS < "${gids_file}" 2>/dev/null || CAND_GIDS=()
+    local total=${#CAND_GIDS[@]}
+    if [ "$total" -eq 0 ]; then
+        rm -rf "${scan_tmp}"
+        return 0
+    fi
+
+    local SELECTION
+    read -rp "请输入要重试的任务编号 (空格或逗号分隔；直接回车 = 全部 ${total} 个；输入 0 取消): " SELECTION || true
+    SELECTION="${SELECTION:-}"
+    if [ "$SELECTION" = "0" ]; then
+        echo ">> 操作已取消。"
+        rm -rf "${scan_tmp}"
+        return 0
+    fi
+
+    declare -a CHOSEN_GIDS=()
+    local token
+    if [ -z "$SELECTION" ]; then
+        CHOSEN_GIDS=("${CAND_GIDS[@]}")
+    else
+        local -a TOKENS=()
+        read -ra TOKENS <<< "${SELECTION//,/ }"
+        for token in "${TOKENS[@]}"; do
+            if [[ ! "$token" =~ ^[0-9]+$ ]]; then
+                echo "   >> 忽略无效编号: ${token}"
+                continue
+            fi
+            if [ "$token" -lt 1 ] || [ "$token" -gt "$total" ]; then
+                echo "   >> 忽略超出范围的编号: ${token} (有效范围 1-${total})"
+                continue
+            fi
+            CHOSEN_GIDS+=("${CAND_GIDS[$((token - 1))]}")
+        done
+    fi
+
+    if [ ${#CHOSEN_GIDS[@]} -eq 0 ]; then
+        echo ">> 未选择任何任务，操作已取消。"
+        rm -rf "${scan_tmp}"
+        return 0
+    fi
+
+    local CONFIRM
+    read -rp "确认重新加入以上 ${#CHOSEN_GIDS[@]} 个任务以继续下载? [Y/n 默认: Y]: " CONFIRM || true
+    CONFIRM="${CONFIRM:-Y}"
+    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+        echo ">> 操作已取消。"
+        rm -rf "${scan_tmp}"
+        return 0
+    fi
+
+    echo ""
+    echo ">> 正在重新加入任务 (已下载的数据会断点续传保留，不会从头重新下载)..."
+    local ok_count=0 fail_count=0
+    local gid meta name desc add_body purge_body resp new_gid err_msg
+    for gid in "${CHOSEN_GIDS[@]}"; do
+        meta="$(cat "${scan_tmp}/req/${gid}.meta" 2>/dev/null || true)"
+        if [ -n "$meta" ]; then
+            name="${meta%%|*}"
+            desc="${meta#*|}"
+        else
+            name="$gid"
+            desc="未知来源"
+        fi
+
+        add_body="${scan_tmp}/req/${gid}.add.json"
+        if [ ! -f "${add_body}" ]; then
+            echo "   [!] ${name}: 无法自动重试 (缺少种子 / 链接信息)"
+            fail_count=$((fail_count + 1))
+            continue
+        fi
+
+        resp=$(curl -sS -m 20 -X POST -H "Content-Type: application/json" \
+            --data-binary @"${add_body}" "http://127.0.0.1:${RPC_PORT}/jsonrpc" 2>/dev/null || true)
+
+        if printf '%s' "${resp}" | grep -q '"result"'; then
+            new_gid=$(printf '%s' "${resp}" | sed -n 's/.*"result":"\([^"]*\)".*/\1/p' || true)
+            ok_count=$((ok_count + 1))
+            echo "   [成功] ${name}: 已重新加入下载队列 [${desc}] -> 新 GID ${new_gid:-未知}"
+            # 旧记录已失效，清理以免在『已停止』列表里重复出现
+            purge_body="${scan_tmp}/req/${gid}.purge.json"
+            if [ -f "${purge_body}" ]; then
+                curl -sS -m 20 -X POST -H "Content-Type: application/json" \
+                    --data-binary @"${purge_body}" "http://127.0.0.1:${RPC_PORT}/jsonrpc" >/dev/null 2>&1 || true
+            fi
+        else
+            err_msg=$(printf '%s' "${resp}" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p' || true)
+            fail_count=$((fail_count + 1))
+            echo "   [失败] ${name}: 重新加入失败 (${err_msg:-RPC 无有效响应})"
+            if [ -z "${resp}" ]; then
+                echo "          (提示: 无法连接 RPC，请确认 Aria2 正在运行)"
+            fi
+        fi
+    done
+
+    echo ""
+    if [ "$ok_count" -gt 0 ]; then
+        echo ">> [完成] ${ok_count} 个任务已重新加入下载队列，正在断点续传。"
+    fi
+    if [ "$fail_count" -gt 0 ]; then
+        echo ">> [注意] 有 ${fail_count} 个任务未能自动重试，请参考上方原因处理。"
+    fi
+    echo ">> 可打开 AriaNg 查看: 任务会先『检查中 (Checking)』，随后自动断点续传。"
+
+    rm -rf "${scan_tmp}"
 }
 
 # ==================== 模块 9: 实用辅助与清理工具箱 ====================
