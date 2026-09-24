@@ -39,6 +39,9 @@ fi
 
 FRPS_BIN="${BIN_DIR}/frps"
 FRPC_BIN="${BIN_DIR}/frpc"
+# 客户端 / 服务端配置分目录存放，避免同目录下互相混淆
+CLIENT_CONFIG_DIR="${CONFIG_DIR}/frpc"
+SERVER_CONFIG_DIR="${CONFIG_DIR}/frps"
 CERTS_DIR="${CONFIG_DIR}/certs"
 CLIENT_SERVICE_FILE="${SYSTEMD_DIR}/frpc@.service"
 SERVER_SERVICE_FILE="${SYSTEMD_DIR}/frps@.service"
@@ -145,6 +148,8 @@ check_dependencies() {
 }
 
 mkdir -p "$CONFIG_DIR"
+mkdir -p "$CLIENT_CONFIG_DIR"
+mkdir -p "$SERVER_CONFIG_DIR"
 mkdir -p "$CERTS_DIR"
 mkdir -p "$SYSTEMD_DIR"
 check_dependencies
@@ -163,7 +168,7 @@ Type=simple
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=1048576
-ExecStart=/usr/local/bin/frpc -c /etc/frp/%i.toml
+ExecStart=/usr/local/bin/frpc -c /etc/frp/frpc/%i.toml
 
 [Install]
 WantedBy=multi-user.target
@@ -180,7 +185,7 @@ Type=simple
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=1048576
-ExecStart=/usr/local/bin/frps -c /etc/frp/%i.toml
+ExecStart=/usr/local/bin/frps -c /etc/frp/frps/%i.toml
 
 [Install]
 WantedBy=multi-user.target
@@ -196,7 +201,7 @@ Type=simple
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=1048576
-ExecStart=%h/.local/bin/frpc -c %h/.local/etc/frp/%i.toml
+ExecStart=%h/.local/bin/frpc -c %h/.local/etc/frp/frpc/%i.toml
 
 [Install]
 WantedBy=default.target
@@ -212,7 +217,7 @@ Type=simple
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=1048576
-ExecStart=%h/.local/bin/frps -c %h/.local/etc/frp/%i.toml
+ExecStart=%h/.local/bin/frps -c %h/.local/etc/frp/frps/%i.toml
 
 [Install]
 WantedBy=default.target
@@ -224,6 +229,58 @@ EOF
     fi
 
     $SYSTEMCTL_CMD daemon-reload
+}
+
+# ======================= 旧版扁平配置自动迁移 =======================
+# 历史版本把 frpc / frps 的 .toml 直接放在 $CONFIG_DIR 下，这里按角色归档到 frpc/ 与 frps/
+FRP_MIGRATED_COUNT=0
+migrate_flat_frp_configs() {
+    local f="" name="" dest="" role_hint=""
+    for f in "$CONFIG_DIR"/*.toml; do
+        [[ -e "$f" ]] || continue
+        name=$(basename "$f")
+        if grep -q "serverAddr" "$f" 2>/dev/null; then
+            dest="${CLIENT_CONFIG_DIR}/${name}"
+        elif grep -q "bindPort" "$f" 2>/dev/null; then
+            dest="${SERVER_CONFIG_DIR}/${name}"
+        else
+            dest="${CLIENT_CONFIG_DIR}/${name}"
+            role_hint=" (角色无法识别，暂归入 frpc/)"
+        fi
+        if [[ -e "$dest" ]]; then
+            dest="${dest%.toml}.from-flat.toml"
+        fi
+        if ! mv -f "$f" "$dest" 2>/dev/null; then
+            echo -e "${RED}!! 归档失败，保留原位置: ${f}${NC}"
+            continue
+        fi
+        echo -e "${GREEN}✓ 已归档配置: ${name} -> ${dest}${NC}${role_hint}"
+        FRP_MIGRATED_COUNT=$(( FRP_MIGRATED_COUNT + 1 ))
+        role_hint=""
+    done
+    if [[ "$FRP_MIGRATED_COUNT" -gt 0 ]]; then
+        echo -e "${CYAN}>> 已将 ${FRP_MIGRATED_COUNT} 个旧版配置按角色归档到 frpc/ 与 frps/ 子目录。${NC}"
+    fi
+}
+
+# 迁移后重启仍在运行的实例，使其加载新的 -c 配置路径
+restart_instances_after_migration() {
+    [[ "$FRP_MIGRATED_COUNT" -gt 0 ]] || return 0
+    local name="" unit="" state="" restarted=0
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        for unit in "frpc@${name}" "frps@${name}"; do
+            state=$($SYSTEMCTL_CMD is-active "$unit" 2>/dev/null | head -n 1 | tr -d ' \r\n' || true)
+            if [[ "$state" == "active" ]]; then
+                $SYSTEMCTL_CMD restart "$unit" 2>/dev/null || true
+                echo -e "${GREEN}✓ 已重启实例以加载新配置路径: ${unit}${NC}"
+                restarted=$(( restarted + 1 ))
+            fi
+        done
+    done < <(frp_instance_names)
+    if [[ "$restarted" -gt 0 ]]; then
+        echo -e "${CYAN}>> 共重启 ${restarted} 个实例。${NC}"
+    fi
 }
 
 # ======================= Acme.sh 管理模块 (已精简) =======================
@@ -450,10 +507,16 @@ add_config() {
     echo -e "已选择角色: ${CYAN}${role_str}${NC}"
 
     prompt_required "请输入配置文件名称 (无需后缀，如 default): " conf_name
-    local target_file="${CONFIG_DIR}/${conf_name}.toml"
+    local role_dir="$SERVER_CONFIG_DIR"
+    local other_dir="$CLIENT_CONFIG_DIR"
+    [[ "$role_choice" == "2" ]] && { role_dir="$CLIENT_CONFIG_DIR"; other_dir="$SERVER_CONFIG_DIR"; }
+    local target_file="${role_dir}/${conf_name}.toml"
     if [[ -f "$target_file" ]]; then
-        echo -e "${RED}错误: 配置文件 ${conf_name}.toml 已存在！${NC}"
+        echo -e "${RED}错误: ${role_str} 配置文件 ${conf_name}.toml 已存在！${NC}"
         return
+    fi
+    if [[ -f "${other_dir}/${conf_name}.toml" ]]; then
+        echo -e "${YELLOW}提示: 同名配置已存在于另一角色目录（${other_dir}），本次将写入 ${role_dir}/ 互不影响。${NC}"
     fi
 
     case "$role_choice" in
@@ -608,13 +671,13 @@ EOF
 # ======================= 追加代理配置入口 =======================
 append_service_config() {
     echo -e "\n${BLUE}--- 向现有客户端配置追加代理规则 ---${NC}"
-    local files=("$CONFIG_DIR"/*.toml)
+    local files=("$CLIENT_CONFIG_DIR"/*.toml)
     if [[ ! -e "${files[0]}" ]]; then
-        echo -e "${YELLOW}未检索到任何配置文件，请先添加主配置文件！${NC}"
+        echo -e "${YELLOW}未检索到任何客户端配置，请先添加客户端 (frpc) 主配置文件！${NC}"
         return
     fi
 
-    echo "现有配置文件清单:"
+    echo "现有客户端配置文件清单:"
     local names=()
     local idx=1
     for f in "${files[@]}"; do
@@ -636,7 +699,7 @@ append_service_config() {
         conf_name="$target_input"
     fi
 
-    local target_file="${CONFIG_DIR}/${conf_name}.toml"
+    local target_file="${CLIENT_CONFIG_DIR}/${conf_name}.toml"
     if [[ ! -f "$target_file" ]]; then
         echo -e "${RED}未找到指定配置文件: ${target_file}${NC}"
         return
@@ -662,50 +725,74 @@ append_service_config() {
 # ======================= 删除配置及关联服务 =======================
 delete_config() {
     echo -e "\n${BLUE}--- 删除 FRP 配置文件及对应服务 ---${NC}"
-    local files=("$CONFIG_DIR"/*.toml)
-    if [[ ! -e "${files[0]}" ]]; then
+    local roles=() names=() files=()
+    local f="" name=""
+    for f in "$CLIENT_CONFIG_DIR"/*.toml; do
+        [[ -e "$f" ]] || continue
+        roles+=("client"); names+=("$(basename "$f" .toml)"); files+=("$f")
+    done
+    for f in "$SERVER_CONFIG_DIR"/*.toml; do
+        [[ -e "$f" ]] || continue
+        roles+=("server"); names+=("$(basename "$f" .toml)"); files+=("$f")
+    done
+
+    if [[ ${#names[@]} -eq 0 ]]; then
         echo -e "${YELLOW}未找到任何 .toml 配置文件。${NC}"
         return
     fi
 
-    echo "现有配置文件清单:"
-    local names=()
-    local idx=1
-    for f in "${files[@]}"; do
-        local n
-        n=$(basename "$f" .toml)
-        names+=("$n")
-        echo -e "  [${CYAN}${idx}${NC}] ${n}"
-        ((idx++))
+    echo "现有配置文件清单 (带角色标注):"
+    local idx=0 role_text=""
+    for ((idx=0; idx<${#names[@]}; idx++)); do
+        if [[ "${roles[$idx]}" == "server" ]]; then
+            role_text="Server (frps)"
+        else
+            role_text="Client (frpc)"
+        fi
+        echo -e "  [${CYAN}$((idx+1))${NC}] ${names[$idx]}  ${YELLOW}(${role_text})${NC}"
     done
     echo "----------------------------------------"
 
-    read -rp "请输入要删除的配置 [序号或名称, 0 取消]: " del_input
+    read -rp "请输入要删除的配置 [序号 或 角色/名称(如 server/default), 0 取消]: " del_input
     [[ "$del_input" == "0" || -z "$del_input" ]] && return
 
-    local del_name=""
+    local del_idx=-1 want_role="" want_name=""
     if [[ "$del_input" =~ ^[0-9]+$ ]] && (( del_input >= 1 && del_input <= ${#names[@]} )); then
-        del_name="${names[$((del_input - 1))]}"
+        del_idx=$((del_input - 1))
     else
-        del_name="$del_input"
+        want_name="$del_input"
+        if [[ "$del_input" == */* ]]; then
+            want_role="${del_input%%/*}"
+            want_name="${del_input#*/}"
+        fi
+        for ((idx=0; idx<${#names[@]}; idx++)); do
+            [[ "${names[$idx]}" == "$want_name" ]] || continue
+            if [[ -z "$want_role" || "$want_role" == "${roles[$idx]}" ]]; then
+                del_idx=$idx
+                break
+            fi
+        done
     fi
 
-    local target_file="${CONFIG_DIR}/${del_name}.toml"
+    if (( del_idx < 0 )); then
+        echo -e "${RED}未找到指定配置: ${del_input}${NC}"
+        return
+    fi
 
-    if [[ -f "$target_file" ]]; then
-        read -rp "确认彻底停止关联服务并删除 ${del_name}.toml？(y/N): " confirm
-        if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-            $SYSTEMCTL_CMD stop "frpc@${del_name}" 2>/dev/null || true
-            $SYSTEMCTL_CMD stop "frps@${del_name}" 2>/dev/null || true
-            $SYSTEMCTL_CMD disable "frpc@${del_name}" 2>/dev/null || true
-            $SYSTEMCTL_CMD disable "frps@${del_name}" 2>/dev/null || true
-            rm -f "$target_file"
-            echo -e "${GREEN}✓ 配置及服务已成功移除: ${del_name}.toml${NC}"
-        else
-            echo -e "${YELLOW}操作已取消。${NC}"
-        fi
+    local del_name="${names[$del_idx]}"
+    local del_role="${roles[$del_idx]}"
+    local target_file="${files[$del_idx]}"
+    local unit_name="frpc@${del_name}"
+    [[ "$del_role" == "server" ]] && unit_name="frps@${del_name}"
+
+    read -rp "确认彻底停止关联服务并删除 ${del_name}.toml (${del_role})？(y/N): " confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        $SYSTEMCTL_CMD stop "$unit_name" 2>/dev/null || true
+        $SYSTEMCTL_CMD disable "$unit_name" 2>/dev/null || true
+        rm -f "$target_file"
+        echo -e "${GREEN}✓ 配置及服务已成功移除: ${target_file}${NC}"
     else
-        echo -e "${RED}未找到指定配置文件: ${target_file}${NC}"
+        echo -e "${YELLOW}操作已取消。${NC}"
     fi
 }
 
@@ -715,8 +802,18 @@ manage_services() {
     [[ "$IS_ROOT" == true ]] && mode_tag="Root 全局模式"
     echo -e "\n${BLUE}--- 实例运行状态看板 [${mode_tag}] ---${NC}"
 
-    local files=("$CONFIG_DIR"/*.toml)
-    if [[ ! -e "${files[0]}" ]]; then
+    local roles=() names=() files=()
+    local f="" name=""
+    for f in "$CLIENT_CONFIG_DIR"/*.toml; do
+        [[ -e "$f" ]] || continue
+        roles+=("client"); names+=("$(basename "$f" .toml)"); files+=("$f")
+    done
+    for f in "$SERVER_CONFIG_DIR"/*.toml; do
+        [[ -e "$f" ]] || continue
+        roles+=("server"); names+=("$(basename "$f" .toml)"); files+=("$f")
+    done
+
+    if [[ ${#names[@]} -eq 0 ]]; then
         echo -e "${YELLOW}当前没有任何配置，请先添加配置后再管理。${NC}"
         return
     fi
@@ -735,30 +832,24 @@ manage_services() {
     echo
     echo "----------------------------------------------------------------------------------"
 
-    local config_list=()
-    local idx=1
-    for f in "${files[@]}"; do
-        local name
-        name=$(basename "$f" .toml)
-        config_list+=("$name")
+    local idx=0
+    for ((idx=0; idx<${#names[@]}; idx++)); do
+        name="${names[$idx]}"
 
-        local role="未知"
-        local unit=""
-        if grep -q "serverAddr" "$f"; then 
-            role="Client (frpc)"
-            unit="frpc@${name}"
-        elif grep -q "bindPort" "$f"; then 
+        local role="" unit=""
+        if [[ "${roles[$idx]}" == "server" ]]; then
             role="Server (frps)"
             unit="frps@${name}"
+        else
+            role="Client (frpc)"
+            unit="frpc@${name}"
         fi
 
         local active_status="inactive"
         local enabled_status="disabled"
 
-        if [[ -n "$unit" ]]; then
-            active_status=$($SYSTEMCTL_CMD is-active "$unit" 2>/dev/null | head -n 1 | tr -d ' \r\n' || true)
-            enabled_status=$($SYSTEMCTL_CMD is-enabled "$unit" 2>/dev/null | head -n 1 | tr -d ' \r\n' || true)
-        fi
+        active_status=$($SYSTEMCTL_CMD is-active "$unit" 2>/dev/null | head -n 1 | tr -d ' \r\n' || true)
+        enabled_status=$($SYSTEMCTL_CMD is-enabled "$unit" 2>/dev/null | head -n 1 | tr -d ' \r\n' || true)
 
         [[ -z "$active_status" ]] && active_status="inactive"
         [[ -z "$enabled_status" ]] && enabled_status="disabled"
@@ -778,49 +869,47 @@ manage_services() {
             *)        enabled_colored="${YELLOW}${enabled_status}${NC}" ;;
         esac
 
-        print_cell "[$idx]" "[$idx]" "$W_IDX"
+        print_cell "[$((idx+1))]" "[$((idx+1))]" "$W_IDX"
         print_cell "$name" "$name" "$W_NAME"
         print_cell "$role" "$role" "$W_TYPE"
         print_cell "$active_status" "$active_colored" "$W_STATUS"
         print_cell "$enabled_status" "$enabled_colored" "$W_ENABLED"
         echo
-        ((idx++))
     done
     echo "----------------------------------------------------------------------------------"
 
-    read -rp "请输入要操作的配置 [序号或名称, 0 返回]: " user_input
+    read -rp "请输入要操作的配置 [序号 或 角色/名称(如 server/default), 0 返回]: " user_input
     [[ "$user_input" == "0" || -z "$user_input" ]] && return
 
-    local op_name=""
-    if [[ "$user_input" =~ ^[0-9]+$ ]] && (( user_input >= 1 && user_input <= ${#config_list[@]} )); then
-        op_name="${config_list[$((user_input - 1))]}"
+    local op_idx=-1 want_role="" want_name=""
+    if [[ "$user_input" =~ ^[0-9]+$ ]] && (( user_input >= 1 && user_input <= ${#names[@]} )); then
+        op_idx=$((user_input - 1))
     else
-        op_name="$user_input"
+        want_name="$user_input"
+        if [[ "$user_input" == */* ]]; then
+            want_role="${user_input%%/*}"
+            want_name="${user_input#*/}"
+        fi
+        for ((idx=0; idx<${#names[@]}; idx++)); do
+            [[ "${names[$idx]}" == "$want_name" ]] || continue
+            if [[ -z "$want_role" || "$want_role" == "${roles[$idx]}" ]]; then
+                op_idx=$idx
+                break
+            fi
+        done
     fi
 
-    local selected_file="${CONFIG_DIR}/${op_name}.toml"
-    if [[ ! -f "$selected_file" ]]; then
-        echo -e "${RED}未找到配置: ${op_name}${NC}"
+    if (( op_idx < 0 )); then
+        echo -e "${RED}未找到配置: ${user_input}${NC}"
         return
     fi
 
-    local detected_role=""
-    if grep -q "bindPort" "$selected_file"; then
-        detected_role="Server"
-    elif grep -q "serverAddr" "$selected_file"; then
+    local op_name="${names[$op_idx]}"
+    local selected_file="${files[$op_idx]}"
+    local detected_role="Server"
+    local target_unit="frps@${op_name}"
+    if [[ "${roles[$op_idx]}" == "client" ]]; then
         detected_role="Client"
-    else
-        echo -e "${YELLOW}未能识别配置角色，请手动指定:${NC}"
-        echo "1. 作为 Server (frps) 管理"
-        echo "2. 作为 Client (frpc) 管理"
-        read -rp "输入选项 [1-2]: " fallback_choice
-        [[ "$fallback_choice" == "1" ]] && detected_role="Server" || detected_role="Client"
-    fi
-
-    local target_unit=""
-    if [[ "$detected_role" == "Server" ]]; then
-        target_unit="frps@${op_name}"
-    else
         target_unit="frpc@${op_name}"
     fi
 
@@ -917,10 +1006,20 @@ frp_version_text() {
     fi
 }
 
-# 统计配置目录中的实例配置数量
+# 统计配置目录中的实例配置数量 (client + server)
 frp_config_count() {
     local count=0 f=""
-    for f in "$CONFIG_DIR"/*.toml; do
+    for f in "$CLIENT_CONFIG_DIR"/*.toml "$SERVER_CONFIG_DIR"/*.toml; do
+        [[ -e "$f" ]] || continue
+        count=$(( count + 1 ))
+    done
+    printf '%s' "$count"
+}
+
+# 统计指定角色子目录下的配置数量
+frp_config_count_role() {
+    local dir="$1" count=0 f=""
+    for f in "$dir"/*.toml; do
         [[ -e "$f" ]] || continue
         count=$(( count + 1 ))
     done
@@ -933,7 +1032,7 @@ frp_instance_names() {
     local names=() result=()
     local found="false"
 
-    for f in "$CONFIG_DIR"/*.toml; do
+    for f in "$CLIENT_CONFIG_DIR"/*.toml "$SERVER_CONFIG_DIR"/*.toml; do
         [[ -e "$f" ]] || continue
         names+=("$(basename "$f" .toml)")
     done
@@ -1086,10 +1185,13 @@ uninstall_frp() {
     echo "[1/4] 停止并禁用所有 FRP 实例服务..."
     local f="" name="" unit="" exist="" skip="false"
     local units=() seen_units=()
-    for f in "$CONFIG_DIR"/*.toml; do
+    for f in "$CLIENT_CONFIG_DIR"/*.toml; do
         [[ -e "$f" ]] || continue
-        name=$(basename "$f" .toml)
-        units+=("frpc@${name}" "frps@${name}")
+        units+=("frpc@$(basename "$f" .toml)")
+    done
+    for f in "$SERVER_CONFIG_DIR"/*.toml; do
+        [[ -e "$f" ]] || continue
+        units+=("frps@$(basename "$f" .toml)")
     done
 
     # 兜底补充未在配置目录中出现的单元
@@ -1187,7 +1289,8 @@ menu() {
         echo "   版本: $(frp_version_text)"
         echo "=========================================="
         echo -e " 服务状态: $(frp_service_state_text)    开机自启: $(frp_boot_state_text)"
-        echo " 配置文件数量: $(frp_config_count)    配置目录: ${CONFIG_DIR}    二进制: ${BIN_DIR}/frp{c,s}"
+        echo " 配置文件数量: $(frp_config_count) (客户端 $(frp_config_count_role "$CLIENT_CONFIG_DIR") / 服务端 $(frp_config_count_role "$SERVER_CONFIG_DIR"))"
+        echo " 配置目录: ${CONFIG_DIR} (frpc / frps)    二进制: ${BIN_DIR}/frp{c,s}"
         echo "------------------------------------------"
         echo " 1. 检查最新版本并安装 / 更新 FRP (frps & frpc)"
         echo " 2. 添加新的主配置文件 (支持服务端 / 客户端)"
@@ -1222,5 +1325,7 @@ menu() {
     done
 }
 
+migrate_flat_frp_configs
 init_systemd_templates
+restart_instances_after_migration
 menu

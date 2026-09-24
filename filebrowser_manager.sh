@@ -56,9 +56,11 @@ else
 fi
 
 BIN_PATH="${BIN_DIR}/filebrowser"
-CONFIG_FILE="${WORK_DIR}/config.yaml"
-SETTINGS_FILE="${WORK_DIR}/settings.conf"
-SOURCES_FILE="${WORK_DIR}/sources.conf"
+# 配置文件统一收进 conf/ 子目录，与数据库 / 缓存等运行时数据分离
+CONF_DIR="${WORK_DIR}/conf"
+CONFIG_FILE="${CONF_DIR}/config.yaml"
+SETTINGS_FILE="${CONF_DIR}/settings.conf"
+SOURCES_FILE="${CONF_DIR}/sources.conf"
 SERVICE_FILE="${SYSTEMD_DIR}/${SERVICE_NAME}.service"
 
 RUN_MODE_TEXT="$([ "$IS_ROOT" = true ] && echo "Root (系统级服务)" || echo "普通用户 ${CURRENT_USER} (用户级服务)")"
@@ -266,7 +268,7 @@ get_setting() {
 
 set_setting() {
     local key="$1" val="$2" tmp=""
-    mkdir -p "$WORK_DIR"
+    mkdir -p "$CONF_DIR"
     touch "$SETTINGS_FILE"
     if grep -qE "^${key}=" "$SETTINGS_FILE" 2>/dev/null; then
         tmp=$(mktemp)
@@ -440,7 +442,7 @@ ask_source_name_path() {
 # ===========================================================================
 
 render_config() {
-    mkdir -p "$WORK_DIR"
+    mkdir -p "$CONF_DIR"
     if [[ -f "$CONFIG_FILE" ]]; then
         cp -f "$CONFIG_FILE" "${CONFIG_FILE}.bak" 2>/dev/null || true
     fi
@@ -807,6 +809,29 @@ initial_config_wizard() {
     render_config
 }
 
+# ===========================================================================
+#                        写入 systemd 服务文件
+# ===========================================================================
+write_service_file() {
+    mkdir -p "$SYSTEMD_DIR"
+    cat <<EOF > "$SERVICE_FILE"
+[Unit]
+Description=FileBrowser Quantum
+Documentation=https://filebrowserquantum.com
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=${WORK_DIR}
+ExecStart=${BIN_PATH} -c ${CONFIG_FILE}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=${SERVICE_WANTED_BY}
+EOF
+}
+
 install_or_update_filebrowser() {
     echo ""
     echo "=========================================="
@@ -839,7 +864,7 @@ install_or_update_filebrowser() {
 
     echo ""
     echo "[1/4] 准备目录与二进制程序..."
-    mkdir -p "$WORK_DIR"
+    mkdir -p "$WORK_DIR" "$CONF_DIR"
     if [[ "$need_download" == true ]]; then
         download_and_install_binary "$platform" || return 1
     elif [[ "$skip_download" == true ]]; then
@@ -871,23 +896,7 @@ install_or_update_filebrowser() {
 
     echo ""
     echo "[3/4] 写入 systemd 服务文件..."
-    mkdir -p "$SYSTEMD_DIR"
-    cat <<EOF > "$SERVICE_FILE"
-[Unit]
-Description=FileBrowser Quantum
-Documentation=https://filebrowserquantum.com
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=${WORK_DIR}
-ExecStart=${BIN_PATH} -c ${CONFIG_FILE}
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=${SERVICE_WANTED_BY}
-EOF
+    write_service_file
     echo "[✓] 服务文件: ${SERVICE_FILE}"
 
     echo ""
@@ -925,7 +934,7 @@ EOF
 
     echo " 可执行文件: ${BIN_PATH}"
     echo " 配置文件:   ${CONFIG_FILE}"
-    echo " 数据目录:   ${WORK_DIR} (数据库 + 缓存)"
+    echo " 数据目录:   ${WORK_DIR} (conf/ 配置 + 数据库 + 缓存)"
     echo " 访问地址:   http://<服务器IP>:${port}${base_url}"
     local i=0 line=""
     while IFS= read -r line; do
@@ -1567,7 +1576,7 @@ uninstall_filebrowser() {
 
     echo "[3/4] 处理工作目录..."
     local del_work=""
-    prompt "是否删除工作目录 ${WORK_DIR} (含 config.yaml / 数据库 / 缓存)? [y/N]: " del_work
+    prompt "是否删除工作目录 ${WORK_DIR} (含 conf/ 配置 / 数据库 / 缓存)? [y/N]: " del_work
     if [[ "$del_work" =~ ^[Yy]$ ]]; then
         rm -rf "$WORK_DIR"
         echo -e "${GREEN}[✓] 已删除工作目录: ${WORK_DIR}${NC}"
@@ -1616,6 +1625,48 @@ uninstall_filebrowser() {
     echo -e "       ${GREEN}FileBrowser 已成功卸载完成！${NC}"
     echo "=========================================="
     return 0
+}
+
+# ===========================================================================
+#                  旧版扁平配置自动迁移 (WORK_DIR -> conf/)
+# ===========================================================================
+FB_MIGRATED_COUNT=0
+migrate_flat_fb_configs() {
+    local name="" f="" dest=""
+    mkdir -p "$CONF_DIR" 2>/dev/null || true
+    for name in config.yaml settings.conf sources.conf; do
+        f="${WORK_DIR}/${name}"
+        [[ -e "$f" ]] || continue
+        dest="${CONF_DIR}/${name}"
+        if [[ -e "$dest" ]]; then
+            echo -e "${YELLOW}提示: ${dest} 已存在，旧文件另存为 ${f}.old${NC}"
+            mv -f "$f" "${f}.old" 2>/dev/null || true
+            continue
+        fi
+        if mv -f "$f" "$dest" 2>/dev/null; then
+            echo -e "${GREEN}✓ 已迁移配置: ${f} -> ${dest}${NC}"
+            FB_MIGRATED_COUNT=$(( FB_MIGRATED_COUNT + 1 ))
+        else
+            echo -e "${RED}!! 迁移失败，保留原位置: ${f}${NC}"
+        fi
+    done
+    if [[ "$FB_MIGRATED_COUNT" -gt 0 ]]; then
+        echo -e "${CYAN}>> 已将 ${FB_MIGRATED_COUNT} 个配置文件迁移到 ${CONF_DIR}${NC}"
+    fi
+}
+
+# 迁移后刷新服务文件并重启服务，使新的配置路径生效
+refresh_service_after_migration() {
+    [[ "$FB_MIGRATED_COUNT" -gt 0 ]] || return 0
+    [[ -f "$SERVICE_FILE" ]] || return 0
+    write_service_file
+    $SYSTEMCTL_CMD daemon-reload 2>/dev/null || true
+    local state=""
+    state=$($SYSTEMCTL_CMD is-active "${SERVICE_NAME}.service" 2>/dev/null | head -n 1 | tr -d ' \r\n' || true)
+    if [[ "$state" == "active" ]]; then
+        $SYSTEMCTL_CMD restart "${SERVICE_NAME}.service" 2>/dev/null || true
+        echo -e "${GREEN}✓ 已重启 ${SERVICE_NAME}.service 以加载新的配置路径${NC}"
+    fi
 }
 
 # ===========================================================================
@@ -1671,4 +1722,6 @@ main_menu() {
     done
 }
 
+migrate_flat_fb_configs
+refresh_service_after_migration
 main_menu
