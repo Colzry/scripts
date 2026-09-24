@@ -2522,20 +2522,21 @@ PYEOF
     rm -rf "${scan_tmp}"
 }
 
-# ==================== 模块 8: 扫描并恢复未完成种子任务 ====================
+# ==================== 模块 8: 恢复未完成下载 / 重试异常停止的任务 ====================
 scan_and_resume_torrents() {
-    echo ""
-    echo "=========================================="
-    echo "    扫描目录并恢复未完成种子断点下载      "
-    echo "=========================================="
-
     if [ ! -f "${CONF_FILE}" ]; then
         echo "错误: 未找到配置文件 ${CONF_FILE}，请先确认 Aria2 是否已安装。"
         return 1
     fi
 
-    install_packages curl
+    install_packages curl python3
 
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "错误: 未检测到 python3，无法解析 Aria2 RPC 状态，请先安装 python3 后重试。"
+        return 1
+    fi
+
+    local RPC_PORT RPC_SECRET
     RPC_PORT=$(grep -E "^rpc-listen-port=" "${CONF_FILE}" | cut -d'=' -f2- | tr -d ' \r')
     RPC_PORT="${RPC_PORT:-$DEFAULT_PORT}"
     RPC_SECRET=$(grep -E "^rpc-secret=" "${CONF_FILE}" | cut -d'=' -f2- | tr -d ' \r')
@@ -2546,6 +2547,33 @@ scan_and_resume_torrents() {
         sleep 1
     fi
 
+    local SUB_CHOICE
+    while true; do
+        echo ""
+        echo "=========================================="
+        echo "       恢复 / 重试未完成的下载任务        "
+        echo "=========================================="
+        echo " 1. 扫描目录并恢复未完成种子断点下载 (重新注入 .torrent)"
+        echo " 2. 一键继续下载异常停止的任务 (报错 / 未完成，如磁盘写满导致)"
+        echo " 0. 返回上级菜单"
+        echo "=========================================="
+        read -rp "请选择操作 [0-2 默认: 0]: " SUB_CHOICE
+        SUB_CHOICE="${SUB_CHOICE:-0}"
+
+        case "$SUB_CHOICE" in
+            1) resume_torrents_from_dir || true ;;
+            2) resume_stopped_tasks || true ;;
+            0) return 0 ;;
+            *) echo "无效选项，请重新选择。"; continue ;;
+        esac
+
+        pause_menu
+    done
+}
+
+# ==================== 模块 8-1: 扫描目录并重新注入 .torrent 恢复断点 ====================
+resume_torrents_from_dir() {
+    local CURRENT_DIR
     CURRENT_DIR=$(get_current_download_dir)
     read -rp "请输入要扫描的种子所在目录 [默认: ${CURRENT_DIR}]: " TARGET_SCAN_DIR
     TARGET_SCAN_DIR="${TARGET_SCAN_DIR:-$CURRENT_DIR}"
@@ -2615,6 +2643,464 @@ EOF
     echo ""
     echo ">> 处理完毕！共成功推送并激活 ${resumed_count} 个未完成任务。"
     echo ">> 请打开 AriaNg 查看任务列表，任务会先进行“检查中 (Checking)”，自检完成后将自动断点续传。"
+}
+
+# ==================== 模块 8-2: 一键继续下载异常停止的任务 ====================
+# 说明: aria2 的 aria2.unpause 仅适用于 paused 状态，对已停止(error/removed)的任务会直接拒绝，
+#       因此这里按原任务信息重新加入下载队列(复用 .aria2 断点，不会重新下载已完成的数据)。
+resume_stopped_tasks() {
+    echo ""
+    echo "---- [异常停止任务] 一键继续下载 ----"
+    echo ">> 正在分析 Aria2『已停止』列表: 只筛选未下载完整(报错 / 被移除 / 磁盘写满等)的任务..."
+    echo "   (正常下载完成的 100% 任务会被自动跳过)"
+
+    ARIA2_CONF_FILE="${CONF_FILE}" python3 - <<'PYEOF'
+import base64
+import json
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+CONF_FILE = os.environ.get("ARIA2_CONF_FILE", "")
+RPC_TIMEOUT = 20
+
+RED = "\033[0;31m"
+GREEN = "\033[0;32m"
+YELLOW = "\033[0;33m"
+CYAN = "\033[0;36m"
+NC = "\033[0m"
+
+
+def read_conf(key, default):
+    try:
+        with open(CONF_FILE, "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                name, value = line.split("=", 1)
+                if name.strip() == key:
+                    return value.strip()
+    except OSError:
+        pass
+    return default
+
+
+def num(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def human(size):
+    value = float(size)
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if value < 1024 or unit == "TB":
+            return "%.1f %s" % (value, unit)
+        value = value / 1024
+    return "%.1f TB" % value
+
+
+RPC_PORT = read_conf("rpc-listen-port", "6800") or "6800"
+RPC_SECRET = read_conf("rpc-secret", "")
+RPC_URL = "http://127.0.0.1:" + RPC_PORT + "/jsonrpc"
+# 显式使用空代理，防止本地 127.0.0.1 请求被系统 http_proxy 劫持
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+TRANSPORT = ["urllib"]
+
+
+def make_body(method, params):
+    call_params = ["token:" + RPC_SECRET] if RPC_SECRET else []
+    if params:
+        call_params.extend(params)
+    return json.dumps({"jsonrpc": "2.0", "id": "resume_stopped", "method": method, "params": call_params})
+
+
+def call_urllib(body):
+    req = urllib.request.Request(RPC_URL, data=body.encode("utf-8"), headers={"Content-Type": "application/json"})
+    try:
+        with OPENER.open(req, timeout=RPC_TIMEOUT) as resp:
+            return resp.read().decode("utf-8", "replace"), None
+    except urllib.error.HTTPError as exc:
+        return None, "HTTP %s" % exc.code
+    except urllib.error.URLError as exc:
+        return None, "无法连接 127.0.0.1:%s (%s)" % (RPC_PORT, getattr(exc, "reason", exc))
+    except Exception as exc:
+        return None, "%s: %s" % (type(exc).__name__, exc)
+
+
+def call_curl(body):
+    try:
+        proc = subprocess.run(["curl", "-sS", "-m", str(RPC_TIMEOUT), "--noproxy", "*", "-X", "POST",
+                               "-H", "Content-Type: application/json", "--data-binary", "@-", RPC_URL],
+                              input=body.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=RPC_TIMEOUT + 10)
+    except FileNotFoundError:
+        return None, "未找到 curl 命令"
+    except Exception as exc:
+        return None, "curl 执行异常: %s" % exc
+    if proc.returncode != 0:
+        return None, "curl 退出码 %s" % proc.returncode
+    return proc.stdout.decode("utf-8", "replace"), None
+
+
+def parse_resp(raw):
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None, "响应不是合法 JSON: %s" % raw[:120]
+    if not isinstance(data, dict):
+        return None, "响应格式异常"
+    if data.get("error"):
+        err = data["error"] if isinstance(data["error"], dict) else {}
+        return None, "[%s] %s" % (err.get("code", "?"), err.get("message", ""))
+    return data.get("result"), None
+
+
+def rpc(method, params=None):
+    """返回 (结果, 错误描述)；urllib 失败时自动回退 curl。"""
+    body = make_body(method, params)
+    if TRANSPORT[0] == "curl":
+        raw, err = call_curl(body)
+        if err is None:
+            return parse_resp(raw)
+        return None, err
+    raw, err = call_urllib(body)
+    if err is None:
+        return parse_resp(raw)
+    raw2, err2 = call_curl(body)
+    if err2 is None:
+        TRANSPORT[0] = "curl"
+        return parse_resp(raw2)
+    return None, "%s；curl 回退亦失败: %s" % (err, err2)
+
+
+def torrent_name(task):
+    bt = task.get("bittorrent")
+    if isinstance(bt, dict):
+        inner = bt.get("info")
+        if isinstance(inner, dict) and inner.get("name"):
+            return inner["name"]
+    return ""
+
+
+def task_name(task):
+    name = torrent_name(task)
+    if name:
+        return name
+    files = task.get("files")
+    if isinstance(files, list):
+        for f in files:
+            path = (f or {}).get("path") or ""
+            if path:
+                return os.path.basename(path)
+    return task.get("gid") or "未知任务"
+
+
+def task_progress(task):
+    total = num(task.get("totalLength"))
+    done = num(task.get("completedLength"))
+    if total <= 0:
+        total = 0
+        done = 0
+        files = task.get("files")
+        if isinstance(files, list):
+            for f in files:
+                total += num((f or {}).get("length"))
+                done += num((f or {}).get("completedLength"))
+    return total, done
+
+
+def is_normal_complete(task):
+    """是否为『正常下载完整』: 状态 complete 或仍处于做种状态。"""
+    if task.get("seeder") == "true":
+        return True
+    return (task.get("status") or "").strip() == "complete"
+
+
+def classify(task):
+    """判定已停止的任务是否需要继续下载，返回 (是否重试, 跳过原因)。"""
+    status = (task.get("status") or "").strip()
+    if is_normal_complete(task):
+        return False, "正常下载完成"
+    total, done = task_progress(task)
+    full = total > 0 and done >= total
+    if status == "error":
+        # 报错停下的一律视为未完成(磁盘写满 / 校验失败 / 中断等，进度也可能刚好 100%)
+        return True, ""
+    if status == "removed":
+        # 被移除: 未下载完整的需要继续，进度已满的视为正常收尾
+        if full:
+            return False, "已移除且进度已满"
+        return True, ""
+    if full:
+        return False, "状态未知且进度已满"
+    return True, ""
+
+
+def flatten_trackers(task):
+    result = []
+    seen = set()
+    bt = task.get("bittorrent")
+    announce = bt.get("announceList") if isinstance(bt, dict) else None
+    if isinstance(announce, list):
+        for tier in announce:
+            if not isinstance(tier, list):
+                continue
+            for uri in tier:
+                if isinstance(uri, str) and uri and uri not in seen:
+                    seen.add(uri)
+                    result.append(uri)
+    return result
+
+
+def file_uris(task):
+    result = []
+    seen = set()
+    files = task.get("files")
+    if isinstance(files, list):
+        for f in files:
+            uris = (f or {}).get("uris")
+            if not isinstance(uris, list):
+                continue
+            for u in uris:
+                uri = (u or {}).get("uri")
+                if uri and uri not in seen:
+                    seen.add(uri)
+                    result.append(uri)
+    return result
+
+
+def can_retry(task):
+    if task.get("infoHash"):
+        return True
+    return len(file_uris(task)) > 0
+
+
+def find_local_torrent(task):
+    """尽可能找到本地 .torrent 元数据，用它重加比磁力链接更可靠。"""
+    candidates = []
+    gid = task.get("gid") or ""
+    if gid:
+        opt, _err = rpc("aria2.getOption", [gid])
+        if isinstance(opt, dict) and opt.get("torrent-file"):
+            candidates.append(opt["torrent-file"])
+    dirpath = task.get("dir") or ""
+    name = torrent_name(task)
+    info_hash = task.get("infoHash") or ""
+    if dirpath:
+        if name:
+            candidates.append(os.path.join(dirpath, name + ".torrent"))
+        if info_hash:
+            candidates.append(os.path.join(dirpath, info_hash + ".torrent"))
+    files = task.get("files")
+    if isinstance(files, list):
+        for f in files:
+            path = (f or {}).get("path") or ""
+            if path:
+                candidates.append(path + ".torrent")
+    for candidate in candidates:
+        try:
+            if candidate and os.path.isfile(candidate):
+                return candidate
+        except OSError:
+            continue
+    return ""
+
+
+def build_readd(task):
+    """返回 (method, params, desc)；无法自动重试时 method 为 None。"""
+    options = {}
+    dirpath = task.get("dir") or ""
+    if dirpath:
+        options["dir"] = dirpath
+
+    torrent_file = find_local_torrent(task)
+    if torrent_file:
+        try:
+            with open(torrent_file, "rb") as fh:
+                payload = base64.b64encode(fh.read()).decode("ascii")
+            return "aria2.addTorrent", [payload, [], options], "本地种子 %s" % torrent_file
+        except OSError:
+            pass
+
+    info_hash = task.get("infoHash") or ""
+    if info_hash:
+        parts = ["magnet:?xt=urn:btih:" + info_hash]
+        name = torrent_name(task)
+        if name:
+            parts.append("dn=" + urllib.parse.quote(name))
+        for tracker in flatten_trackers(task)[:20]:
+            parts.append("tr=" + urllib.parse.quote(tracker, safe=""))
+        return "aria2.addUri", [["&".join(parts)], options], "磁力链接(基于 infoHash)"
+
+    uris = file_uris(task)
+    if uris:
+        files = task.get("files")
+        if isinstance(files, list) and len(files) == 1 and dirpath:
+            path = (files[0] or {}).get("path") or ""
+            if path:
+                rel = os.path.relpath(path, dirpath)
+                if rel != "." and not rel.startswith(".."):
+                    options["out"] = rel
+        return "aria2.addUri", [uris, options], "%d 个下载链接" % len(uris)
+
+    return None, None, "缺少种子 / 链接信息，无法自动重试"
+
+
+version, ver_err = rpc("aria2.getVersion")
+if ver_err:
+    print("!! 无法从 Aria2 获取任务状态: %s" % ver_err)
+    print("   RPC 端点: %s" % RPC_URL)
+    print("   常见原因: 服务未运行 / rpc-listen-port 或 rpc-secret 与运行中的实例不一致。")
+    sys.exit(1)
+
+stopped, stop_err = rpc("aria2.tellStopped", [0, 10000])
+if stop_err:
+    print("!! 查询『已停止』列表失败: %s" % stop_err)
+    sys.exit(1)
+if not isinstance(stopped, list):
+    stopped = []
+
+STATUS_TEXT = {"error": "错误", "removed": "已移除", "complete": "已完成"}
+
+candidates = []
+skipped_reasons = {}
+for task in stopped:
+    need_retry, skip_reason = classify(task)
+    if not need_retry:
+        skipped_reasons[skip_reason] = skipped_reasons.get(skip_reason, 0) + 1
+        continue
+    total, done = task_progress(task)
+    candidates.append((task, max(total - done, 0)))
+
+skip_text = "、".join("%s x%d" % (k, v) for k, v in sorted(skipped_reasons.items())) if skipped_reasons else "无"
+print(">> RPC 连接正常: 127.0.0.1:%s" % RPC_PORT)
+print(">> 已停止任务 %d 个: 跳过 %s，需继续下载 %d 个。"
+      % (len(stopped), skip_text, len(candidates)))
+
+if not candidates:
+    print("")
+    print("%s>> 无需处理: 已停止列表中不存在『未下载完整』的任务。%s" % (GREEN, NC))
+    print("   提示: 若刚刚发生过磁盘写满等错误，请先释放空间，再重新执行本功能。")
+    sys.exit(0)
+
+print("")
+print(">> 以下任务已停止但并未下载完整，可尝试重新加入下载队列:")
+print("   " + "-" * 76)
+for index, item in enumerate(candidates, start=1):
+    task = item[0]
+    left = item[1]
+    status = STATUS_TEXT.get(task.get("status") or "", task.get("status") or "?")
+    kind = "BT  " if task.get("infoHash") else "HTTP"
+    print("   [%2d] [%s] %s %s" % (index, status, kind, task_name(task)))
+    print("        剩余约 %s / 目录 %s" % (human(left) if left > 0 else "未知", task.get("dir") or "?"))
+    message = (task.get("errorMessage") or "").strip()
+    code = (task.get("errorCode") or "").strip()
+    if message:
+        print("        错误: %s%s" % (message, (" (code %s)" % code) if code else ""))
+    if (task.get("status") or "") == "removed":
+        print("        %s注意: 该任务是被移除的(可能由手动操作或转移脚本触发)%s" % (YELLOW, NC))
+    if not can_retry(task):
+        print("        %s无法自动重试: 缺少种子 / 链接信息%s" % (YELLOW, NC))
+print("   " + "-" * 76)
+
+
+def ask(prompt):
+    try:
+        return input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        print("")
+        return None
+
+
+answer = ask("请输入要重试的任务编号 (空格或逗号分隔；直接回车 = 全部 %d 个；输入 0 取消): " % len(candidates))
+if answer is None:
+    print(">> 输入已中断，操作取消。")
+    sys.exit(0)
+answer = answer.strip()
+if answer == "0":
+    print(">> 操作已取消。")
+    sys.exit(0)
+
+chosen = []
+if answer == "":
+    chosen = list(range(len(candidates)))
+else:
+    for token in answer.replace(",", " ").split():
+        if not token.isdigit():
+            print("   >> 忽略无效编号: %s" % token)
+            continue
+        number = int(token)
+        if number < 1 or number > len(candidates):
+            print("   >> 忽略超出范围的编号: %s" % token)
+            continue
+        if (number - 1) not in chosen:
+            chosen.append(number - 1)
+
+if not chosen:
+    print(">> 未选择任何任务，操作取消。")
+    sys.exit(0)
+
+confirm = ask("确认重新加入以上 %d 个任务以继续下载? [Y/n 默认: Y]: " % len(chosen))
+if confirm is None:
+    print(">> 输入已中断，操作取消。")
+    sys.exit(0)
+confirm = confirm.strip().lower()
+if confirm and not confirm.startswith("y"):
+    print(">> 操作已取消。")
+    sys.exit(0)
+
+print("")
+print(">> 正在重新加入任务 (已下载的数据通过断点续传保留，不会从头重新下载)...")
+ok_count = 0
+fail_count = 0
+for index in chosen:
+    task = candidates[index][0]
+    gid = task.get("gid") or ""
+    name = task_name(task)
+
+    # 重新取一次最新状态，避免列表展示后状态发生变化
+    fresh, fresh_err = rpc("aria2.tellStatus", [gid])
+    if fresh_err or not isinstance(fresh, dict):
+        print("   %s!!%s %s: 读取任务状态失败 (%s)" % (RED, NC, name, fresh_err or "无数据"))
+        fail_count += 1
+        continue
+    if is_normal_complete(fresh):
+        print("   %s✓%s %s: 已下载完整，无需重试" % (GREEN, NC, name))
+        continue
+
+    method, params, desc = build_readd(fresh)
+    if method is None:
+        print("   %s!%s %s: %s" % (YELLOW, NC, name, desc))
+        fail_count += 1
+        continue
+
+    result, add_err = rpc(method, params)
+    if add_err:
+        print("   %s!!%s %s: 重新加入失败 (%s)" % (RED, NC, name, add_err))
+        fail_count += 1
+        continue
+
+    ok_count += 1
+    print("   %s✓%s %s: 已重新加入队列 [%s] -> 新 GID %s" % (GREEN, NC, name, desc, result))
+
+    # 旧记录已失效，清理以免在『已停止』列表里重复出现
+    _ignored, purge_err = rpc("aria2.removeDownloadResult", [gid])
+    if purge_err:
+        print("      (提示: 旧记录清理失败: %s，可用菜单 9 -> 3 清理)" % purge_err)
+
+print("")
+if ok_count:
+    print("%s>> 完成: %d 个任务已重新加入下载队列，正在断点续传。%s" % (GREEN, ok_count, NC))
+if fail_count:
+    print("%s>> 有 %d 个任务未能自动重试，请参考上方原因处理。%s" % (YELLOW, fail_count, NC))
+print(">> 可打开 AriaNg 查看: 任务会先『检查中 (Checking)』，随后自动断点续传。")
+PYEOF
 }
 
 # ==================== 模块 9: 实用辅助与清理工具箱 ====================
@@ -3372,7 +3858,7 @@ while true; do
     echo " 5. BT 吸血 Peer 防火墙拦截管理 (ipset+iptables / 默认开启 / 每日更新)"
     echo " 6. 迁移下载任务到新磁盘 (迁移 未完成 / 全部 任务并切换工作路径)"
     echo " 7. 转移已完成下载到新磁盘 (含做种与已暂停任务 / 可清理游离文件)"
-    echo " 8. 扫描目录并恢复未完成种子断点下载"
+    echo " 8. 恢复 / 重试未完成的下载 (扫描种子断点续传 / 一键重试异常停止)"
     echo " 9. Aria2 实用辅助与清理工具箱 (清理已完成种子 / 碎片清理 / 健康自检)"
     echo " 10. Aria2 日志排查与故障分析 (实时日志 / 崩溃溯源 / 前台单测)"
     echo " 11. 单独安装 / 更新 AriaNg 前端 (Caddy 反代模式)"
