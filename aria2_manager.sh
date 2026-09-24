@@ -1358,11 +1358,11 @@ migrate_downloads() {
     fi
 }
 
-# ==================== 模块 7: 转移已完成下载到新磁盘 (以 Aria2 任务状态为准) ====================
+# ==================== 模块 7: 转移已完成下载 / 游离文件到新磁盘 (释放下载空间) ====================
 archive_completed_files() {
     echo ""
     echo "=========================================="
-    echo "   转移已完成下载到新磁盘 (释放下载空间)  "
+    echo "   转移下载数据到新磁盘 (释放下载空间)    "
     echo "=========================================="
 
     if [ ! -f "${CONF_FILE}" ]; then
@@ -1378,6 +1378,7 @@ archive_completed_files() {
         sleep 1
     fi
 
+    local CURRENT_DIR SRC_DIR DEST_DIR ARCHIVE_MODE
     CURRENT_DIR=$(get_current_download_dir)
     read -rp "请输入源下载目录绝对路径 [默认: ${CURRENT_DIR}]: " SRC_DIR
     SRC_DIR="${SRC_DIR:-$CURRENT_DIR}"
@@ -1403,6 +1404,33 @@ archive_completed_files() {
     fi
     chmod 755 "${DEST_DIR}" 2>/dev/null || true
 
+    echo ""
+    echo ">> 请选择要转移的内容:"
+    echo "   1. 仅转移 Aria2 已完成的任务 (含做种 / 已暂停，原有功能)"
+    echo "   2. 仅转移游离文件/目录 (不被任何 Aria2 任务管理，如已清除记录或手动放入)"
+    echo "   3. 两者依次处理 (先转移已完成任务，再转移游离文件)"
+    read -rp "请输入模式编号 [1-3 默认: 1]: " ARCHIVE_MODE
+    ARCHIVE_MODE="${ARCHIVE_MODE:-1}"
+    if [[ ! "$ARCHIVE_MODE" =~ ^[123]$ ]]; then
+        echo ">> 无效模式，已取消。"
+        return 0
+    fi
+
+    if [ "$ARCHIVE_MODE" != "2" ]; then
+        _transfer_completed_tasks "$SRC_DIR" "$DEST_DIR"
+    fi
+    if [ "$ARCHIVE_MODE" != "1" ]; then
+        _transfer_orphan_files "$SRC_DIR" "$DEST_DIR"
+    fi
+}
+
+# ==================== 模块 7-1: 转移 Aria2 已完成的任务数据 ====================
+_transfer_completed_tasks() {
+    local SRC_DIR="$1"
+    local DEST_DIR="$2"
+
+    echo ""
+    echo "---- [已完成任务] 源: ${SRC_DIR}  -->  目标: ${DEST_DIR} ----"
     echo ">> 正在向 Aria2 RPC 查询已完成 (含做种 / 已暂停) 的任务清单..."
     local running_aria2
     running_aria2=$(ps -ef 2>/dev/null | grep '[a]ria2c' | head -n 1 || true)
@@ -2073,6 +2101,422 @@ PYEOF
         fi
     else
         echo ">> 已保留源磁盘上的文件 (Aria2 中的任务记录也保持原样)。"
+    fi
+
+    rm -rf "${scan_tmp}"
+}
+
+# ==================== 模块 7-2: 转移游离文件/目录 (不被 Aria2 任务管理) ====================
+_transfer_orphan_files() {
+    local SRC_DIR="$1"
+    local DEST_DIR="$2"
+
+    echo ""
+    echo "---- [游离文件] 源: ${SRC_DIR}  -->  目标: ${DEST_DIR} ----"
+    echo ">> 正在扫描源目录: 找出不被任何 Aria2 任务管理、且无 .aria2 控制文件的游离目标..."
+
+    local scan_tmp scan_rc
+    scan_tmp=$(mktemp -d)
+    scan_rc=0
+    ARIA2_CONF_FILE="${CONF_FILE}" ARIA2_SRC_DIR="${SRC_DIR}" ARIA2_OUT_DIR="${scan_tmp}" \
+        python3 - <<'PYEOF' || scan_rc=$?
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+CONF_FILE = os.environ.get("ARIA2_CONF_FILE", "")
+SRC_DIR = os.path.realpath(os.environ.get("ARIA2_SRC_DIR", "."))
+OUT_DIR = os.environ.get("ARIA2_OUT_DIR", ".")
+RPC_TIMEOUT = 20
+FIELD_SEP = "\x1f"
+
+
+def read_conf(key, default):
+    try:
+        with open(CONF_FILE, "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key_name, value = line.split("=", 1)
+                if key_name.strip() == key:
+                    return value.strip()
+    except OSError:
+        pass
+    return default
+
+
+def human(size):
+    value = float(size)
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if value < 1024 or unit == "TB":
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TB"
+
+
+RPC_PORT = read_conf("rpc-listen-port", "6800") or "6800"
+RPC_SECRET = read_conf("rpc-secret", "")
+RPC_URL = "http://127.0.0.1:" + RPC_PORT + "/jsonrpc"
+# 显式使用空代理，防止本地 127.0.0.1 请求被系统 http_proxy 劫持
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+TRANSPORT = ["urllib"]
+
+
+def build_body(method, params=None):
+    call_params = ["token:" + RPC_SECRET] if RPC_SECRET else []
+    if params:
+        call_params.extend(params)
+    return json.dumps({"jsonrpc": "2.0", "id": "orphan_scan", "method": method, "params": call_params})
+
+
+def call_urllib(body):
+    req = urllib.request.Request(RPC_URL, data=body.encode("utf-8"), headers={"Content-Type": "application/json"})
+    try:
+        with OPENER.open(req, timeout=RPC_TIMEOUT) as resp:
+            return resp.read().decode("utf-8", "replace"), None
+    except urllib.error.HTTPError as exc:
+        return None, f"HTTP {exc.code}"
+    except urllib.error.URLError as exc:
+        return None, f"无法连接 127.0.0.1:{RPC_PORT} ({getattr(exc, 'reason', exc)})"
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def call_curl(body):
+    """curl 直连 RPC：绕过 urllib 可能遇到的代理 / 环境差异问题。"""
+    try:
+        proc = subprocess.run(["curl", "-sS", "-m", str(RPC_TIMEOUT), "--noproxy", "*", "-X", "POST",
+                               "-H", "Content-Type: application/json", "--data-binary", "@-", RPC_URL],
+                              input=body.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=RPC_TIMEOUT + 10)
+    except FileNotFoundError:
+        return None, "未找到 curl 命令"
+    except Exception as exc:
+        return None, f"curl 执行异常: {exc}"
+    if proc.returncode != 0:
+        return None, f"curl 退出码 {proc.returncode} ({proc.stderr.decode('utf-8', 'replace').strip()})"
+    return proc.stdout.decode("utf-8", "replace"), None
+
+
+def parse_response(raw):
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None, f"响应不是合法 JSON: {raw[:200]}"
+    if not isinstance(data, dict):
+        return None, "响应格式异常"
+    if data.get("error"):
+        err = data["error"] if isinstance(data["error"], dict) else {}
+        return None, f"RPC 拒绝请求 [{err.get('code', '?')}] {err.get('message', '')}"
+    return data.get("result"), None
+
+
+def rpc(method, params=None):
+    """返回 (结果, 错误描述)；urllib 失败时自动回退 curl。"""
+    body = build_body(method, params)
+    if TRANSPORT[0] == "curl":
+        raw, err = call_curl(body)
+        if err is None:
+            return parse_response(raw)
+        return None, err
+    raw, err = call_urllib(body)
+    if err is None:
+        return parse_response(raw)
+    raw2, err2 = call_curl(body)
+    if err2 is None:
+        TRANSPORT[0] = "curl"
+        return parse_response(raw2)
+    return None, f"{err}；curl 回退亦失败: {err2}"
+
+
+version, ver_err = rpc("aria2.getVersion")
+if ver_err:
+    print(f"!! 无法从 Aria2 获取任务状态: {ver_err}", file=sys.stderr)
+    print(f"   RPC 端点: {RPC_URL}", file=sys.stderr)
+    print("   常见原因: 服务未运行 / rpc-listen-port 与运行中实例不一致 / rpc-secret 不匹配。", file=sys.stderr)
+    sys.exit(1)
+
+
+def clean_metadata_name(raw_name):
+    """清理 [METADATA] 虚拟文件名，提取真实番号/文件名。
+    例如: [METADATA][javdb.com]SNOS-134-C.torrent -> SNOS-134-C
+    """
+    name = re.sub(r"^(\[[^\]]+\])+", "", raw_name).strip()
+    for ext in [".torrent.无码破解", ".torrent", ".aria2"]:
+        if name.endswith(ext):
+            name = name[:-len(ext)]
+    return name
+
+
+managed_names = set()
+task_count = 0
+query_errors = 0
+for method, params in (("aria2.tellActive", None),
+                       ("aria2.tellWaiting", [0, 10000]),
+                       ("aria2.tellStopped", [0, 10000])):
+    tasks, err = rpc(method, params)
+    if err:
+        query_errors += 1
+        continue
+    if not isinstance(tasks, list):
+        continue
+    for task in tasks:
+        task_count += 1
+        task_dir = task.get("dir") or ""
+        task_dir_real = os.path.realpath(task_dir) if task_dir else SRC_DIR
+        # BT 任务名提取
+        info = task.get("bittorrent")
+        bt_name = ""
+        if isinstance(info, dict):
+            inner = info.get("info")
+            if isinstance(inner, dict):
+                bt_name = inner.get("name") or ""
+        if bt_name and task_dir_real == SRC_DIR:
+            managed_names.add(bt_name.lower())
+        # 文件列表路径提取
+        files = task.get("files")
+        if not isinstance(files, list):
+            continue
+        for f in files:
+            raw_path = (f or {}).get("path") or ""
+            if not raw_path:
+                continue
+            if raw_path.startswith("[METADATA]"):
+                clean_name = clean_metadata_name(raw_path)
+                if clean_name:
+                    managed_names.add(clean_name.lower())
+                continue
+            if not os.path.isabs(raw_path):
+                real_path = os.path.realpath(os.path.join(task_dir_real, raw_path))
+            else:
+                real_path = os.path.realpath(raw_path)
+            if real_path == SRC_DIR or real_path.startswith(SRC_DIR + os.sep):
+                rel_path = os.path.relpath(real_path, SRC_DIR)
+                managed_names.add(rel_path.split(os.sep)[0].lower())
+
+
+def tree_size(path):
+    if os.path.isfile(path):
+        try:
+            return os.path.getsize(path)
+        except OSError:
+            return 0
+    total = 0
+    for root, _dirs, files in os.walk(path, onerror=lambda _e: None):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+try:
+    entries = sorted(os.listdir(SRC_DIR))
+except OSError as exc:
+    print(f"!! 无法读取源目录 {SRC_DIR}: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+# 磁盘上所有 .aria2 控制文件对应的基准名: 存在即代表任务未完成/仍被接管
+control_bases = {item[:-6].lower() for item in entries if item.endswith(".aria2")}
+records = []
+skipped_managed = 0
+for item in entries:
+    item_lower = item.lower()
+    # 规则 1: 忽略隐藏文件、.aria2 控制文件自身、.torrent 种子文件
+    if item.startswith(".") or item.endswith(".aria2") or item.endswith(".torrent"):
+        continue
+    # 规则 2: 存在同名 .aria2 控制文件，说明任务正在等待/下载/未完成
+    if item_lower in control_bases:
+        skipped_managed += 1
+        continue
+    # 规则 3: 命中 RPC 任务清单（含 [METADATA] 提取名）
+    if item_lower in managed_names:
+        skipped_managed += 1
+        continue
+    # 规则 4: 去掉包装前缀后再比对一次 (如 [98t.tv]xxx)
+    clean_item = re.sub(r"^(\[[^\]]+\])+", "", item).strip().lower()
+    if clean_item in managed_names or clean_item in control_bases:
+        skipped_managed += 1
+        continue
+    full_path = os.path.join(SRC_DIR, item)
+    records.append((item, os.path.isdir(full_path), tree_size(full_path)))
+
+total_bytes = sum(size for _n, _d, size in records)
+lines = []
+lines.append(">> 游离判定依据: 不在任何 Aria2 任务清单内，且磁盘上没有同名 .aria2 控制文件。")
+lines.append(f">> 源目录: {SRC_DIR}")
+lines.append(f">> RPC 任务总数: {task_count} 个 (解析出受管理名称 {len(managed_names)} 个)")
+lines.append(f">> 磁盘 .aria2 控制基准名: {len(control_bases)} 个")
+lines.append(f">> 已按 Aria2 管理状态跳过: {skipped_managed} 项")
+if query_errors:
+    lines.append(f"   !! 有 {query_errors} 项 RPC 查询失败，游离判定可能不准，请留意误判。")
+if records:
+    lines.append(f">> 发现游离文件/目录: {len(records)} 个 (约 {human(total_bytes)})")
+else:
+    lines.append(">> 未发现游离文件/目录。")
+
+# 先落盘再输出报告: 即使报告文本出错，也不影响已确认的转移清单
+with open(os.path.join(OUT_DIR, "orphans.rec"), "wb") as fh:
+    for index, (name, is_dir, size) in enumerate(records, start=1):
+        fields = [str(index), name, "1" if is_dir else "0", str(size), human(size)]
+        fh.write(FIELD_SEP.join(fields).encode("utf-8", "surrogateescape") + b"\x00")
+
+for line in lines:
+    print(line)
+PYEOF
+
+    if [ "$scan_rc" -ne 0 ]; then
+        echo ""
+        echo ">> [失败] 游离文件扫描未完成 (RPC 或文件系统异常)，未做任何转移。"
+        rm -rf "${scan_tmp}"
+        return 1
+    fi
+
+    local orphans_file="${scan_tmp}/orphans.rec"
+    if [ ! -s "${orphans_file}" ]; then
+        echo ""
+        echo ">> 没有发现游离文件/目录: 目录内所有内容都已被 Aria2 任务管理或存在 .aria2 控制文件。"
+        rm -rf "${scan_tmp}"
+        return 0
+    fi
+
+    declare -a ORPHAN_RECS=()
+    mapfile -d '' -t ORPHAN_RECS < "${orphans_file}" 2>/dev/null || ORPHAN_RECS=()
+    local ORPHAN_TOTAL=${#ORPHAN_RECS[@]}
+    if [ "$ORPHAN_TOTAL" -eq 0 ]; then
+        echo ""
+        echo ">> 没有发现游离文件/目录。"
+        rm -rf "${scan_tmp}"
+        return 0
+    fi
+
+    declare -a O_NAME=() O_ISDIR=() O_BYTES=() O_HUMAN=()
+    local rec r_index r_name r_isdir r_bytes r_human total_bytes=0
+    for rec in "${ORPHAN_RECS[@]}"; do
+        IFS=$'\x1f' read -r r_index r_name r_isdir r_bytes r_human <<< "$rec"
+        O_NAME+=("$r_name")
+        O_ISDIR+=("$r_isdir")
+        O_BYTES+=("${r_bytes:-0}")
+        O_HUMAN+=("${r_human:-未知}")
+        total_bytes=$((total_bytes + ${r_bytes:-0}))
+    done
+
+    local total_gb page_size=15
+    total_gb=$(awk "BEGIN {printf \"%.2f\", ${total_bytes}/1024/1024/1024}")
+
+    local i kind
+    if [ "$ORPHAN_TOTAL" -gt "$page_size" ]; then
+        read -rp "匹配到的游离目标较多 (${ORPHAN_TOTAL} 项)，是否翻页查看清单? [Y/n 默认: Y]: " VIEW_PAGER
+        VIEW_PAGER="${VIEW_PAGER:-Y}"
+        if [[ "$VIEW_PAGER" =~ ^[Yy]$ ]]; then
+            local current_idx=0 page_total page_no
+            page_total=$(( (ORPHAN_TOTAL + page_size - 1) / page_size ))
+            while [ "$current_idx" -lt "$ORPHAN_TOTAL" ]; do
+                clear 2>/dev/null || true
+                page_no=$(( current_idx / page_size + 1 ))
+                echo "=== 游离文件/目录清单 (第 ${page_no} / ${page_total} 页，共 ${ORPHAN_TOTAL} 项) ==="
+                for ((i=current_idx; i<current_idx+page_size && i<ORPHAN_TOTAL; i++)); do
+                    if [ "${O_ISDIR[$i]}" = "1" ]; then kind="[目录]"; else kind="[文件]"; fi
+                    printf ' [%d] %s %s (%s)\n' "$((i+1))" "$kind" "${O_NAME[$i]}" "${O_HUMAN[$i]}"
+                done
+                echo "--------------------------------------------------"
+                current_idx=$((current_idx + page_size))
+                if [ "$current_idx" -lt "$ORPHAN_TOTAL" ]; then
+                    read -rp "按 [Enter] 查看下一页，输入 [q] 退出预览，输入 [g] 直接进入同步: " PAGE_ACTION
+                    case "$PAGE_ACTION" in
+                        [Qq]) break ;;
+                        [Gg]) break ;;
+                    esac
+                else
+                    read -rp "已浏览全部游离目标，按 [Enter] 继续..." __dummy_page
+                fi
+            done
+        fi
+    else
+        echo ""
+        echo "---------------- 游离文件/目录清单 ------------------"
+        for ((i=0; i<ORPHAN_TOTAL; i++)); do
+            if [ "${O_ISDIR[$i]}" = "1" ]; then kind="[目录]"; else kind="[文件]"; fi
+            printf ' [%d] %s %s (%s)\n' "$((i+1))" "$kind" "${O_NAME[$i]}" "${O_HUMAN[$i]}"
+        done
+        echo "--------------------------------------------------"
+    fi
+
+    echo ""
+    echo ">> 共发现 ${ORPHAN_TOTAL} 个游离目标 / 约 ${total_gb} GB"
+    read -rp "确认开始将这些游离目标同步到 ${DEST_DIR}? [Y/n 默认: Y]: " CONFIRM_ORPHAN
+    CONFIRM_ORPHAN="${CONFIRM_ORPHAN:-Y}"
+    if [[ ! "$CONFIRM_ORPHAN" =~ ^[Yy]$ ]]; then
+        echo ">> 操作已取消。"
+        rm -rf "${scan_tmp}"
+        return 0
+    fi
+
+    declare -a TRANSFER_FAILED=()
+    local name
+    echo ""
+    echo ">> 正在同步游离数据到新磁盘 (保持相对目录层级)..."
+    for ((i=0; i<ORPHAN_TOTAL; i++)); do
+        name="${O_NAME[$i]}"
+        echo "   -> 正在转移: ${name}..."
+        # 以 ${SRC_DIR}/./ 形式传入，-R 会以 ./ 之后的部分作为目标相对路径
+        if ! rsync -avP --partial -R "${SRC_DIR}/./${name}" "${DEST_DIR}/"; then
+            echo "   !! [失败] 同步出错: ${name}"
+            TRANSFER_FAILED+=("$name")
+        fi
+    done
+
+    if [ ${#TRANSFER_FAILED[@]} -gt 0 ]; then
+        echo ""
+        echo ">> 警告: 有 ${#TRANSFER_FAILED[@]} 项同步失败，后续清理会跳过这些项:"
+        for name in "${TRANSFER_FAILED[@]}"; do
+            echo "   - ${name}"
+        done
+    fi
+
+    echo ""
+    echo ">> [完成] 游离数据同步结束。"
+    read -rp "是否删除源目录 (${SRC_DIR}) 中已转移的游离文件/目录以释放空间? [Y/n 默认: Y]: " CLEAN_ORPHAN_SRC
+    CLEAN_ORPHAN_SRC="${CLEAN_ORPHAN_SRC:-Y}"
+    if [[ ! "$CLEAN_ORPHAN_SRC" =~ ^[Yy]$ ]]; then
+        echo ">> 已保留源目录上的游离文件 (请确认新磁盘数据完整后自行清理)。"
+        rm -rf "${scan_tmp}"
+        return 0
+    fi
+
+    declare -A FAILED_MAP=()
+    for name in "${TRANSFER_FAILED[@]}"; do
+        FAILED_MAP["$name"]=1
+    done
+
+    echo ">> 正在清理源目录中的已转移游离目标..."
+    local removed=0 skipped=0
+    for ((i=0; i<ORPHAN_TOTAL; i++)); do
+        name="${O_NAME[$i]}"
+        if [ -n "${FAILED_MAP[$name]}" ]; then
+            echo "   - 跳过 (同步失败，未删除): ${name}"
+            skipped=$((skipped + 1))
+            continue
+        fi
+        if rm -rf -- "${SRC_DIR}/${name}"; then
+            echo "   - 已删除: ${name}"
+            removed=$((removed + 1))
+        else
+            echo "   !! 删除失败: ${name}"
+            skipped=$((skipped + 1))
+        fi
+    done
+
+    echo ""
+    echo ">> [成功] 已删除 ${removed} 项游离目标，源磁盘空间已释放。"
+    if [ "$skipped" -gt 0 ]; then
+        echo "   提示: 有 ${skipped} 项被跳过 (同步失败或删除失败)，请在源目录中手动确认。"
     fi
 
     rm -rf "${scan_tmp}"
@@ -2927,7 +3371,7 @@ while true; do
     echo " 4. 启用 / 停用 Trackers 自动更新"
     echo " 5. BT 吸血 Peer 防火墙拦截管理 (ipset+iptables / 默认开启 / 每日更新)"
     echo " 6. 迁移下载任务到新磁盘 (迁移 未完成 / 全部 任务并切换工作路径)"
-    echo " 7. 转移已完成下载到新磁盘 (以 Aria2 完成状态为准 / 含做种与已暂停任务)"
+    echo " 7. 转移已完成下载到新磁盘 (含做种与已暂停任务 / 可清理游离文件)"
     echo " 8. 扫描目录并恢复未完成种子断点下载"
     echo " 9. Aria2 实用辅助与清理工具箱 (清理已完成种子 / 碎片清理 / 健康自检)"
     echo " 10. Aria2 日志排查与故障分析 (实时日志 / 崩溃溯源 / 前台单测)"
