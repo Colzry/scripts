@@ -262,16 +262,62 @@ remove_caddy_package() {
     fi
 }
 
+# ==================== Tracker 拉取模式 (best 精选 / all 全量) ====================
+# 读取当前 update_tracker.sh 所用的模式；脚本不存在或不带标记时按默认 best
+current_tracker_mode() {
+    local mode=""
+    if [ -f "${TRACKER_SCRIPT}" ]; then
+        mode=$(grep -E '^TRACKER_MODE="(best|all)"' "${TRACKER_SCRIPT}" 2>/dev/null | head -n1 | cut -d'"' -f2)
+        if [ -z "$mode" ]; then
+            # 兼容旧版脚本(无 TRACKER_MODE 标记): 按其中的 URL 判断
+            if grep -qE 'master/all\.txt|trackers_all\.txt' "${TRACKER_SCRIPT}" 2>/dev/null; then
+                mode="all"
+            fi
+        fi
+    fi
+    if [ "$mode" = "all" ]; then
+        printf 'all'
+    else
+        printf 'best'
+    fi
+}
+
+tracker_mode_text() {
+    if [ "$(current_tracker_mode)" = "all" ]; then
+        printf '%b' "all (全量列表)"
+    else
+        printf '%b' "best (精选列表)"
+    fi
+}
+
 # ==================== 生成 Tracker 更新脚本 ====================
+# 用法: ensure_tracker_script [best|all]
+#   不带参数时沿用当前模式(无脚本则 best)，避免安装/开启定时器时把用户的 all 选择静默改回 best
 ensure_tracker_script() {
+    local mode="${1:-}"
+    if [ "$mode" != "best" ] && [ "$mode" != "all" ]; then
+        mode="$(current_tracker_mode)"
+    fi
+
+    local tracker_url_1 tracker_url_2
+    if [ "$mode" = "all" ]; then
+        tracker_url_1="https://bitbucket.org/xiu2/trackerslistcollection/raw/master/all.txt"
+        tracker_url_2="https://cdn.jsdelivr.net/gh/ngosang/trackerslist@master/trackers_all.txt"
+    else
+        tracker_url_1="https://bitbucket.org/xiu2/trackerslistcollection/raw/master/best.txt"
+        tracker_url_2="https://cdn.jsdelivr.net/gh/ngosang/trackerslist@master/trackers_best.txt"
+    fi
+
     mkdir -p "${ARIA2_CONF_DIR}/scripts"
     cat > "${TRACKER_SCRIPT}" <<EOF
 #!/usr/bin/env bash
 CONF_FILE="${CONF_FILE}"
-TRACKER_URL1="https://bitbucket.org/xiu2/trackerslistcollection/raw/master/all.txt"
-TRACKER_URL2="https://cdn.jsdelivr.net/gh/ngosang/trackerslist@master/trackers_all.txt"
+# 拉取模式: best(精选) / all(全量)
+TRACKER_MODE="${mode}"
+TRACKER_URL1="${tracker_url_1}"
+TRACKER_URL2="${tracker_url_2}"
 
-echo "正在从多源获取最新 Tracker 列表..."
+echo "正在从多源获取最新 Tracker 列表 (模式: \${TRACKER_MODE})..."
 tracker_list=\$( (curl -sSL --connect-timeout 10 -m 30 "\${TRACKER_URL1}"; echo ""; curl -sSL --connect-timeout 10 -m 30 "\${TRACKER_URL2}") | tr -d '\r' | sed '/^[[:space:]]*#/d; /^[[:space:]]*\$/d' | sort -u | paste -sd "," - )
 
 if [ -n "\$tracker_list" ]; then
@@ -539,7 +585,7 @@ install_aria2() {
     echo "RPC 端口: ${RPC_PORT}"
     echo "RPC 密钥: ${RPC_SECRET}"
     echo "顺带配置 AriaNg: $([[ "$WITH_ARIANG" =~ ^[Yy]$ ]] && echo "是" || echo "否")"
-    echo "Trackers 自动更新: 默认开启 (每日定时)"
+    echo "Trackers 自动更新: 默认开启 (每日定时)，拉取模式: $(tracker_mode_text) (可在主菜单 3 切换)"
     echo "全局最大上传限制: 2M"
     echo "全局下载速度限制: 不限速 (0)"
     echo "BT 默认做种策略: 分享率达到 1.0 停止做种"
@@ -924,8 +970,10 @@ update_trackers_menu() {
         return 1
     fi
 
+    echo "当前自动拉取模式: $(tracker_mode_text)"
+    echo ""
     echo "请选择操作:"
-    echo " 1. 立即从网络自动拉取最新 Trackers (双源合并去重)"
+    echo " 1. 立即从网络自动拉取最新 Trackers (双源合并去重，可选 best / all)"
     echo " 2. 手动自定义输入 Trackers 列表"
     echo " 0. 返回上级菜单"
     read -rp "请选择 [0-2 默认: 0]: " TRACKER_CHOICE
@@ -934,8 +982,22 @@ update_trackers_menu() {
     if [ "$TRACKER_CHOICE" == "0" ]; then
         return 0
     elif [ "$TRACKER_CHOICE" == "1" ]; then
-        ensure_tracker_script
-        echo ">> 正在执行 Tracker 更新脚本..."
+        echo ""
+        echo "请选择 Tracker 列表类型 (xiu2 与 ngosang 两个源均使用同一类型):"
+        echo " 1. best 精选列表 (体积小、质量高，推荐) [默认]"
+        echo " 2. all  全量列表 (数量最多，体积较大)"
+        read -rp "请选择 [1-2 默认: 1]: " TRACKER_LIST_CHOICE
+        TRACKER_LIST_CHOICE="${TRACKER_LIST_CHOICE:-1}"
+
+        local tracker_mode="best"
+        if [ "$TRACKER_LIST_CHOICE" == "2" ]; then
+            tracker_mode="all"
+        elif [ "$TRACKER_LIST_CHOICE" != "1" ]; then
+            echo ">> 无效选项，按默认 best 处理。"
+        fi
+
+        ensure_tracker_script "$tracker_mode"
+        echo ">> 拉取模式已设为 $(tracker_mode_text)，正在执行 Tracker 更新脚本..."
         bash "${TRACKER_SCRIPT}"
     elif [ "$TRACKER_CHOICE" == "2" ]; then
         echo ""
@@ -981,6 +1043,7 @@ manage_tracker_timer() {
     else
         echo -e "\033[31m未启用 (Inactive / Stopped)\033[0m"
     fi
+    echo "当前自动拉取模式: $(tracker_mode_text)  (如需切换 best / all 请使用主菜单 3)"
     echo ""
 
     echo " 1. 启用并开启开机自启 (Enable & Start)"
@@ -992,6 +1055,7 @@ manage_tracker_timer() {
 
     case "$TIMER_CHOICE" in
         1)
+            # 不带参数调用: 沿用当前 best/all 选择(尚无脚本时默认 best)，不会静默改回 best
             ensure_tracker_script
             [ "$IS_ROOT" = false ] && mkdir -p "${SYSTEMD_DIR}"
 
@@ -3923,7 +3987,7 @@ while true; do
     echo "------------------------------------------"
     echo " 1. $([ -f "${ARIA2C_BIN}" ] && echo "重新配置 Aria2 后端 (自动带入当前设置)" || echo "安装 / 配置 Aria2 后端 (默认启用 Trackers 自动更新)")"
     echo " 2. Aria2 常用核心设置 (下载目录 / 并发数 / 做种 / 上下载限速 / 占位清理)"
-    echo " 3. 手动更新 / 设置 BT Trackers (双源拉取 / 自定义)"
+    echo " 3. 手动更新 / 设置 BT Trackers (双源拉取 best/all / 自定义)"
     echo " 4. 启用 / 停用 Trackers 自动更新"
     echo " 5. BT 吸血 Peer 防火墙拦截管理 (ipset+iptables / 默认开启 / 每日更新)"
     echo " 6. 迁移下载任务到新磁盘 (迁移 未完成 / 全部 任务并切换工作路径)"
