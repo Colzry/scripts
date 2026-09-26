@@ -290,6 +290,71 @@ tracker_mode_text() {
     fi
 }
 
+# ==================== Tracker 自动更新周期 ====================
+# 默认每周更新；取值使用 systemd 时间跨度写法 (如 12h / 24h / 72h / 1w / 2w)
+TRACKER_INTERVAL_DEFAULT="1w"
+
+# systemd 时间跨度 -> 中文可读说明
+tracker_interval_text() {
+    case "${1:-}" in
+        "")        printf '每周 (1w，默认)' ;;
+        12h)       printf '每 12 小时 (12h)' ;;
+        24h|1d)    printf '每天 (24h)' ;;
+        72h|3d)    printf '每 3 天 (72h)' ;;
+        1w|7d)     printf '每周 (1w)' ;;
+        2w|14d)    printf '每两周 (2w)' ;;
+        30d|1month) printf '每 30 天 (30d)' ;;
+        *)         printf '每 %s' "$1" ;;
+    esac
+}
+
+# 读取当前更新周期(取自已写入的 timer 单元)；未安装或解析不到时返回默认值
+current_tracker_interval() {
+    local unit="${SYSTEMD_DIR}/aria2-update-tracker.timer"
+    local value=""
+    if [ -f "${unit}" ]; then
+        value=$(grep -E '^OnUnitActiveSec=' "${unit}" 2>/dev/null | head -n1 | cut -d'=' -f2- | tr -d ' \r')
+    fi
+    if [ -n "${value}" ]; then
+        printf '%s' "${value}"
+    else
+        printf '%s' "${TRACKER_INTERVAL_DEFAULT}"
+    fi
+}
+
+# 写入 Trackers 自动更新的 systemd 单元 (service + timer)，周期使用指定值，缺省沿用当前周期
+write_tracker_timer_units() {
+    local interval="${1:-}"
+    if [ -z "$interval" ]; then
+        interval="$(current_tracker_interval)"
+    fi
+
+    [ "$IS_ROOT" = false ] && mkdir -p "${SYSTEMD_DIR}"
+
+    ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2-update-tracker.service'" <<EOF
+[Unit]
+Description=Update Aria2 BT Trackers
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=${TRACKER_SCRIPT}
+EOF
+
+    ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2-update-tracker.timer'" <<EOF
+[Unit]
+Description=Run Aria2 Trackers Update Periodically
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=${interval}
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
 # ==================== 生成 Tracker 更新脚本 ====================
 # 用法: ensure_tracker_script [best|all]
 #   不带参数时沿用当前模式(无脚本则 best)，避免安装/开启定时器时把用户的 all 选择静默改回 best
@@ -585,7 +650,7 @@ install_aria2() {
     echo "RPC 端口: ${RPC_PORT}"
     echo "RPC 密钥: ${RPC_SECRET}"
     echo "顺带配置 AriaNg: $([[ "$WITH_ARIANG" =~ ^[Yy]$ ]] && echo "是" || echo "否")"
-    echo "Trackers 自动更新: 默认开启 (每日定时)，拉取模式: $(tracker_mode_text) (可在主菜单 3 切换)"
+    echo "Trackers 自动更新: 默认开启 (周期: $(tracker_interval_text "$(current_tracker_interval)")，可在主菜单 4 调整)"
     echo "全局最大上传限制: 2M"
     echo "全局下载速度限制: 不限速 (0)"
     echo "BT 默认做种策略: 分享率达到 1.0 停止做种"
@@ -711,28 +776,8 @@ WantedBy=default.target
 EOF
     fi
 
-    ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2-update-tracker.service'" <<EOF
-[Unit]
-Description=Update Aria2 BT Trackers
-After=network.target
-
-[Service]
-Type=oneshot
-ExecStart=${TRACKER_SCRIPT}
-EOF
-
-    ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2-update-tracker.timer'" <<EOF
-[Unit]
-Description=Run Aria2 Trackers Update Daily
-
-[Timer]
-OnBootSec=10min
-OnUnitActiveSec=24h
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
+    # Trackers 自动更新单元: 周期沿用已保存的值(未设置过则为默认每周 1w)
+    write_tracker_timer_units
 
     ${SYSTEMCTL_CMD} daemon-reload
     ${SYSTEMCTL_CMD} enable --now aria2.service
@@ -1044,47 +1089,28 @@ manage_tracker_timer() {
         echo -e "\033[31m未启用 (Inactive / Stopped)\033[0m"
     fi
     echo "当前自动拉取模式: $(tracker_mode_text)  (如需切换 best / all 请使用主菜单 3)"
+    echo "当前更新周期: $(tracker_interval_text "$(current_tracker_interval)")"
     echo ""
 
     echo " 1. 启用并开启开机自启 (Enable & Start)"
     echo " 2. 停用并关闭开机自启 (Disable & Stop)"
     echo " 3. 查看定时器运行与下次触发时间"
+    echo " 4. 设置自动更新周期 (默认每周，支持自定义)"
     echo " 0. 返回上级菜单"
-    read -rp "请选择操作 [0-3 默认: 0]: " TIMER_CHOICE
+    read -rp "请选择操作 [0-4 默认: 0]: " TIMER_CHOICE
     TIMER_CHOICE="${TIMER_CHOICE:-0}"
 
     case "$TIMER_CHOICE" in
         1)
             # 不带参数调用: 沿用当前 best/all 选择(尚无脚本时默认 best)，不会静默改回 best
             ensure_tracker_script
-            [ "$IS_ROOT" = false ] && mkdir -p "${SYSTEMD_DIR}"
-
-            ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2-update-tracker.service'" <<EOF
-[Unit]
-Description=Update Aria2 BT Trackers
-After=network.target
-
-[Service]
-Type=oneshot
-ExecStart=${TRACKER_SCRIPT}
-EOF
-
-            ${SUDO_CMD} bash -c "cat > '${SYSTEMD_DIR}/aria2-update-tracker.timer'" <<EOF
-[Unit]
-Description=Run Aria2 Trackers Update Daily
-
-[Timer]
-OnBootSec=10min
-OnUnitActiveSec=24h
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
+            # 同样沿用已保存的更新周期(从未设置过则为默认每周)
+            write_tracker_timer_units
 
             ${SYSTEMCTL_CMD} daemon-reload
             ${SYSTEMCTL_CMD} enable --now aria2-update-tracker.timer
             echo ">> Trackers 自动更新定时器已成功启用！"
+            echo ">> 当前周期: $(tracker_interval_text "$(current_tracker_interval)")"
             ;;
         2)
             echo ">> 正在停止并禁用 Trackers 定时器..."
@@ -1095,6 +1121,60 @@ EOF
         3)
             echo ""
             ${SYSTEMCTL_CMD} list-timers aria2-update-tracker.timer || true
+            ;;
+        4)
+            echo ""
+            echo "请选择 Trackers 自动更新周期:"
+            echo " 1. 每 12 小时 (12h)"
+            echo " 2. 每天 (24h)"
+            echo " 3. 每 3 天 (72h)"
+            echo " 4. 每周 (1w) [默认]"
+            echo " 5. 每两周 (2w)"
+            echo " 6. 自定义周期 (systemd 时间格式)"
+            echo " 0. 取消"
+            read -rp "请选择 [0-6 默认: 4]: " TIMER_INTERVAL_CHOICE
+            TIMER_INTERVAL_CHOICE="${TIMER_INTERVAL_CHOICE:-4}"
+
+            local new_interval="" custom_interval=""
+            case "$TIMER_INTERVAL_CHOICE" in
+                1) new_interval="12h" ;;
+                2) new_interval="24h" ;;
+                3) new_interval="72h" ;;
+                4) new_interval="1w" ;;
+                5) new_interval="2w" ;;
+                6)
+                    while true; do
+                        read -rp "请输入自定义周期 (数字+单位，如 6h / 8h / 3d / 2w；直接回车取消): " custom_interval
+                        custom_interval=$(printf '%s' "$custom_interval" | tr -d ' \r' | tr 'A-Z' 'a-z')
+                        if [ -z "$custom_interval" ]; then
+                            echo ">> 已取消，更新周期未修改。"
+                            return 0
+                        fi
+                        if [[ ! "$custom_interval" =~ ^[0-9]+(s|min|h|d|w|m)$ ]]; then
+                            echo ">> 格式不正确，请使用 <数字><单位>；单位可为 s / min / h / d / w / m。"
+                            continue
+                        fi
+                        if [[ "$custom_interval" =~ ^0+(s|min|h|d|w|m)$ ]]; then
+                            echo ">> 周期必须大于 0，请重新输入。"
+                            continue
+                        fi
+                        new_interval="$custom_interval"
+                        break
+                    done
+                    ;;
+                0) echo ">> 已取消，更新周期未修改。"; return 0 ;;
+                *) echo ">> 无效选项，更新周期未修改。"; return 1 ;;
+            esac
+
+            write_tracker_timer_units "$new_interval"
+            ${SYSTEMCTL_CMD} daemon-reload 2>/dev/null || true
+            if [ "$IS_ACTIVE" = true ]; then
+                ${SYSTEMCTL_CMD} restart aria2-update-tracker.timer 2>/dev/null || true
+                echo ">> 更新周期已设为 $(tracker_interval_text "$new_interval")，定时器已重启生效。"
+            else
+                echo ">> 更新周期已设为 $(tracker_interval_text "$new_interval")。"
+                echo "   提示: 定时器当前未启用，可先用选项 1 启用后生效。"
+            fi
             ;;
         0)
             return 0
@@ -3385,7 +3465,7 @@ manage_utils_menu() {
                     echo -e "\033[37m[未安装或未运行]\033[0m"
                 fi
 
-                echo -n "4. Trackers 每日定时更新: "
+                echo -n "4. Trackers 定时更新 ($(tracker_interval_text "$(current_tracker_interval)")): "
                 if ${SYSTEMCTL_CMD} is-active --quiet aria2-update-tracker.timer 2>/dev/null; then
                     echo -e "\033[32m[已启用]\033[0m"
                 else
@@ -3988,7 +4068,7 @@ while true; do
     echo " 1. $([ -f "${ARIA2C_BIN}" ] && echo "重新配置 Aria2 后端 (自动带入当前设置)" || echo "安装 / 配置 Aria2 后端 (默认启用 Trackers 自动更新)")"
     echo " 2. Aria2 常用核心设置 (下载目录 / 并发数 / 做种 / 上下载限速 / 占位清理)"
     echo " 3. 手动更新 / 设置 BT Trackers (双源拉取 best/all / 自定义)"
-    echo " 4. 启用 / 停用 Trackers 自动更新"
+    echo " 4. 启用 / 停用 Trackers 自动更新 (默认每周，可设周期)"
     echo " 5. BT 吸血 Peer 防火墙拦截管理 (ipset+iptables / 默认开启 / 每日更新)"
     echo " 6. 迁移下载任务到新磁盘 (迁移 未完成 / 全部 任务并切换工作路径)"
     echo " 7. 转移已完成下载到新磁盘 (含做种与已暂停任务 / 可清理游离文件)"
