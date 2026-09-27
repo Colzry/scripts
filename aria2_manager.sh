@@ -35,6 +35,8 @@ fi
 ARIA2_CONF_DIR="${USER_HOME}/.aria2"
 CONF_FILE="${ARIA2_CONF_DIR}/aria2.conf"
 SESSION_FILE="${ARIA2_CONF_DIR}/aria2.session"
+# aria2-next 的原生恢复/断点数据目录(不再使用下载目录旁的 .aria2 控制文件)
+STATE_DIR="${ARIA2_CONF_DIR}/state"
 LOG_FILE="${ARIA2_CONF_DIR}/aria2.log"
 TRACKER_SCRIPT="${ARIA2_CONF_DIR}/scripts/update_tracker.sh"
 BLOCKER_SCRIPT="${ARIA2_CONF_DIR}/scripts/block_peers.sh"
@@ -44,6 +46,206 @@ DEFAULT_PORT="6800"
 DEFAULT_ARIANG_PORT="6880"
 GH_PROXY="https://gitpy.223327.xyz/https://github.com"
 ARIANG_DIR="${ARIA2_CONF_DIR}/ariang"
+
+# ==================== 运行模式: systemd / docker ====================
+# systemd: 本机 aria2-next 二进制 + systemd 服务 (默认)
+# docker : 官方镜像 ghcr.io/aninsomniacy/aria2-next，无需本机编译
+# 挂载策略: 把配置/下载/状态等目录按【完全相同的路径】挂进容器，
+#           这样 aria2.conf 里的路径在容器内外都一致，所有现有功能无需做路径转换。
+ARIA2_RUN_MODE="systemd"
+ARIA2_DOCKER_IMAGE="ghcr.io/aninsomniacy/aria2-next"
+ARIA2_DOCKER_TAG="latest"
+ARIA2_DOCKER_NAME="aria2-next"
+DOCKER_CMD="docker"
+DOCKER_RESOLVED=0
+ARIA2_MODE_FILE="${ARIA2_CONF_DIR}/run-mode.conf"
+
+is_docker_mode() { [ "${ARIA2_RUN_MODE:-systemd}" = "docker" ]; }
+
+# 读取持久化的运行模式与容器参数
+load_run_mode() {
+    [ -f "${ARIA2_MODE_FILE}" ] || return 0
+    local v=""
+    v=$(grep -E '^mode=' "${ARIA2_MODE_FILE}" 2>/dev/null | tail -n1 | cut -d'=' -f2- | tr -d ' \r')
+    [ -n "$v" ] && ARIA2_RUN_MODE="$v"
+    v=$(grep -E '^image=' "${ARIA2_MODE_FILE}" 2>/dev/null | tail -n1 | cut -d'=' -f2- | tr -d ' \r')
+    [ -n "$v" ] && ARIA2_DOCKER_IMAGE="$v"
+    v=$(grep -E '^tag=' "${ARIA2_MODE_FILE}" 2>/dev/null | tail -n1 | cut -d'=' -f2- | tr -d ' \r')
+    [ -n "$v" ] && ARIA2_DOCKER_TAG="$v"
+    v=$(grep -E '^container=' "${ARIA2_MODE_FILE}" 2>/dev/null | tail -n1 | cut -d'=' -f2- | tr -d ' \r')
+    [ -n "$v" ] && ARIA2_DOCKER_NAME="$v"
+}
+
+save_run_mode() {
+    mkdir -p "${ARIA2_CONF_DIR}"
+    cat > "${ARIA2_MODE_FILE}" <<EOF
+# 由 aria2_manager.sh 维护，请勿手工修改
+mode=${ARIA2_RUN_MODE}
+image=${ARIA2_DOCKER_IMAGE}
+tag=${ARIA2_DOCKER_TAG}
+container=${ARIA2_DOCKER_NAME}
+EOF
+}
+
+# 解析可用的 docker 命令(必要时带 sudo)，结果缓存到 DOCKER_CMD
+docker_ensure() {
+    [ "${DOCKER_RESOLVED}" = "1" ] && return 0
+    command -v docker >/dev/null 2>&1 || return 1
+    if docker info >/dev/null 2>&1; then
+        DOCKER_CMD="docker"
+    elif [ "$IS_ROOT" = false ] && ${SUDO_CMD} docker info >/dev/null 2>&1; then
+        DOCKER_CMD="${SUDO_CMD} docker"
+    else
+        return 1
+    fi
+    DOCKER_RESOLVED=1
+    return 0
+}
+
+docker_container_exists() {
+    docker_ensure || return 1
+    $DOCKER_CMD container inspect "${ARIA2_DOCKER_NAME}" >/dev/null 2>&1
+}
+
+docker_container_running() {
+    docker_ensure || return 1
+    [ "$($DOCKER_CMD container inspect -f '{{.State.Running}}' "${ARIA2_DOCKER_NAME}" 2>/dev/null)" = "true" ]
+}
+
+# SELinux 处于强制模式时，bind mount 需要 z 标签
+selinux_enforcing() {
+    if command -v getenforce >/dev/null 2>&1; then
+        [ "$(getenforce 2>/dev/null)" = "Enforcing" ]
+        return $?
+    fi
+    [ -f /sys/fs/selinux/enforce ] && [ "$(cat /sys/fs/selinux/enforce 2>/dev/null)" = "1" ]
+}
+
+# 计算需要按相同路径挂载进容器的路径(去重、过滤非绝对路径与已被父目录覆盖的项)
+aria2_docker_mounts() {
+    local -a out=()
+    local p item covered
+    for p in "${ARIA2_CONF_DIR}" "$(get_current_download_dir)" \
+             "$(get_conf_value "state-dir" "${STATE_DIR}")" \
+             "$(get_conf_value "log" "${LOG_FILE}")" \
+             "$(get_conf_value "input-file" "${SESSION_FILE}")" \
+             "$(get_conf_value "save-session" "${SESSION_FILE}")"; do
+        p="${p%/}"
+        [ -n "$p" ] || continue
+        case "$p" in
+            /*) ;;
+            *) continue ;;   # 非绝对路径(例如 log=-)直接跳过
+        esac
+        covered=""
+        for item in "${out[@]:-}"; do
+            [ -n "$item" ] || continue
+            if [ "$p" = "$item" ] || [ "${p#"${item}/"}" != "$p" ]; then
+                covered=1
+                break
+            fi
+        done
+        [ -n "$covered" ] && continue
+        out+=("$p")
+    done
+    if [ ${#out[@]} -gt 0 ]; then
+        printf '%s\n' "${out[@]}"
+    fi
+    return 0
+}
+
+# 以当前配置 (重新)创建并启动容器
+docker_apply_container() {
+    if ! docker_ensure; then
+        echo ">> !! Docker 不可用 (命令缺失 / 守护进程未运行 / 当前用户无权限)。"
+        return 1
+    fi
+
+    local download_dir
+    download_dir="$(get_current_download_dir)"
+    mkdir -p "${download_dir}" "${ARIA2_CONF_DIR}" 2>/dev/null || true
+    touch "${SESSION_FILE}" "${LOG_FILE}" 2>/dev/null || true
+
+    local vol_suffix=""
+    selinux_enforcing && vol_suffix=":z"
+
+    local -a vol_args=()
+    local p
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        if [ -e "$p" ]; then
+            vol_args+=(-v "${p}:${p}${vol_suffix}")
+        else
+            echo ">> 跳过不存在的挂载路径: ${p}"
+        fi
+    done < <(aria2_docker_mounts)
+
+    if docker_container_exists; then
+        $DOCKER_CMD rm -f "${ARIA2_DOCKER_NAME}" >/dev/null 2>&1 || true
+    fi
+
+    echo ">> 正在启动容器 ${ARIA2_DOCKER_NAME} (镜像 ${ARIA2_DOCKER_IMAGE}:${ARIA2_DOCKER_TAG})..."
+    if ! $DOCKER_CMD run -d \
+            --name "${ARIA2_DOCKER_NAME}" \
+            --restart unless-stopped \
+            --network host \
+            -e "PUID=$(id -u)" \
+            -e "PGID=$(id -g)" \
+            "${vol_args[@]}" \
+            "${ARIA2_DOCKER_IMAGE}:${ARIA2_DOCKER_TAG}" \
+            "--conf-path=${CONF_FILE}" >/dev/null; then
+        echo ">> !! 容器启动失败，请检查上方 Docker 错误输出。"
+        return 1
+    fi
+    return 0
+}
+
+# ==================== 服务控制抽象 (systemd / docker 通用) ====================
+svc_is_active() {
+    if is_docker_mode; then
+        docker_container_running
+    else
+        ${SYSTEMCTL_CMD} is-active --quiet aria2.service 2>/dev/null
+    fi
+}
+
+svc_start() {
+    if is_docker_mode; then
+        # 直接按当前配置重建容器，确保 dir/端口等变更后挂载依然正确
+        docker_apply_container
+    else
+        ${SYSTEMCTL_CMD} start aria2.service
+    fi
+}
+
+svc_stop() {
+    if is_docker_mode; then
+        if docker_container_exists; then
+            $DOCKER_CMD stop "${ARIA2_DOCKER_NAME}" >/dev/null 2>&1 || true
+        fi
+    else
+        ${SYSTEMCTL_CMD} stop aria2.service 2>/dev/null || true
+    fi
+}
+
+# 容器模式下直接按当前配置重建容器，使 dir/端口/限速等变更一并生效
+svc_restart() {
+    if is_docker_mode; then
+        docker_apply_container
+    else
+        ${SYSTEMCTL_CMD} restart aria2.service
+    fi
+}
+
+svc_logs() {
+    if is_docker_mode; then
+        docker_ensure || { echo ">> Docker 不可用，无法读取容器日志。"; return 1; }
+        $DOCKER_CMD logs --tail 60 "${ARIA2_DOCKER_NAME}" 2>&1
+    elif [ "$IS_ROOT" = true ]; then
+        journalctl -u aria2.service -n 40 --no-pager
+    else
+        journalctl --user -u aria2.service -n 40 --no-pager
+    fi
+}
 
 # ==================== 基础依赖检测 (仅缺失时安装，不刷源) ====================
 install_packages() {
@@ -90,6 +292,18 @@ pause_menu() {
 # ==================== 状态与配置检查辅助函数 ====================
 # 运行状态（带颜色）
 get_aria2_status() {
+    if is_docker_mode; then
+        if ! docker_ensure; then
+            printf '%b' "${YELLOW}Docker 不可用${NC}"
+        elif docker_container_running; then
+            printf '%b' "${GREEN}运行中 (容器)${NC}"
+        elif docker_container_exists; then
+            printf '%b' "${RED}已停止 (容器)${NC}"
+        else
+            printf '%b' "${YELLOW}未安装${NC}"
+        fi
+        return 0
+    fi
     if [ ! -f "${ARIA2C_BIN}" ]; then
         printf '%b' "${YELLOW}未安装${NC}"
     elif ${SYSTEMCTL_CMD} is-active --quiet aria2.service 2>/dev/null; then
@@ -101,6 +315,16 @@ get_aria2_status() {
 
 # 开机自启状态（带颜色）
 get_aria2_boot_status() {
+    if is_docker_mode; then
+        if ! docker_ensure; then
+            printf '%b' "${YELLOW}Docker 不可用${NC}"
+        elif docker_container_exists; then
+            printf '%b' "${GREEN}已启用 (restart 策略)${NC}"
+        else
+            printf '%b' "${YELLOW}未安装${NC}"
+        fi
+        return 0
+    fi
     if [ ! -f "${ARIA2C_BIN}" ]; then
         printf '%b' "${YELLOW}未安装${NC}"
     elif ${SYSTEMCTL_CMD} is-enabled --quiet aria2.service 2>/dev/null; then
@@ -112,6 +336,10 @@ get_aria2_boot_status() {
 
 # 已安装的 aria2c 版本号，未安装或读取失败时返回 "未安装"
 get_aria2_version_text() {
+    if is_docker_mode; then
+        printf 'Docker 镜像 %s' "${ARIA2_DOCKER_TAG}"
+        return 0
+    fi
     local ver=""
     ver=$("$ARIA2C_BIN" --version 2>/dev/null | head -n1 | sed -nE 's/.*[Vv]ersion[[:space:]]+([0-9][0-9A-Za-z.-]*).*/\1/p') || true
     if [ -n "$ver" ]; then
@@ -196,9 +424,111 @@ replace_literal_in_file() {
     rm -f "${tmp}"
 }
 
+# ==================== Aria2 活动任务查询 (aria2-next 无 .aria2 控制文件) ====================
+# 通过 RPC 查询「进行中 + 等待中」的任务；aria2-next 不再生成 .aria2 控制文件，
+# 因此磁盘上的文件是否仍被 Aria2 托管，只能以 RPC 任务清单为准。
+#   $1 = names  输出受管理名称集合(小写、去重，含 BT 根目录名/文件名/顶层目录名)
+#   $1 = paths  输出未完成任务的绝对文件路径(去重)
+_rpc_active_query() {
+    [ -f "${CONF_FILE}" ] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    ARIA2_CONF_FILE="${CONF_FILE}" ARIA2_QUERY_MODE="$1" python3 - <<'PYEOF'
+import json
+import os
+import sys
+import urllib.request
+
+CONF_FILE = os.environ.get("ARIA2_CONF_FILE", "")
+MODE = os.environ.get("ARIA2_QUERY_MODE", "names")
+TIMEOUT = 10
+
+
+def read_conf(key, default):
+    try:
+        with open(CONF_FILE, "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k.strip() == key:
+                    return v.strip()
+    except OSError:
+        pass
+    return default
+
+
+PORT = read_conf("rpc-listen-port", "6800") or "6800"
+SECRET = read_conf("rpc-secret", "")
+URL = "http://127.0.0.1:" + PORT + "/jsonrpc"
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def rpc(method, params=None):
+    cp = ["token:" + SECRET] if SECRET else []
+    if params:
+        cp.extend(params)
+    body = json.dumps({"jsonrpc": "2.0", "id": "active_query", "method": method, "params": cp}).encode("utf-8")
+    req = urllib.request.Request(URL, data=body, headers={"Content-Type": "application/json"})
+    try:
+        with OPENER.open(req, timeout=TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+    if isinstance(data, dict) and data.get("error"):
+        return None
+    return data.get("result") if isinstance(data, dict) else None
+
+
+names = set()
+paths = set()
+for method, params in (("aria2.tellActive", None), ("aria2.tellWaiting", [0, 10000])):
+    tasks = rpc(method, params)
+    if not isinstance(tasks, list):
+        continue
+    for task in tasks:
+        bt = task.get("bittorrent")
+        if isinstance(bt, dict):
+            inner = bt.get("info")
+            if isinstance(inner, dict) and inner.get("name"):
+                names.add(inner["name"].lower())
+        task_dir = task.get("dir") or ""
+        files = task.get("files")
+        if not isinstance(files, list):
+            continue
+        for f in files:
+            path = (f or {}).get("path") or ""
+            if not path:
+                continue
+            if not os.path.isabs(path):
+                path = os.path.join(task_dir, path) if task_dir else path
+            real = os.path.realpath(path)
+            paths.add(real)
+            names.add(os.path.basename(real).lower())
+            if task_dir:
+                real_dir = os.path.realpath(task_dir)
+                if real != real_dir and real.startswith(real_dir + os.sep):
+                    names.add(os.path.relpath(real, real_dir).split(os.sep)[0].lower())
+
+if MODE == "paths":
+    for p in sorted(paths):
+        print(p)
+else:
+    for n in sorted(names):
+        print(n)
+PYEOF
+}
+
+rpc_active_managed_names() { _rpc_active_query names; }
+rpc_active_file_paths() { _rpc_active_query paths; }
+
 # ==================== 进程安全停机与等待 ====================
 stop_aria2_safely() {
     echo ">> 正在平稳停止 Aria2 服务以刷新保存 session..."
+    if is_docker_mode; then
+        svc_stop
+        return 0
+    fi
     ${SYSTEMCTL_CMD} stop aria2.service 2>/dev/null || true
     
     local timeout=10
@@ -397,7 +727,12 @@ if [ -n "\$tracker_list" ]; then
         printf 'bt-tracker=%s\n' "\$tracker_list" >> "\$CONF_FILE"
     fi
     echo "Tracker 列表更新成功！"
-    ${SYSTEMCTL_CMD} restart aria2.service
+    # 按运行模式重启: Docker 容器模式用 docker restart，本机模式用 systemctl
+    if grep -q '^mode=docker' "${ARIA2_MODE_FILE}" 2>/dev/null; then
+        docker restart "${ARIA2_DOCKER_NAME}" >/dev/null 2>&1 || sudo docker restart "${ARIA2_DOCKER_NAME}" >/dev/null 2>&1 || true
+    else
+        ${SYSTEMCTL_CMD} restart aria2.service
+    fi
 else
     echo "警告: Tracker 列表获取为空，跳过更新。"
     exit 1
@@ -595,6 +930,488 @@ EOF
     chmod +x "${FILTER_SCRIPT}"
 }
 
+# ==================== Aria2 二进制 (aria2-next) 下载 ====================
+ARIA2_NEXT_REPO="AnInsomniacy/aria2-next"
+# 无法联网获取最新 tag 时使用的固定版本(保证资源命名一致)
+ARIA2_NEXT_FALLBACK_TAG="v2.8.2"
+# aria2-next 的 Linux 发布二进制要求 glibc 不低于该版本
+ARIA2_NEXT_MIN_GLIBC="2.35"
+# 记录本次二进制来源，用于安装概要展示
+ARIA2_INSTALL_NOTE=""
+
+# 读取系统 glibc 版本(非 glibc 或读取失败时输出空)
+detect_glibc_version() {
+    local out=""
+    if command -v getconf >/dev/null 2>&1; then
+        out=$(getconf GNU_LIBC_VERSION 2>/dev/null || true)
+    fi
+    if [ -z "$out" ] && command -v ldd >/dev/null 2>&1; then
+        out=$(ldd --version 2>/dev/null | head -n1 || true)
+    fi
+    printf '%s' "$out" | grep -oE '[0-9]+\.[0-9]+' | head -n1
+}
+
+# 通用版本比较: $1=实际版本 $2=要求版本，满足(>=)返回 0
+version_at_least() {
+    local have="$1" want="$2"
+    [ -n "$have" ] || return 1
+    [ "$(printf '%s\n%s\n' "$want" "$have" | sort -V | head -n1)" = "$want" ]
+}
+
+# 当前 glibc 版本是否 >= 指定版本
+glibc_at_least() {
+    version_at_least "$(detect_glibc_version)" "$1"
+}
+
+# aria2-next 对应的 Linux 资源后缀(不支持的架构返回 1)
+aria2_next_asset_suffix() {
+    case "$(uname -m)" in
+        x86_64|amd64) printf 'linux-x86_64' ;;
+        aarch64|arm64) printf 'linux-aarch64' ;;
+        *) return 1 ;;
+    esac
+}
+
+# 当前平台能否运行 aria2-next 官方预编译二进制
+aria2_next_supported() {
+    if ! aria2_next_asset_suffix >/dev/null 2>&1; then
+        return 1
+    fi
+    glibc_at_least "$ARIA2_NEXT_MIN_GLIBC"
+}
+
+# 后端说明文本(用于安装确认前的概要展示)
+aria2_backend_text() {
+    printf 'aria2-next (AnInsomniacy/官方预编译优先，glibc 过旧则本机源码编译)'
+}
+
+# 平台不满足要求时的原因说明
+aria2_next_unsupported_reason() {
+    local arch="" glibc=""
+    arch="$(uname -m)"
+    if ! aria2_next_asset_suffix >/dev/null 2>&1; then
+        printf '当前架构 %s 没有官方预编译产物(仅 x86_64 / aarch64)' "$arch"
+        return 0
+    fi
+    glibc="$(detect_glibc_version)"
+    printf '需要 glibc >= %s，当前为 %s' "$ARIA2_NEXT_MIN_GLIBC" "${glibc:-未知}"
+}
+
+# 识别已安装二进制的来源: next / legacy / unknown / none
+detect_aria2_flavor() {
+    [ -x "${ARIA2C_BIN}" ] || { printf 'none'; return 0; }
+    local out="" help_out=""
+    out=$("${ARIA2C_BIN}" --version 2>/dev/null | head -n 10 || true)
+    if printf '%s' "$out" | grep -qi 'aria2-next'; then
+        printf 'next'
+        return 0
+    fi
+    # 兜底: 能力探测。aria2-next 独有 state-dir，旧版 aria2 没有该选项
+    help_out=$("${ARIA2C_BIN}" --help=#all 2>/dev/null || true)
+    if printf '%s' "$help_out" | grep -q -- '--state-dir'; then
+        printf 'next'
+        return 0
+    fi
+    if [ -n "$out" ]; then
+        printf 'legacy'
+    else
+        printf 'unknown'
+    fi
+}
+
+# 解析 aria2-next 最新 release tag，失败时用固定版本兑底
+resolve_aria2_next_tag() {
+    local api="https://api.github.com/repos/${ARIA2_NEXT_REPO}/releases/latest"
+    local tag=""
+    tag=$(curl -sSL -m 12 "$api" 2>/dev/null \
+        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1 || true)
+    if [ -n "$tag" ]; then
+        printf '%s' "$tag"
+    else
+        printf '%s' "$ARIA2_NEXT_FALLBACK_TAG"
+    fi
+}
+
+# 计算文件 sha256(优先 sha256sum，其次 openssl)
+file_sha256() {
+    local f="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$f" 2>/dev/null | awk '{print $1}'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$f" 2>/dev/null | awk '{print $NF}'
+    fi
+}
+
+# 下载 GitHub 资源(先走加速代理，失败再直连)；成功返回 0
+download_with_proxy_fallback() {
+    local gh_path="$1" dest="$2"
+    local direct="https://github.com/${gh_path}"
+    local proxied="${GH_PROXY}/${gh_path}"
+    local url=""
+    if command -v curl >/dev/null 2>&1; then
+        for url in "$proxied" "$direct"; do
+            if curl -fSL --connect-timeout 15 -m 300 -o "$dest" "$url" 2>/dev/null && [ -s "$dest" ]; then
+                return 0
+            fi
+        done
+    elif command -v wget >/dev/null 2>&1; then
+        for url in "$proxied" "$direct"; do
+            if wget -q -T 20 -O "$dest" "$url" 2>/dev/null && [ -s "$dest" ]; then
+                return 0
+            fi
+        done
+    else
+        return 1
+    fi
+    return 1
+}
+
+# 安装单一后端的二进制，成功返回 0
+install_aria2_binary_backend() {
+    local tmp_dir=""
+    tmp_dir=$(mktemp -d)
+    local candidate="${tmp_dir}/aria2c.new"
+    mkdir -p "${ARIA2C_BIN_DIR}"
+
+    local suffix="" tag="" ver="" asset=""
+    suffix="$(aria2_next_asset_suffix)" || { echo ">> 本机架构无 aria2-next 预编译产物。"; rm -rf "${tmp_dir}"; return 1; }
+    tag="$(resolve_aria2_next_tag)"
+    ver="${tag#v}"
+    asset="aria2-next-${ver}-${suffix}"
+
+    echo ">> 版本: aria2-next ${tag} (${suffix})"
+    echo ">> 正在下载 Aria2 二进制 (多源加速 + 直连回退)..."
+    if ! download_with_proxy_fallback "${ARIA2_NEXT_REPO}/releases/download/${tag}/${asset}" "${candidate}"; then
+        echo ">> !! aria2-next 下载失败，请检查网络后重试。"
+        rm -rf "${tmp_dir}"
+        return 1
+    fi
+
+    # SHA-256 校验: 官方提供 checksums 文件；拿不到时仅提示，校验不通过则中止
+    local sums_file="${tmp_dir}/checksums.sha256"
+    local expected="" actual=""
+    if download_with_proxy_fallback "${ARIA2_NEXT_REPO}/releases/download/${tag}/aria2-next-${ver}-checksums.sha256" "${sums_file}"; then
+        expected=$(awk -v n="$asset" '$2 == n || $2 == "*" n { print $1 }' "${sums_file}" 2>/dev/null | head -n1)
+        actual="$(file_sha256 "${candidate}")"
+        if [ -n "$expected" ] && [ -n "$actual" ] && [ "$expected" != "$actual" ]; then
+            echo ">> !! SHA-256 校验不通过(期望 ${expected} / 实际 ${actual})。"
+            rm -rf "${tmp_dir}"
+            return 2
+        fi
+        if [ -n "$expected" ] && [ -n "$actual" ]; then
+            echo ">> SHA-256 校验通过。"
+        else
+            echo ">> 提示: 校验信息不完整，已跳过 SHA-256 校验。"
+        fi
+    else
+        echo ">> 提示: 未获取到官方校验文件，已跳过 SHA-256 校验。"
+    fi
+
+    chmod +x "${candidate}" 2>/dev/null || true
+    # 先验证能否执行(既校验完整性，也提前发现 glibc 过旧等问题)，再覆盖现有二进制
+    if ! "${candidate}" --version >/dev/null 2>&1; then
+        echo ">> !! 下载的二进制无法在本机执行(--version 失败)，可能 glibc 版本不足。"
+        rm -rf "${tmp_dir}"
+        return 1
+    fi
+
+    mv -f "${candidate}" "${ARIA2C_BIN}"
+    chmod +x "${ARIA2C_BIN}" 2>/dev/null || true
+    rm -rf "${tmp_dir}"
+    echo ">> 已安装: ${ARIA2C_BIN}"
+    "${ARIA2C_BIN}" --version 2>/dev/null | head -n1 | sed 's/^/   /' || true
+    return 0
+}
+
+# 安装 Aria2 二进制(aria2-next)；返回 2 表示完整性校验失败
+install_aria2_binary() {
+    local rc=0
+    install_aria2_binary_backend || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        return 0
+    fi
+    if [ "$rc" -eq 2 ]; then
+        echo ">> !! 安装包完整性校验失败，为避免装入被篡改/损坏的程序，已中止。"
+        echo "   可稍后重试；若反复出现，请检查网络或下载加速代理。"
+        return 1
+    fi
+    echo ">> !! aria2-next 安装失败，请检查网络/架构/glibc 后重试。"
+    return 1
+}
+
+# ==================== aria2-next 源码编译 (glibc 过旧时的官方可行路径) ====================
+# 官方 Linux 预编译以 Ubuntu 22.04 为基线(glibc >= 2.35)，在更旧的系统(如 RHEL/Rocky/Alma 9
+# 的 glibc 2.34)上无法运行。此时保留 aria2-next 的唯一官方路径就是本机源码编译：
+# 依赖库全部内置在源码 third_party 中，只需 CMake >= 3.25、Ninja/Make、Perl 与 C/C++ 工具链，
+# 编译产物只依赖本机 glibc，因此在旧系统上可以正常运行。
+ARIA2_NEXT_MIN_CMAKE="3.25"
+ARIA2_NEXT_BUILD_ROOT="${ARIA2_CONF_DIR}/build"
+ARIA2_NEXT_TOOLS_DIR="${ARIA2_CONF_DIR}/tools"
+# 系统 CMake 过旧时下载 Kitware 官方静态版(要求 glibc >= 2.17，兼容老系统)
+ARIA2_CMAKE_FALLBACK_VER="3.31.6"
+# 源码编译建议的最小可用磁盘(GB)
+ARIA2_BUILD_MIN_FREE_GB=8
+
+# 读取某个 cmake 可执行文件的版本号
+cmake_cmd_version() {
+    "$1" --version 2>/dev/null | sed -n '1s/[^0-9]*\([0-9][0-9.]*\).*/\1/p'
+}
+
+# 解析可用的 CMake (>= 3.25)：优先系统自带，其次 Kitware 官方静态版
+# 注意: 诊断信息一律输出到 stderr，函数 stdout 只用于回传路径
+resolve_cmake_bin() {
+    local sys_cmake="" arch="" tag="" base="" pkg=""
+    sys_cmake="$(command -v cmake 2>/dev/null || true)"
+    if [ -n "$sys_cmake" ] && version_at_least "$(cmake_cmd_version "$sys_cmake")" "$ARIA2_NEXT_MIN_CMAKE"; then
+        printf '%s' "$sys_cmake"
+        return 0
+    fi
+    if [ -x "${ARIA2_NEXT_TOOLS_DIR}/cmake/bin/cmake" ] \
+        && version_at_least "$(cmake_cmd_version "${ARIA2_NEXT_TOOLS_DIR}/cmake/bin/cmake")" "$ARIA2_NEXT_MIN_CMAKE"; then
+        printf '%s' "${ARIA2_NEXT_TOOLS_DIR}/cmake/bin/cmake"
+        return 0
+    fi
+
+    case "$(uname -m)" in
+        x86_64|amd64) arch="x86_64" ;;
+        aarch64|arm64) arch="aarch64" ;;
+        *) return 1 ;;
+    esac
+
+    tag=$(curl -sSL -m 12 https://api.github.com/repos/Kitware/CMake/releases/latest 2>/dev/null \
+        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\([^"]*\)".*/\1/p' | head -n1 || true)
+    [ -n "$tag" ] || tag="$ARIA2_CMAKE_FALLBACK_VER"
+    base="cmake-${tag}-linux-${arch}"
+    pkg="${ARIA2_NEXT_TOOLS_DIR}/${base}.tar.gz"
+
+    echo ">> 系统 CMake 缺失或低于 ${ARIA2_NEXT_MIN_CMAKE}，正在下载官方静态版 CMake ${tag} (${arch})..." >&2
+    mkdir -p "${ARIA2_NEXT_TOOLS_DIR}"
+    if ! download_with_proxy_fallback "Kitware/CMake/releases/download/v${tag}/${base}.tar.gz" "${pkg}"; then
+        echo ">> !! CMake 下载失败，请检查网络后重试。" >&2
+        return 1
+    fi
+    rm -rf "${ARIA2_NEXT_TOOLS_DIR}/cmake" "${ARIA2_NEXT_TOOLS_DIR}/${base}"
+    if ! tar -xzf "${pkg}" -C "${ARIA2_NEXT_TOOLS_DIR}"; then
+        echo ">> !! CMake 解压失败。" >&2
+        rm -f "${pkg}"
+        return 1
+    fi
+    rm -f "${pkg}"
+    mv "${ARIA2_NEXT_TOOLS_DIR}/${base}" "${ARIA2_NEXT_TOOLS_DIR}/cmake" 2>/dev/null || true
+    if [ ! -x "${ARIA2_NEXT_TOOLS_DIR}/cmake/bin/cmake" ]; then
+        echo ">> !! CMake 安装失败 (未找到 bin/cmake)。" >&2
+        return 1
+    fi
+    printf '%s' "${ARIA2_NEXT_TOOLS_DIR}/cmake/bin/cmake"
+}
+
+# 安装源码编译所需工具链(按发行版映射包名)，并校验关键命令
+ensure_build_toolchain() {
+    local pkgs="" tool="" have_cc="" have_cxx=""
+    local -a missing=()
+
+    if command -v apt-get >/dev/null 2>&1; then
+        pkgs="cmake ninja-build make perl gcc g++ pkg-config binutils curl tar"
+    elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+        pkgs="cmake ninja-build make perl gcc gcc-c++ pkgconf-pkg-config binutils curl tar"
+    elif command -v pacman >/dev/null 2>&1; then
+        pkgs="cmake ninja make perl gcc pkgconf binutils curl tar"
+    elif command -v zypper >/dev/null 2>&1; then
+        pkgs="cmake ninja make perl gcc gcc-c++ pkg-config binutils curl tar"
+    fi
+
+    if [ -n "$pkgs" ]; then
+        echo ">> 正在检查/安装编译工具链: ${pkgs}"
+        install_packages $pkgs || true
+    fi
+
+    for tool in cc gcc clang; do
+        if command -v "$tool" >/dev/null 2>&1; then have_cc="$tool"; break; fi
+    done
+    for tool in c++ g++ clang++; do
+        if command -v "$tool" >/dev/null 2>&1; then have_cxx="$tool"; break; fi
+    done
+    [ -n "$have_cc" ] || missing+=("C 编译器(gcc/clang)")
+    [ -n "$have_cxx" ] || missing+=("C++ 编译器(g++/clang++)")
+    for tool in make perl tar; do
+        command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+    done
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+        missing+=("curl 或 wget")
+    fi
+    if ! command -v pkg-config >/dev/null 2>&1 && ! command -v pkgconf >/dev/null 2>&1; then
+        echo ">> 提示: 未检测到 pkg-config/pkgconf，部分内置依赖可能配置失败。"
+    fi
+
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo ">> !! 缺少编译所需工具: ${missing[*]}"
+        echo "   请手动安装后重试 (Ubuntu/Debian: sudo apt install build-essential cmake ninja-build pkg-config perl binutils)"
+        return 1
+    fi
+    return 0
+}
+
+# 目录可用空间(GB，向下取整)；目录尚不存在时回溯到最近的父目录
+dir_free_gb() {
+    local path="${1%/}"
+    while [ -n "$path" ] && [ ! -d "$path" ]; do
+        path="$(dirname "$path")"
+    done
+    [ -d "$path" ] || return 0
+    df -Pk "$path" 2>/dev/null | awk 'NR==2 {printf "%d", $4/1024/1024}'
+}
+
+# 源码编译并安装 aria2-next；成功返回 0
+build_aria2_next_from_source() {
+    echo ""
+    echo "=========== 源码编译安装 aria2-next ==========="
+
+    if ! aria2_next_asset_suffix >/dev/null 2>&1; then
+        echo ">> !! 当前架构 $(uname -m) 不在项目维护的构建矩阵内 (仅 x86_64 / aarch64)。"
+        echo "   请参考 https://github.com/${ARIA2_NEXT_REPO} 的 Build 章节手动编译。"
+        return 1
+    fi
+
+    local glibc_have="" free_gb=""
+    glibc_have="$(detect_glibc_version)"
+    echo ">> 当前 glibc: ${glibc_have:-未知} (官方预编译要求 >= ${ARIA2_NEXT_MIN_GLIBC})"
+    echo ">> 编译方式: 官方 superbuild，依赖库全部来自源码 third_party，无需额外开发库"
+    echo ">> 预计耗时 30-90 分钟；需要磁盘约 ${ARIA2_BUILD_MIN_FREE_GB}GB、内存峰值 2-4GB"
+
+    free_gb="$(dir_free_gb "${ARIA2_CONF_DIR}")"
+    if [ -n "$free_gb" ] && [ "$free_gb" -lt "$ARIA2_BUILD_MIN_FREE_GB" ]; then
+        echo ">> !! 警告: ${ARIA2_CONF_DIR} 所在分区可用空间约 ${free_gb}GB，低于建议的 ${ARIA2_BUILD_MIN_FREE_GB}GB。"
+        echo "   内置的 OpenSSL / libtorrent / FFmpeg / GPAC 体量较大，可能因磁盘写满而中途失败。"
+    fi
+
+    read -rp "确认开始源码编译? [Y/n 默认: Y]: " CONFIRM_BUILD
+    CONFIRM_BUILD="${CONFIRM_BUILD:-Y}"
+    if [[ ! "$CONFIRM_BUILD" =~ ^[Yy]$ ]]; then
+        echo ">> 已取消源码编译。"
+        return 1
+    fi
+
+    install_packages curl wget python3 tar findutils
+    ensure_build_toolchain || return 1
+
+    local cmake_bin=""
+    if ! cmake_bin="$(resolve_cmake_bin)"; then
+        echo ">> !! 无法获得 CMake >= ${ARIA2_NEXT_MIN_CMAKE}，源码编译中止。"
+        return 1
+    fi
+    echo ">> 使用 CMake: ${cmake_bin} (版本 $(cmake_cmd_version "$cmake_bin"))"
+
+    local tag="" ver="" tarball="" src_root="" build_dir=""
+    tag="$(resolve_aria2_next_tag)"
+    ver="${tag#v}"
+    mkdir -p "${ARIA2_NEXT_BUILD_ROOT}"
+    tarball="${ARIA2_NEXT_BUILD_ROOT}/aria2-next-${ver}.tar.gz"
+    src_root="${ARIA2_NEXT_BUILD_ROOT}/aria2-next-${ver}"
+    build_dir="${ARIA2_NEXT_BUILD_ROOT}/out-${ver}"
+
+    if [ ! -d "${src_root}/third_party" ]; then
+        echo ">> 正在下载 aria2-next ${tag} 源码包 (含内置依赖源码，体积较大)..."
+        rm -rf "${src_root}"
+        if ! download_with_proxy_fallback "${ARIA2_NEXT_REPO}/archive/refs/tags/${tag}.tar.gz" "${tarball}"; then
+            echo ">> !! 源码包下载失败，请检查网络后重试。"
+            return 1
+        fi
+        if ! tar -xzf "${tarball}" -C "${ARIA2_NEXT_BUILD_ROOT}"; then
+            echo ">> !! 源码包解压失败。"
+            rm -f "${tarball}"
+            return 1
+        fi
+        rm -f "${tarball}"
+    else
+        echo ">> 已存在源码目录，跳过下载: ${src_root}"
+    fi
+    # 解压目录名与预期不一致时，直接在解压根目录下定位 third_party 所属目录
+    if [ ! -d "${src_root}/third_party" ]; then
+        local found=""
+        found=$(find "${ARIA2_NEXT_BUILD_ROOT}" -maxdepth 2 -type d -name third_party 2>/dev/null | head -n1 || true)
+        if [ -n "$found" ]; then
+            src_root="$(dirname "$found")"
+            echo ">> 源码目录已解析为: ${src_root}"
+        fi
+    fi
+    if [ ! -d "${src_root}/third_party" ]; then
+        echo ">> !! 源码目录不完整 (缺少 third_party): ${src_root}"
+        return 1
+    fi
+
+    local -a gen_args=()
+    local jobs=2 ram_mb=0
+    if command -v ninja >/dev/null 2>&1; then
+        gen_args=(-G Ninja)
+    else
+        gen_args=(-G "Unix Makefiles")
+        echo ">> 提示: 未检测到 ninja，改用 Unix Makefiles 生成器。"
+    fi
+
+    jobs="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf '2')"
+    [[ "$jobs" =~ ^[0-9]+$ ]] || jobs=2
+    ram_mb=$(awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || printf '0')
+    [[ "$ram_mb" =~ ^[0-9]+$ ]] || ram_mb=0
+    if [ "$ram_mb" -gt 0 ] && [ "$ram_mb" -lt 4096 ] && [ "$jobs" -gt 2 ]; then
+        jobs=2
+        echo ">> 可用内存较低 (${ram_mb}MB)，并行任务数已降为 2 以避免编译期内存不足。"
+    fi
+
+    echo ">> 正在配置构建 (Release / LTO 已关闭以降低内存占用与耗时)..."
+    if ! ( cd "${src_root}" && PREFIX="${build_dir}/dependencies" \
+            "$cmake_bin" -S . -B "${build_dir}" "${gen_args[@]}" \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DARIA2_RELEASE_SIZE_OPTIMIZED=ON \
+                -DARIA2_RELEASE_LTO=OFF \
+                -DBUILD_TESTING=OFF \
+                -DCMAKE_SKIP_RPATH=ON ); then
+        echo ">> !! CMake 配置失败，请查看上方错误信息。"
+        return 1
+    fi
+
+    echo ">> 正在编译 (并行 ${jobs})。这一步耗时最长；中断后重跑本功能会复用已编译的中间产物。"
+    if ! "$cmake_bin" --build "${build_dir}" --target aria2_project -j"${jobs}"; then
+        echo ">> !! 编译失败，请查看上方错误信息。"
+        echo "   源码与中间产物已保留在 ${ARIA2_NEXT_BUILD_ROOT}，修复问题后可重新执行本功能。"
+        return 1
+    fi
+
+    local built="${build_dir}/aria2-next"
+    if [ ! -x "$built" ]; then
+        echo ">> !! 未找到编译产物: ${built}"
+        return 1
+    fi
+    if ! "$built" --version >/dev/null 2>&1; then
+        echo ">> !! 编译产物无法在本机执行。"
+        return 1
+    fi
+
+    mkdir -p "${ARIA2C_BIN_DIR}"
+    if [ -w "${ARIA2C_BIN_DIR}" ]; then
+        cp -f "$built" "${ARIA2C_BIN}"
+        chmod +x "${ARIA2C_BIN}" 2>/dev/null || true
+    else
+        ${SUDO_CMD} cp -f "$built" "${ARIA2C_BIN}"
+        ${SUDO_CMD} chmod +x "${ARIA2C_BIN}" 2>/dev/null || true
+    fi
+
+    ARIA2_INSTALL_NOTE="本机源码编译"
+    echo ""
+    echo ">> [成功] 已安装源码编译版 aria2-next: ${ARIA2C_BIN}"
+    "${ARIA2C_BIN}" --version 2>/dev/null | head -n 3 | sed 's/^/   /' || true
+
+    echo ""
+    read -rp "是否删除编译目录 (源码+中间产物，可释放数 GB 空间)? [y/N 默认: N]: " CLEAN_BUILD
+    CLEAN_BUILD="${CLEAN_BUILD:-N}"
+    if [[ "$CLEAN_BUILD" =~ ^[Yy]$ ]]; then
+        rm -rf "${ARIA2_NEXT_BUILD_ROOT}"
+        echo ">> 已删除编译目录。"
+    else
+        echo ">> 已保留编译目录 (可随时手动删除): ${ARIA2_NEXT_BUILD_ROOT}"
+    fi
+    return 0
+}
+
 # ==================== 模块 1: 安装 / 重新配置 Aria2 后端 ====================
 install_aria2() {
     echo ""
@@ -638,6 +1455,46 @@ install_aria2() {
         fi
         echo "RPC 密钥不能为空，请重新输入！"
     done
+    # ---- 运行方式选择: 本机二进制(systemd) / Docker 容器 ----
+    local PREV_RUN_MODE="${ARIA2_RUN_MODE}"
+    echo ""
+    echo "请选择 Aria2 运行方式:"
+    echo "  1. 本机二进制 + systemd 服务 (默认；预编译安装，glibc 过旧则源码编译)"
+    echo "  2. Docker 容器 (使用官方镜像，无需本机编译，适合 glibc 过旧的环境)"
+    local RUN_MODE_DEFAULT="1"
+    is_docker_mode && RUN_MODE_DEFAULT="2"
+    read -rp "请选择 [1-2 默认: ${RUN_MODE_DEFAULT}]: " RUN_MODE_CHOICE
+    RUN_MODE_CHOICE="${RUN_MODE_CHOICE:-$RUN_MODE_DEFAULT}"
+    if [ "$RUN_MODE_CHOICE" = "2" ]; then
+        ARIA2_RUN_MODE="docker"
+    else
+        ARIA2_RUN_MODE="systemd"
+    fi
+
+    # 运行方式发生切换时，先清理另一种方式的实例，避免 RPC 端口冲突
+    if [ "${PREV_RUN_MODE}" != "${ARIA2_RUN_MODE}" ]; then
+        if is_docker_mode; then
+            if [ -f "${SYSTEMD_DIR}/aria2.service" ] || ${SYSTEMCTL_CMD} is-active --quiet aria2.service 2>/dev/null; then
+                echo ">> 检测到本机 systemd 服务，正在停止并禁用以避免端口冲突..."
+                ${SYSTEMCTL_CMD} stop aria2.service 2>/dev/null || true
+                ${SYSTEMCTL_CMD} disable aria2.service 2>/dev/null || true
+            fi
+        else
+            if docker_ensure && docker_container_exists; then
+                echo ">> 检测到旧的 aria2 Docker 容器 ${ARIA2_DOCKER_NAME}，正在删除以避免端口冲突..."
+                $DOCKER_CMD rm -f "${ARIA2_DOCKER_NAME}" >/dev/null 2>&1 || true
+            fi
+        fi
+    fi
+
+    if is_docker_mode; then
+        read -rp "Docker 镜像地址 [默认: ${ARIA2_DOCKER_IMAGE}]: " INPUT_DOCKER_IMAGE
+        ARIA2_DOCKER_IMAGE="${INPUT_DOCKER_IMAGE:-$ARIA2_DOCKER_IMAGE}"
+        read -rp "镜像标签 (tag) [默认: ${ARIA2_DOCKER_TAG}]: " INPUT_DOCKER_TAG
+        ARIA2_DOCKER_TAG="${INPUT_DOCKER_TAG:-$ARIA2_DOCKER_TAG}"
+        read -rp "容器名称 [默认: ${ARIA2_DOCKER_NAME}]: " INPUT_DOCKER_NAME
+        ARIA2_DOCKER_NAME="${INPUT_DOCKER_NAME:-$ARIA2_DOCKER_NAME}"
+    fi
 
     echo ""
     read -rp "是否顺带安装/更新 AriaNg Web 前端 (Caddy 反代模式)? [y/N 默认: N]: " WITH_ARIANG
@@ -646,6 +1503,8 @@ install_aria2() {
     echo ""
     echo "=== Aria2 配置概要 ==="
     echo "运行模式: $([ "$IS_ROOT" = true ] && echo "Root 系统模式" || echo "普通用户模式 ($CURRENT_USER)")"
+    echo "运行方式: $(is_docker_mode && echo "Docker 容器 (${ARIA2_DOCKER_IMAGE}:${ARIA2_DOCKER_TAG})" || echo "本机二进制 + systemd 服务")"
+    echo "Aria2 后端: $(aria2_backend_text)"
     echo "下载目录: ${DOWNLOAD_DIR}"
     echo "RPC 端口: ${RPC_PORT}"
     echo "RPC 密钥: ${RPC_SECRET}"
@@ -654,7 +1513,7 @@ install_aria2() {
     echo "全局最大上传限制: 2M"
     echo "全局下载速度限制: 不限速 (0)"
     echo "BT 默认做种策略: 分享率达到 1.0 停止做种"
-    echo "未选文件自动清理: 开启 (bt-remove-unselected-file=true)"
+    echo "断点/恢复状态目录: ${STATE_DIR} (aria2-next 原生恢复数据)"
     echo "吸血 Peer 防火墙: 默认自动开启 (ipset + iptables 拦截)"
     echo "======================"
     read -rp "确认应用并保存配置? [Y/n 默认: Y]: " CONFIRM
@@ -663,31 +1522,94 @@ install_aria2() {
         echo "已取消操作。"
         return 0
     fi
+    if is_docker_mode; then
+        if ! docker_ensure; then
+            echo ">> 未检测到可用的 Docker，正在尝试自动安装 (系统源不提供时需手动安装)..."
+            for _pkg in docker.io moby-engine docker; do
+                install_packages "$_pkg" >/dev/null 2>&1 || true
+                ${SUDO_CMD} systemctl enable --now docker >/dev/null 2>&1 || true
+                docker_ensure && break
+            done
+        fi
+        if ! docker_ensure; then
+            echo ""
+            echo ">> !! 未检测到可用的 Docker (命令缺失 / 守护进程未运行 / 当前用户无权限)。"
+            echo "   请手动安装并启动 Docker:"
+            echo "     Ubuntu/Debian : sudo apt install -y docker.io && sudo systemctl enable --now docker"
+            echo "     RHEL/Rocky 9  : sudo dnf install -y moby-engine (需 EPEL) 或安装官方 docker-ce"
+            echo "   若当前用户无权限，可加入 docker 组后重新登录:"
+            echo "     sudo usermod -aG docker ${CURRENT_USER}"
+            echo "   也可以退出本功能，改用『本机二进制 (预编译 / 源码编译)』方案。"
+            return 1
+        fi
+        install_packages curl python3
+        echo ">> 已选择 Docker 运行方式 (${DOCKER_CMD})，跳过本机二进制安装与编译。"
+    else
 
     local NEED_DOWNLOAD=true
     if [ -f "${ARIA2C_BIN}" ] && [ -x "${ARIA2C_BIN}" ]; then
-        echo ""
-        echo ">> 检测到 ${ARIA2C_BIN} 已存在，跳过重新下载二进制程序。"
+        local CUR_FLAVOR=""
+        CUR_FLAVOR="$(detect_aria2_flavor)"
         NEED_DOWNLOAD=false
+        if [ "$CUR_FLAVOR" != "next" ]; then
+            echo ""
+            echo ">> 检测到已有 Aria2 二进制 (来源: ${CUR_FLAVOR})，而本脚本已统一改用 aria2-next。"
+            echo "   注意: 本脚本生成的配置含 aria2-next 专属项 (state-dir)，旧版 aria2 无法解析，"
+            echo "         且 aria2-next 不再生成 .aria2 断点文件、也不导入旧版 session/断点状态。"
+            read -rp "是否安装/替换为 aria2-next? [y/N 默认: N]: " SWITCH_BACKEND
+            SWITCH_BACKEND="${SWITCH_BACKEND:-N}"
+            if [[ "$SWITCH_BACKEND" =~ ^[Yy]$ ]]; then
+                NEED_DOWNLOAD=true
+            else
+                echo ">> 已取消：未安装替代二进制，本次配置中止。"
+                return 1
+            fi
+        else
+            echo ""
+            echo ">> 检测到 ${ARIA2C_BIN} 已存在，跳过重新下载二进制程序。"
+        fi
     fi
 
     if [ "$NEED_DOWNLOAD" = true ]; then
-        install_packages curl wget tar python3
-        echo ">> 正在下载 Aria2 增强版..."
-        ARIA2_URL="${GH_PROXY}/P3TERX/Aria2-Pro-Core/releases/download/1.36.0_2021.08.22/aria2-1.36.0-static-linux-amd64.tar.gz"
-        TMP_DIR=$(mktemp -d)
-        wget -q --show-progress -O "${TMP_DIR}/aria2.tar.gz" "${ARIA2_URL}"
-
-        echo ">> 解压并安装到 ${ARIA2C_BIN}..."
-        tar -zxvf "${TMP_DIR}/aria2.tar.gz" -C "${TMP_DIR}"
-        mkdir -p "${ARIA2C_BIN_DIR}"
-        mv "${TMP_DIR}/aria2c" "${ARIA2C_BIN}"
-        chmod +x "${ARIA2C_BIN}"
-        rm -rf "${TMP_DIR}"
+        install_packages curl wget python3
+        if aria2_next_supported; then
+            install_aria2_binary || { echo ">> [失败] Aria2 二进制安装失败，已中止本次配置。"; return 1; }
+            ARIA2_INSTALL_NOTE="官方预编译"
+        else
+            echo ""
+            echo ">> 无法直接使用 aria2-next 官方预编译产物: $(aria2_next_unsupported_reason)"
+            echo "   说明: 官方 Linux 预编译仅覆盖 x86_64 / aarch64，并以 Ubuntu 22.04 为基线"
+            echo "         (glibc ${ARIA2_NEXT_MIN_GLIBC}+)；glibc 更旧的系统 (如 RHEL/Rocky/Alma 9 为 2.34) 无法运行。"
+            echo ""
+            echo "   可选方案:"
+            echo "     1. 本机源码编译 aria2-next (推荐；旧 glibc 上保留 aria2-next 的官方路径)"
+            echo "     2. 取消本次配置 (可重新运行主菜单 1，在『运行方式』处改选 Docker 容器运行)"
+            read -rp "请选择 [1-2 默认: 1]: " BUILD_FALLBACK
+            BUILD_FALLBACK="${BUILD_FALLBACK:-1}"
+            if [ "$BUILD_FALLBACK" != "1" ]; then
+                echo ">> 已取消，未做任何变更。"
+                return 1
+            fi
+            build_aria2_next_from_source || { echo ">> [失败] 源码编译未完成，已中止本次配置。"; return 1; }
+        fi
     fi
+
+    # 本脚本生成的配置含 aria2-next 专属项(state-dir)，必须确认最终二进制确实是 aria2-next
+    local FINAL_FLAVOR=""
+    FINAL_FLAVOR="$(detect_aria2_flavor)"
+    if [ "$FINAL_FLAVOR" != "next" ]; then
+        echo ""
+        echo ">> [中止] 当前 ${ARIA2C_BIN} 不是 aria2-next (识别结果: ${FINAL_FLAVOR})。"
+        echo "   旧版 aria2 无法解析本脚本生成的配置 (state-dir 等专属项)，服务会启动失败。"
+        echo "   请改用源码编译或替换为 aria2-next 后重新运行本功能。"
+        return 1
+    fi
+
+    fi   # end of systemd-mode binary preparation
 
     mkdir -p "${DOWNLOAD_DIR}"
     mkdir -p "${ARIA2_CONF_DIR}"
+    mkdir -p "${STATE_DIR}"
     touch "${SESSION_FILE}"
     touch "${LOG_FILE}"
 
@@ -703,11 +1625,11 @@ disk-cache=64M
 file-allocation=falloc
 continue=true
 
-## 下载连接与速度设置 ##
+## 下载与速度设置 ##
+## 注: aria2-next 的 HTTP(S) 分片/连接数由引擎自适应管理，
+##     旧的 split / min-split-size / max-connection-per-server 已不再支持；
+##     如需限制单任务并发连接数，可自行启用 stream-max-connections。
 max-concurrent-downloads=5
-max-connection-per-server=64
-min-split-size=4M
-split=64
 disable-ipv6=true
 max-overall-upload-limit=2M
 max-upload-limit=2M
@@ -718,10 +1640,11 @@ max-download-limit=0
 seed-time=0
 seed-ratio=1.0
 
-## 进度保存设置 ##
+## 会话与断点设置 (aria2-next: 原生恢复数据存于 state-dir) ##
 input-file=${SESSION_FILE}
 save-session=${SESSION_FILE}
 save-session-interval=60
+state-dir=${STATE_DIR}
 
 ## RPC 设置 ##
 enable-rpc=true
@@ -731,14 +1654,28 @@ rpc-listen-port=${RPC_PORT}
 rpc-secret=${RPC_SECRET}
 
 ## BT/PT 设置 ##
-bt-save-metadata=false
 follow-torrent=mem
-bt-remove-unselected-file=true
 bt-tracker=
 EOF
 
     ensure_tracker_script
 
+    if is_docker_mode; then
+        # ---- Docker 模式: 拉取镜像并按当前配置启动容器 ----
+        save_run_mode
+        echo ">> 正在拉取镜像 ${ARIA2_DOCKER_IMAGE}:${ARIA2_DOCKER_TAG}..."
+        if ! $DOCKER_CMD pull "${ARIA2_DOCKER_IMAGE}:${ARIA2_DOCKER_TAG}"; then
+            echo ">> !! 镜像拉取失败，请检查网络或镜像地址后重试。"
+            return 1
+        fi
+        docker_apply_container || return 1
+
+        # Trackers 定时更新单元在两种模式下通用 (脚本内部按模式选择重启方式)
+        write_tracker_timer_units
+        ${SYSTEMCTL_CMD} daemon-reload 2>/dev/null || true
+        ${SYSTEMCTL_CMD} enable --now aria2-update-tracker.timer 2>/dev/null || true
+    else
+    save_run_mode
     [ "$IS_ROOT" = false ] && mkdir -p "${SYSTEMD_DIR}"
 
     if [ "$IS_ROOT" = true ]; then
@@ -783,6 +1720,7 @@ EOF
     ${SYSTEMCTL_CMD} enable --now aria2.service
     ${SYSTEMCTL_CMD} restart aria2.service
     ${SYSTEMCTL_CMD} enable --now aria2-update-tracker.timer
+    fi   # end of systemd-mode service bring-up
 
     echo ">> 正在同步 Trackers 列表..."
     bash "${TRACKER_SCRIPT}" 2>/dev/null || true
@@ -824,6 +1762,11 @@ EOF
 
     echo ""
     echo ">> Aria2 后端配置并启动成功！"
+    if is_docker_mode; then
+        echo "   运行方式: Docker 容器 ${ARIA2_DOCKER_NAME} (${ARIA2_DOCKER_IMAGE}:${ARIA2_DOCKER_TAG})"
+    elif [ -n "${ARIA2_INSTALL_NOTE:-}" ]; then
+        echo "   二进制来源: aria2-next (${ARIA2_INSTALL_NOTE})"
+    fi
     echo "   下载目录: ${DOWNLOAD_DIR}"
     echo "   RPC 端口: ${RPC_PORT}"
     echo "   RPC 密钥: ${RPC_SECRET}"
@@ -844,15 +1787,15 @@ manage_core_settings() {
     fi
 
     while true; do
-        local cur_dir cur_concurrent cur_up_limit cur_down_limit cur_seed_time cur_seed_ratio cur_rm_unsel cur_save_meta
+        local cur_dir cur_concurrent cur_up_limit cur_down_limit cur_seed_time cur_seed_ratio cur_state_dir cur_listen_port
         cur_dir=$(get_current_download_dir)
         cur_concurrent=$(get_conf_value "max-concurrent-downloads" "5")
         cur_up_limit=$(get_conf_value "max-overall-upload-limit" "2M")
         cur_down_limit=$(get_conf_value "max-overall-download-limit" "0")
         cur_seed_time=$(get_conf_value "seed-time" "0")
         cur_seed_ratio=$(get_conf_value "seed-ratio" "1.0")
-        cur_rm_unsel=$(get_conf_value "bt-remove-unselected-file" "true")
-        cur_save_meta=$(get_conf_value "bt-save-metadata" "false")
+        cur_state_dir=$(get_conf_value "state-dir" "${STATE_DIR}")
+        cur_listen_port=$(get_conf_value "listen-port" "6881")
 
         echo ""
         echo "=========================================="
@@ -870,8 +1813,8 @@ manage_core_settings() {
         else
             echo "  5. BT 做种策略:            下载完成立即停止做种"
         fi
-        echo "  6. 清理未选择的占位文件:   $([ "$cur_rm_unsel" == "true" ] && echo "是 (自动删除)" || echo "否 (保留空占位)")"
-        echo "  7. 保存磁力下载的种子文件: $([ "$cur_save_meta" == "true" ] && echo "是 (保存 .torrent)" || echo "否 (不保留)")"
+        echo "  6. 断点/恢复状态目录:      ${cur_state_dir}"
+        echo "  7. BT 监听端口:            ${cur_listen_port}"
         echo "------------------------------------------"
         echo " 8. 一键快捷配置向导 (交互式快速配置以上所有项)"
         echo " 0. 保存并返回主菜单"
@@ -939,25 +1882,19 @@ manage_core_settings() {
                 fi
                 ;;
             6)
-                read -rp "是否在下载完成后自动删除未勾选的占位文件? [Y/n 默认: Y]: " UNSEL_CHOICE
-                UNSEL_CHOICE="${UNSEL_CHOICE:-Y}"
-                if [[ "$UNSEL_CHOICE" =~ ^[Yy]$ ]]; then
-                    update_conf_kv "bt-remove-unselected-file" "true"
-                    echo ">> 已开启: 自动删除未选中的文件占位。"
-                else
-                    update_conf_kv "bt-remove-unselected-file" "false"
-                    echo ">> 已关闭: 保留所有文件的占位。"
+                read -rp "请输入新的断点/恢复状态目录绝对路径 [留空取消，当前: ${cur_state_dir}]: " NEW_STATE_DIR
+                if [ -n "$NEW_STATE_DIR" ]; then
+                    NEW_STATE_DIR="${NEW_STATE_DIR%/}"
+                    mkdir -p "${NEW_STATE_DIR}"
+                    update_conf_kv "state-dir" "${NEW_STATE_DIR}"
+                    echo ">> 断点/恢复状态目录已更新为: ${NEW_STATE_DIR}"
                 fi
                 ;;
             7)
-                read -rp "磁力链下载时是否把种子文件 (.torrent) 保存到下载目录? [y/N 默认: N]: " META_CHOICE
-                META_CHOICE="${META_CHOICE:-N}"
-                if [[ "$META_CHOICE" =~ ^[Yy]$ ]]; then
-                    update_conf_kv "bt-save-metadata" "true"
-                    echo ">> 已开启: 磁力链解析成功后将保留 .torrent 种子文件。"
-                else
-                    update_conf_kv "bt-save-metadata" "false"
-                    echo ">> 已关闭: 不保留额外种子文件。"
+                read -rp "请输入 BT 监听端口 (支持范围如 6881-6999) [留空取消，当前: ${cur_listen_port}]: " NEW_LISTEN
+                if [ -n "$NEW_LISTEN" ]; then
+                    update_conf_kv "listen-port" "${NEW_LISTEN}"
+                    echo ">> BT 监听端口已更新为: ${NEW_LISTEN} (需在防火墙/路由器上放行才能提高连通性)"
                 fi
                 ;;
             8)
@@ -980,19 +1917,17 @@ manage_core_settings() {
                 update_conf_kv "seed-ratio" "${IN_RATIO}"
                 update_conf_kv "seed-time" "0"
 
-                read -rp "6. 自动清理未勾选的多余占位文件? [Y/n 默认: Y]: " IN_RM
-                IN_RM="${IN_RM:-Y}"
-                [[ "$IN_RM" =~ ^[Yy]$ ]] && update_conf_kv "bt-remove-unselected-file" "true" || update_conf_kv "bt-remove-unselected-file" "false"
+                read -rp "6. 断点/恢复状态目录 [当前: ${cur_state_dir}]: " IN_STATE_DIR
+                [ -n "$IN_STATE_DIR" ] && mkdir -p "${IN_STATE_DIR}" && update_conf_kv "state-dir" "${IN_STATE_DIR}"
 
-                read -rp "7. 保存磁力下载的 .torrent 种子? [y/N 默认: N]: " IN_SAVE_META
-                IN_SAVE_META="${IN_SAVE_META:-N}"
-                [[ "$IN_SAVE_META" =~ ^[Yy]$ ]] && update_conf_kv "bt-save-metadata" "true" || update_conf_kv "bt-save-metadata" "false"
+                read -rp "7. BT 监听端口 [当前: ${cur_listen_port}]: " IN_LISTEN
+                [ -n "$IN_LISTEN" ] && update_conf_kv "listen-port" "${IN_LISTEN}"
 
                 echo ">> 向导配置已完整写入！"
                 ;;
             0)
                 echo ">> 正在重启 Aria2 服务以应用修改..."
-                ${SYSTEMCTL_CMD} restart aria2.service
+                svc_restart
                 echo ">> Aria2 服务重启完毕，配置已生效！"
                 break
                 ;;
@@ -1062,7 +1997,7 @@ update_trackers_menu() {
 
         update_conf_kv "bt-tracker" "${formatted_trackers}"
 
-        ${SYSTEMCTL_CMD} restart aria2.service
+        svc_restart
         echo ">> 自定义 Trackers 已成功写入并重启 Aria2 服务！"
     else
         echo "无效选项。"
@@ -1309,7 +2244,7 @@ migrate_downloads() {
     fi
 
     echo "请先选择迁移范围:"
-    echo " 1. 仅迁移未完成的下载任务 (自动识别 .aria2 校验块、数据与种子元数据)"
+    echo " 1. 仅迁移未完成的下载任务 (按 Aria2 RPC 清单识别数据，并带上种子元数据)"
     echo " 2. 迁移整个下载目录的所有数据 (包含已完成与未完成，自动识别元数据)"
     echo " 3. 仅迁移指定文件/任务 (按关键词匹配，自动识别元数据)"
     echo " 0. 返回上级菜单"
@@ -1325,7 +2260,7 @@ migrate_downloads() {
         return 1
     fi
 
-    install_packages rsync findutils
+    install_packages rsync findutils python3
 
     FILE_KEYWORD=""
     if [ "$MIGRATE_TYPE" == "3" ]; then
@@ -1369,32 +2304,39 @@ migrate_downloads() {
 
     case "$MIGRATE_TYPE" in
         1)
-            echo ">> 正在检索未完成任务 (*.aria2)..."
-            mapfile -t ARIA2_CONTROL_FILES < <(find "${SRC_DIR}" -name "*.aria2")
-            if [ ${#ARIA2_CONTROL_FILES[@]} -eq 0 ]; then
-                echo "提示: 在源目录下未找到任何未完成的任务 (*.aria2 文件)。"
-                ${SYSTEMCTL_CMD} start aria2.service
+            echo ">> 正在通过 RPC 检索未完成 (进行中 / 等待中) 任务的本地数据..."
+            # aria2-next 不再生成 .aria2 控制文件，未完成任务只能以 RPC 任务清单为准
+            declare -a PENDING_PATHS=()
+            local _pp=""
+            while IFS= read -r _pp; do
+                [ -n "$_pp" ] || continue
+                [ -e "$_pp" ] || continue   # 跳过 [METADATA] 等尚未落盘的虚拟路径
+                PENDING_PATHS+=("$_pp")
+            done < <(rpc_active_file_paths 2>/dev/null || true)
+
+            if [ ${#PENDING_PATHS[@]} -eq 0 ]; then
+                echo "提示: 未检索到未完成任务的本地数据文件 (任务可能尚未开始下载，或仅有磁力元数据)。"
+                echo "      aria2-next 的断点/恢复数据存于 ${STATE_DIR}，该目录独立于下载目录，无需随数据迁移。"
+                svc_start
                 return 0
             fi
 
-            echo ">> 发现 ${#ARIA2_CONTROL_FILES[@]} 个未完成任务，正在断点同步数据、控制文件与种子元数据..."
-            for ctl in "${ARIA2_CONTROL_FILES[@]}"; do
-                data_target="${ctl%.aria2}"
-                rel_ctl="${ctl#"${SRC_DIR}/"}"
-                dest_subdir=$(dirname "${DEST_DIR}/${rel_ctl}")
-                mkdir -p "${dest_subdir}"
+            echo ">> 发现 ${#PENDING_PATHS[@]} 个未完成任务数据文件，正在断点同步数据与种子元数据..."
+            local _rel="" _dest_subdir=""
+            for _pp in "${PENDING_PATHS[@]}"; do
+                case "$_pp" in
+                    "${SRC_DIR}"/*) _rel="${_pp#"${SRC_DIR}/"}" ;;
+                    *) continue ;;
+                esac
+                _dest_subdir=$(dirname "${DEST_DIR}/${_rel}")
+                mkdir -p "${_dest_subdir}"
 
-                rsync -avP --partial "${ctl}" "${dest_subdir}/"
-                MIGRATED_FILES+=("${ctl}")
+                rsync -avP --partial "${_pp}" "${_dest_subdir}/"
+                MIGRATED_FILES+=("${_pp}")
 
-                if [ -e "${data_target}" ]; then
-                    rsync -avP --partial "${data_target}" "${dest_subdir}/"
-                    MIGRATED_FILES+=("${data_target}")
-                fi
-
-                if [ -f "${data_target}.torrent" ]; then
-                    rsync -avP --partial "${data_target}.torrent" "${dest_subdir}/"
-                    MIGRATED_FILES+=("${data_target}.torrent")
+                if [ -f "${_pp}.torrent" ]; then
+                    rsync -avP --partial "${_pp}.torrent" "${_dest_subdir}/"
+                    MIGRATED_FILES+=("${_pp}.torrent")
                 fi
             done
 
@@ -1426,10 +2368,6 @@ migrate_downloads() {
                 rsync -avP --partial "${item}" "${dest_subdir}/"
                 MIGRATED_FILES+=("${item}")
 
-                if [ -f "${item}.aria2" ]; then
-                    rsync -avP --partial "${item}.aria2" "${dest_subdir}/"
-                    MIGRATED_FILES+=("${item}.aria2")
-                fi
                 if [ -f "${item}.torrent" ]; then
                     rsync -avP --partial "${item}.torrent" "${dest_subdir}/"
                     MIGRATED_FILES+=("${item}.torrent")
@@ -1440,11 +2378,11 @@ migrate_downloads() {
                 MATCH_FOUND=true
                 rsync -avP --partial "${ext_file}" "${DEST_DIR}/"
                 MIGRATED_FILES+=("${ext_file}")
-            done < <(find "${SRC_DIR}" -maxdepth 1 -name "*${FILE_KEYWORD}*.torrent" -o -name "*${FILE_KEYWORD}*.aria2")
+            done < <(find "${SRC_DIR}" -maxdepth 1 -name "*${FILE_KEYWORD}*.torrent")
 
             if [ "$MATCH_FOUND" = false ]; then
                 echo "未匹配到任何包含关键字 [${FILE_KEYWORD}] 的文件。"
-                ${SYSTEMCTL_CMD} start aria2.service
+                svc_start
                 return 0
             fi
             ;;
@@ -1465,14 +2403,14 @@ migrate_downloads() {
     fi
 
     echo ">> 正在启动 Aria2 服务恢复下载..."
-    ${SYSTEMCTL_CMD} start aria2.service
+    svc_start
 
     echo ""
     echo ">> 迁移完成！Aria2 已重新载入元数据并开始自检校验断点。"
     echo ""
 
     if [ "$MIGRATE_TYPE" == "1" ] || [ "$MIGRATE_TYPE" == "3" ]; then
-        read -rp "是否删除源磁盘上对应的旧数据 (含数据、.aria2 及种子) 以释放空间? [Y/n 默认: Y]: " CLEAN_OLD
+        read -rp "是否删除源磁盘上对应的旧数据 (含数据与关联种子) 以释放空间? [Y/n 默认: Y]: " CLEAN_OLD
         CLEAN_OLD="${CLEAN_OLD:-Y}"
     else
         read -rp "是否清空源下载目录的所有文件以释放空间? [y/N 默认: N]: " CLEAN_OLD
@@ -1488,7 +2426,7 @@ migrate_downloads() {
                 echo ">> 原磁盘目录内容已完全清空。"
             fi
         else
-            echo ">> 正在清理已迁移的原文件、校验文件及关联种子文件..."
+            echo ">> 正在清理已迁移的原文件及关联种子文件..."
             eval "UNIQUE_FILES=($(printf "%q\n" "${MIGRATED_FILES[@]}" | sort -u))"
             for f in "${UNIQUE_FILES[@]}"; do
                 if [ -e "$f" ]; then
@@ -1516,9 +2454,9 @@ archive_completed_files() {
 
     install_packages rsync findutils python3 curl
 
-    if ! ${SYSTEMCTL_CMD} is-active --quiet aria2.service 2>/dev/null; then
+    if ! svc_is_active; then
         echo ">> 检测到 Aria2 服务未运行，正在启动以调取任务状态..."
-        ${SYSTEMCTL_CMD} start aria2.service
+        svc_start
         sleep 1
     fi
 
@@ -2221,7 +3159,7 @@ PYEOF
         done
         find "${SRC_DIR}" -mindepth 1 -type d -empty -delete 2>/dev/null || true
 
-        # 数据已不在原盘上的 .aria2 控制标记属于失效碎片，一并清掉
+        # 旧版本安装遗留的 .aria2 控制文件 (aria2-next 不再生成)，数据已不在原盘的一并清掉
         while IFS= read -r ctl; do
             if [ ! -e "${ctl%.aria2}" ]; then
                 rm -f "$ctl"
@@ -2257,7 +3195,7 @@ _transfer_orphan_files() {
 
     echo ""
     echo "---- [游离文件] 源: ${SRC_DIR}  -->  目标: ${DEST_DIR} ----"
-    echo ">> 正在扫描源目录: 找出不被任何 Aria2 任务管理、且无 .aria2 控制文件的游离目标..."
+    echo ">> 正在扫描源目录: 找出不被任何 Aria2 任务管理的游离目标..."
 
     local scan_tmp scan_rc
     scan_tmp=$(mktemp -d)
@@ -2391,7 +3329,7 @@ def clean_metadata_name(raw_name):
     例如: [METADATA][javdb.com]SNOS-134-C.torrent -> SNOS-134-C
     """
     name = re.sub(r"^(\[[^\]]+\])+", "", raw_name).strip()
-    for ext in [".torrent.无码破解", ".torrent", ".aria2"]:
+    for ext in [".torrent.无码破解", ".torrent"]:
         if name.endswith(ext):
             name = name[:-len(ext)]
     return name
@@ -2466,26 +3404,22 @@ except OSError as exc:
     print(f"!! 无法读取源目录 {SRC_DIR}: {exc}", file=sys.stderr)
     sys.exit(1)
 
-# 磁盘上所有 .aria2 控制文件对应的基准名: 存在即代表任务未完成/仍被接管
-control_bases = {item[:-6].lower() for item in entries if item.endswith(".aria2")}
+# 磁盘上旧版遗留的 .aria2 控制文件: aria2-next 不再生成，这里仅作为兼容保留的保护规则
+legacy_controls = {item[:-6].lower() for item in entries if item.endswith(".aria2")}
 records = []
 skipped_managed = 0
 for item in entries:
     item_lower = item.lower()
-    # 规则 1: 忽略隐藏文件、.aria2 控制文件自身、.torrent 种子文件
+    # 规则 1: 忽略隐藏文件、种子文件与旧版遗留的 .aria2 控制文件
     if item.startswith(".") or item.endswith(".aria2") or item.endswith(".torrent"):
         continue
-    # 规则 2: 存在同名 .aria2 控制文件，说明任务正在等待/下载/未完成
-    if item_lower in control_bases:
+    # 规则 2: 命中 RPC 任务清单（含 [METADATA] 提取名）
+    if item_lower in managed_names or item_lower in legacy_controls:
         skipped_managed += 1
         continue
-    # 规则 3: 命中 RPC 任务清单（含 [METADATA] 提取名）
-    if item_lower in managed_names:
-        skipped_managed += 1
-        continue
-    # 规则 4: 去掉包装前缀后再比对一次 (如 [98t.tv]xxx)
+    # 规则 3: 去掉包装前缀后再比对一次 (如 [98t.tv]xxx)
     clean_item = re.sub(r"^(\[[^\]]+\])+", "", item).strip().lower()
-    if clean_item in managed_names or clean_item in control_bases:
+    if clean_item in managed_names or clean_item in legacy_controls:
         skipped_managed += 1
         continue
     full_path = os.path.join(SRC_DIR, item)
@@ -2493,10 +3427,11 @@ for item in entries:
 
 total_bytes = sum(size for _n, _d, size in records)
 lines = []
-lines.append(">> 游离判定依据: 不在任何 Aria2 任务清单内，且磁盘上没有同名 .aria2 控制文件。")
+lines.append(">> 游离判定依据: 不在任何 Aria2 任务清单内 (进行中 / 等待中 / 已停止)。")
 lines.append(f">> 源目录: {SRC_DIR}")
 lines.append(f">> RPC 任务总数: {task_count} 个 (解析出受管理名称 {len(managed_names)} 个)")
-lines.append(f">> 磁盘 .aria2 控制基准名: {len(control_bases)} 个")
+if legacy_controls:
+    lines.append(f">> 旧版遗留 .aria2 控制基准名: {len(legacy_controls)} 个 (已一并纳入保护)")
 lines.append(f">> 已按 Aria2 管理状态跳过: {skipped_managed} 项")
 if query_errors:
     lines.append(f"   !! 有 {query_errors} 项 RPC 查询失败，游离判定可能不准，请留意误判。")
@@ -2525,7 +3460,7 @@ PYEOF
     local orphans_file="${scan_tmp}/orphans.rec"
     if [ ! -s "${orphans_file}" ]; then
         echo ""
-        echo ">> 没有发现游离文件/目录: 目录内所有内容都已被 Aria2 任务管理或存在 .aria2 控制文件。"
+        echo ">> 没有发现游离文件/目录: 目录内所有内容都已被 Aria2 任务管理。"
         rm -rf "${scan_tmp}"
         return 0
     fi
@@ -2685,9 +3620,9 @@ scan_and_resume_torrents() {
     RPC_PORT="${RPC_PORT:-$DEFAULT_PORT}"
     RPC_SECRET=$(grep -E "^rpc-secret=" "${CONF_FILE}" | cut -d'=' -f2- | tr -d ' \r')
 
-    if ! ${SYSTEMCTL_CMD} is-active --quiet aria2.service 2>/dev/null; then
+    if ! svc_is_active; then
         echo ">> 检测到 Aria2 服务未运行，正在启动..."
-        ${SYSTEMCTL_CMD} start aria2.service
+        svc_start
         sleep 1
     fi
 
@@ -2791,7 +3726,8 @@ EOF
 
 # ==================== 模块 8-2: 一键继续下载异常停止的任务 ====================
 # 说明: aria2 的 aria2.unpause 仅适用于 paused 状态，对已停止(error/removed)的任务会直接拒绝，
-#       因此这里按原任务信息重新加入下载队列(复用 .aria2 断点，不会重新下载已完成的数据)。
+#       因此这里按原任务信息重新加入下载队列。aria2-next 无 .aria2 控制文件，断点数据存于
+#       state-dir，重加后 Aria2 会自动做完整性校验并续传已下载的分片。
 resume_stopped_tasks() {
     echo ""
     echo "---- [异常停止任务] 一键继续下载 ----"
@@ -3325,12 +4261,11 @@ manage_utils_menu() {
         echo "        Aria2 辅助运维与清理工具箱        "
         echo "=========================================="
         echo " 1. 清理已完成任务的 .torrent 种子文件 (保留正在下载的种子)"
-        echo " 2. 清理孤立的 .aria2 校验碎片 (源数据已删除的残留文件)"
-        echo " 3. 彻底清空 session 中已完成/已停止的历史任务 (减小体积)"
-        echo " 4. 一键服务与网络健康诊断 (检查端口、进程、防火墙与定时器)"
+        echo " 2. 刷新会话/清理历史记录 (停启服务并重置 session)"
+        echo " 3. 一键服务与网络健康诊断 (检查端口、进程、防火墙与定时器)"
         echo " 0. 返回上级菜单"
         echo "=========================================="
-        read -rp "请选择操作 [0-4 默认: 0]: " UTIL_CHOICE
+        read -rp "请选择操作 [0-3 默认: 0]: " UTIL_CHOICE
         UTIL_CHOICE="${UTIL_CHOICE:-0}"
 
         case "$UTIL_CHOICE" in
@@ -3345,6 +4280,17 @@ manage_utils_menu() {
                     continue
                 fi
 
+                echo ">> 正在通过 Aria2 RPC 获取进行中/等待中的任务清单..."
+                declare -A ACTIVE_NAMES=()
+                local _n=""
+                while IFS= read -r _n; do
+                    [ -n "$_n" ] && ACTIVE_NAMES["$_n"]=1
+                done < <(rpc_active_managed_names 2>/dev/null || true)
+                if [ ${#ACTIVE_NAMES[@]} -eq 0 ]; then
+                    echo "   提示: 未获取到活动任务清单(服务未运行或 RPC 不可用)，为安全起见本次不执行删除。"
+                    continue
+                fi
+
                 echo ">> 正在扫描并分析 ${SCAN_DIR} 下的种子文件状态..."
                 mapfile -t ALL_TORRENTS < <(find "${SCAN_DIR}" -type f -name "*.torrent")
 
@@ -3354,10 +4300,20 @@ manage_utils_menu() {
                 fi
 
                 declare -a SAFE_TO_DELETE=()
-
+                local _tname=""
                 for tor in "${ALL_TORRENTS[@]}"; do
                     base_name="${tor%.torrent}"
-                    
+                    _tname=$(printf '%s' "$(basename "$base_name")" | tr '[:upper:]' '[:lower:]')
+                    # 保护策略(aria2-next 无 .aria2 控制文件，以 RPC 清单为准):
+                    #   1) 名称命中进行中/等待中任务
+                    #   2) aria2 自己保存的 <sha1>.torrent 元数据
+                    #   3) 旧版安装遗留的 .aria2 控制文件
+                    if [ -n "${ACTIVE_NAMES[$_tname]}" ]; then
+                        continue
+                    fi
+                    if [[ "$_tname" =~ ^[0-9a-f]{40}$ ]]; then
+                        continue
+                    fi
                     if [ -f "${base_name}.aria2" ] || [ -f "${tor}.aria2" ]; then
                         continue
                     fi
@@ -3389,61 +4345,21 @@ manage_utils_menu() {
                 ;;
 
             2)
-                DEFAULT_CLEAN_DIR=$(get_current_download_dir)
-                read -rp "请输入要检查的下载目录路径 [默认: ${DEFAULT_CLEAN_DIR}]: " SCAN_DIR
-                SCAN_DIR="${SCAN_DIR:-$DEFAULT_CLEAN_DIR}"
-                SCAN_DIR="${SCAN_DIR%/}"
-
-                if [ ! -d "${SCAN_DIR}" ]; then
-                    echo "错误: 目录 ${SCAN_DIR} 不存在！"
-                    continue
-                fi
-
-                echo ">> 正在排查孤立的 .aria2 碎片文件 (对应数据已被手工删除)..."
-                mapfile -t ARIA2_FILES < <(find "${SCAN_DIR}" -type f -name "*.aria2")
-                declare -a ORPHAN_ARIA2=()
-
-                for ctl in "${ARIA2_FILES[@]}"; do
-                    data_file="${ctl%.aria2}"
-                    if [ ! -e "${data_file}" ]; then
-                        ORPHAN_ARIA2+=("${ctl}")
-                    fi
-                done
-
-                if [ ${#ORPHAN_ARIA2[@]} -eq 0 ]; then
-                    echo ">> 未发现孤立的 .aria2 校验文件，环境干净。"
-                else
-                    echo ">> 发现以下 ${#ORPHAN_ARIA2[@]} 个孤立碎片:"
-                    for f in "${ORPHAN_ARIA2[@]}"; do
-                        echo "   - $(basename "$f")"
-                    done
-                    read -rp "确认删除这些无效的 .aria2 碎片? [Y/n 默认: Y]: " CONFIRM_CLEAN_CTL
-                    CONFIRM_CLEAN_CTL="${CONFIRM_CLEAN_CTL:-Y}"
-                    if [[ "$CONFIRM_CLEAN_CTL" =~ ^[Yy]$ ]]; then
-                        for f in "${ORPHAN_ARIA2[@]}"; do
-                            rm -f "$f"
-                        done
-                        echo ">> 碎片清理完毕！"
-                    fi
-                fi
-                ;;
-
-            3)
                 echo ">> 正在安全压缩与清理 aria2.session 会话..."
                 stop_aria2_safely
                 if [ -f "${SESSION_FILE}" ]; then
                     cp "${SESSION_FILE}" "${SESSION_FILE}.bak"
                     echo ">> 已备份原会话为: ${SESSION_FILE}.bak"
                 fi
-                ${SYSTEMCTL_CMD} start aria2.service
+                svc_start
                 echo ">> Aria2 服务已重启，会话记录已刷新。"
                 ;;
 
-            4)
+            3)
                 echo ""
                 echo "=== Aria2 服务与网络健康诊断 ==="
-                echo -n "1. Aria2 核心服务状态: "
-                if ${SYSTEMCTL_CMD} is-active --quiet aria2.service 2>/dev/null; then
+                echo "1. Aria2 核心服务状态: "
+                if svc_is_active; then
                     echo -e "\033[32m[运行中]\033[0m"
                 else
                     echo -e "\033[31m[未运行]\033[0m"
@@ -3530,33 +4446,41 @@ manage_logs_menu() {
                 ;;
             2)
                 echo ""
-                echo ">> 正在调取 Systemd 服务最近日志:"
-                ${SYSTEMCTL_CMD} status aria2.service --no-pager -l || true
-                echo ""
-                echo ">> 正在输出 journalctl 最近 40 行错误信息:"
-                if [ "$IS_ROOT" = true ]; then
-                    journalctl -u aria2.service -n 40 --no-pager
+                echo ">> 正在调取 Aria2 服务最近日志 ($(is_docker_mode && echo "容器 ${ARIA2_DOCKER_NAME}" || echo "systemd")):"
+                if is_docker_mode; then
+                    svc_logs || true
                 else
-                    journalctl --user -u aria2.service -n 40 --no-pager
+                    ${SYSTEMCTL_CMD} status aria2.service --no-pager -l || true
+                    echo ""
+                    echo ">> 正在输出 journalctl 最近 40 行错误信息:"
+                    svc_logs || true
                 fi
                 ;;
             3)
                 echo ""
-                echo ">> 正在临时停止后台服务准备前台测试..."
-                ${SYSTEMCTL_CMD} stop aria2.service 2>/dev/null || true
-                sleep 0.5
-                echo ">> 开始前台执行: ${ARIA2C_BIN} --conf-path=${CONF_FILE}"
-                echo ">> 提示: 按 Ctrl+C 即可终止前台运行并自动恢复后台守护进程。"
-                echo "---------------------------------------------------------"
-                if [ -x "${ARIA2C_BIN}" ]; then
-                    "${ARIA2C_BIN}" --conf-path="${CONF_FILE}" || true
+                if is_docker_mode; then
+                    echo ">> Docker 模式下无法前台运行 (容器已由 Docker 托管)。"
+                    echo "   如需前台调试，请使用:"
+                    echo "     docker run --rm -it --network host -e PUID=\$(id -u) -e PGID=\$(id -g) \\"
+                    echo "       -v ${ARIA2_CONF_DIR}:${ARIA2_CONF_DIR} -v $(get_current_download_dir):$(get_current_download_dir) \\"
+                    echo "       ${ARIA2_DOCKER_IMAGE}:${ARIA2_DOCKER_TAG} --conf-path=${CONF_FILE}"
                 else
-                    echo "错误: 未找到可执行文件 ${ARIA2C_BIN}"
+                    echo ">> 正在临时停止后台服务准备前台测试..."
+                    ${SYSTEMCTL_CMD} stop aria2.service 2>/dev/null || true
+                    sleep 0.5
+                    echo ">> 开始前台执行: ${ARIA2C_BIN} --conf-path=${CONF_FILE}"
+                    echo ">> 提示: 按 Ctrl+C 即可终止前台运行并自动恢复后台守护进程。"
+                    echo "---------------------------------------------------------"
+                    if [ -x "${ARIA2C_BIN}" ]; then
+                        "${ARIA2C_BIN}" --conf-path="${CONF_FILE}" || true
+                    else
+                        echo "错误: 未找到可执行文件 ${ARIA2C_BIN}"
+                    fi
+                    echo "---------------------------------------------------------"
+                    echo ">> 正在恢复后台 Aria2 服务..."
+                    ${SYSTEMCTL_CMD} start aria2.service
+                    echo ">> 后台服务已恢复。"
                 fi
-                echo "---------------------------------------------------------"
-                echo ">> 正在恢复后台 Aria2 服务..."
-                ${SYSTEMCTL_CMD} start aria2.service
-                echo ">> 后台服务已恢复。"
                 ;;
             4)
                 echo ""
@@ -3769,14 +4693,8 @@ manage_video_filter() {
 
             local NEED_RESTART_ARIA2=false
 
-            if ! grep -q "^bt-remove-unselected-file=" "${CONF_FILE}"; then
-                echo "bt-remove-unselected-file=true" >> "${CONF_FILE}"
-                NEED_RESTART_ARIA2=true
-            elif grep -q "^bt-remove-unselected-file=false" "${CONF_FILE}"; then
-                sed -i "s|^bt-remove-unselected-file=.*|bt-remove-unselected-file=true|g" "${CONF_FILE}"
-                NEED_RESTART_ARIA2=true
-            fi
-
+            # 注: 旧版的 bt-remove-unselected-file 已被 aria2-next 移除，
+            #     未勾选文件由 RPC select-file 控制，不再下载到磁盘。
             if ! grep -q "^max-overall-upload-limit=" "${CONF_FILE}"; then
                 echo "max-overall-upload-limit=2M" >> "${CONF_FILE}"
                 echo "max-upload-limit=2M" >> "${CONF_FILE}"
@@ -3784,17 +4702,25 @@ manage_video_filter() {
             fi
 
             if [ "$NEED_RESTART_ARIA2" = true ]; then
-                ${SYSTEMCTL_CMD} restart aria2.service
+                svc_restart
             fi
 
             ensure_filter_script "${INPUT_MIN_MB}" "${TARGET_EXTS}"
             [ "$IS_ROOT" = false ] && mkdir -p "${SYSTEMD_DIR}"
 
+            # Docker 模式下不存在 aria2.service 单元，用 Wants/After docker 代替 Requires，
+            # 避免筛选守护因缺少依赖单元而无法启动 (筛选器通过本地 RPC 与容器通信)
+            local FILTER_DEP_LINES="After=network.target aria2.service
+Requires=aria2.service"
+            if is_docker_mode; then
+                FILTER_DEP_LINES="After=network.target docker.service
+Wants=docker.service"
+            fi
+
             cat > "${SYSTEMD_DIR}/aria2-filter.service" <<EOF
 [Unit]
 Description=Aria2 BT Automatic Filter Daemon
-After=network.target aria2.service
-Requires=aria2.service
+${FILTER_DEP_LINES}
 
 [Service]
 Type=simple
@@ -3818,7 +4744,7 @@ EOF
             else
                 echo "   格式过滤: 仅限 [${TARGET_EXTS}]"
             fi
-            echo "   未选文件: 自动清理 (bt-remove-unselected-file=true)"
+            echo "   未选文件: 通过 RPC select-file 勾选，未勾选文件不会下载 (aria2-next 原生)"
             echo "   上传限速: 全局最大 2MB/s (max-overall-upload-limit=2M)"
             ;;
         2)
@@ -3875,34 +4801,59 @@ clean_small_files_menu() {
 
     echo ""
     echo ">> 正在扫描目录: ${TARGET_DIR}"
-    echo ">> 过滤条件: 体积小于 ${SIZE_MB}MB (自动保护 .aria2 / .torrent 及正在下载中的任务)..."
+    echo ">> 过滤条件: 体积严格小于 ${SIZE_MB}MB (即 $((SIZE_MB * 1024 * 1024)) 字节, 自动保护 .torrent 种子及正在下载中的任务)..."
 
     declare -A ACTIVE_TASKS
-    while IFS= read -r ctl; do
-        ACTIVE_TASKS["$ctl"]=1
-        ACTIVE_TASKS["${ctl%.aria2}"]=1
-    done < <(find "${TARGET_DIR}" -type f -name "*.aria2" 2>/dev/null)
+    local _act="" _real=""
+    # aria2-next 不再生成 .aria2 控制文件，改用 RPC 任务清单的绝对路径保护未完成数据
+    while IFS= read -r _act; do
+        [ -n "$_act" ] && ACTIVE_TASKS["$_act"]=1
+    done < <(rpc_active_file_paths 2>/dev/null || true)
+    if [ ${#ACTIVE_TASKS[@]} -eq 0 ]; then
+        echo "   提示: 未获取到 Aria2 活动任务清单 (服务未运行 / RPC 不可达，或当前确实没有正在下载的任务)。"
+        read -rp "   继续扫描可能误删正在下载的数据，是否继续? [y/N 默认: N]: " CONTINUE_NO_GUARD
+        if [[ ! "${CONTINUE_NO_GUARD:-N}" =~ ^[Yy]$ ]]; then
+            echo ">> 已中止，未删除任何文件。"
+            return 0
+        fi
+    fi
 
     declare -a FILES_TO_DELETE=()
     local TOTAL_BYTES=0
+    # find 的 -size 是“向上取整”的单位语义 (例如 -size -50M 实际会漏掉 49.0~49.99MB 的文件)，
+    # 无法精确表达“小于 N 字节”。这里先用 -(SIZE_MB+1)M 粗筛 (结果是精确判定的超集)，
+    # 再按 stat 得到的真实字节数逐文件精确比较。
+    local SIZE_BYTES=$((SIZE_MB * 1024 * 1024))
+    local COARSE_MB=$((SIZE_MB + 1))
 
     while IFS= read -r file; do
-        # .aria2 校验块、.torrent 种子及活跃任务一律跳过:
+        # .torrent 种子与旧版遗留的 .aria2 控制文件一律跳过:
         # 种子元数据统一由主菜单 [9 -> 1] 的专用清理功能处理，避免误删有效种子
-        if [[ -n "${ACTIVE_TASKS[$file]}" ]] || [[ "$file" == *.aria2 ]] || [[ "$file" == *.torrent ]]; then
+        if [[ "$file" == *.aria2 ]] || [[ "$file" == *.torrent ]]; then
+            continue
+        fi
+        # 正在下载 (进行中 / 等待中) 任务的数据文件不删除
+        _real=$(realpath "$file" 2>/dev/null || printf '%s' "$file")
+        if [ -n "${ACTIVE_TASKS[$_real]}" ] || [ -n "${ACTIVE_TASKS[$file]}" ]; then
+            continue
+        fi
+
+        local f_size
+        f_size=$(stat -c %s "$file" 2>/dev/null || stat -f %z "$file" 2>/dev/null || echo 0)
+        [[ "$f_size" =~ ^[0-9]+$ ]] || f_size=0
+        # 精确判定: 只保留严格小于阈值的文件
+        if [ "$f_size" -ge "$SIZE_BYTES" ]; then
             continue
         fi
 
         FILES_TO_DELETE+=("$file")
-        local f_size
-        f_size=$(stat -c %s "$file" 2>/dev/null || stat -f %z "$file" 2>/dev/null || echo 0)
         TOTAL_BYTES=$((TOTAL_BYTES + f_size))
-    done < <(find "${TARGET_DIR}" -type f -size -"${SIZE_MB}"M 2>/dev/null)
+    done < <(find "${TARGET_DIR}" -type f -size -"${COARSE_MB}"M 2>/dev/null)
 
     local FILE_COUNT=${#FILES_TO_DELETE[@]}
     if [ "$FILE_COUNT" -eq 0 ]; then
         echo ""
-        echo ">> 扫描完成: 未找到任何小于 ${SIZE_MB}MB 的文件。"
+        echo ">> 扫描完成: 未找到任何严格小于 ${SIZE_MB}MB (${SIZE_BYTES} 字节) 的文件。"
         return 0
     fi
 
@@ -3944,7 +4895,7 @@ clean_small_files_menu() {
     fi
 
     echo ""
-    read -rp "确认彻底删除以上 ${FILE_COUNT} 个小于 ${SIZE_MB}MB 的文件以释放空间? [y/N 默认: N]: " CONFIRM_DEL
+    read -rp "确认彻底删除以上 ${FILE_COUNT} 个严格小于 ${SIZE_MB}MB (${SIZE_BYTES} 字节) 的文件以释放空间? [y/N 默认: N]: " CONFIRM_DEL
     CONFIRM_DEL="${CONFIRM_DEL:-N}"
 
     if [[ ! "$CONFIRM_DEL" =~ ^[Yy]$ ]]; then
@@ -3966,7 +4917,7 @@ clean_small_files_menu() {
 
     echo ""
     echo ">> [成功] 已清理 ${FILE_COUNT} 个小文件，释放空间约 ${TOTAL_HUMAN} MB！"
-    echo "   提示: .torrent 种子文件已自动跳过，如需清理请使用主菜单 [9 -> 1]。"
+    echo "   提示: .torrent 种子文件与正在下载中的任务数据已自动跳过，如需清理种子请使用主菜单 [9 -> 1]。"
 }
 
 # ==================== 模块 13: 完整卸载 (全部组件) ====================
@@ -3983,7 +4934,7 @@ uninstall_all() {
     fi
 
     echo ">> 正在停止并禁用 Aria2、定时器、筛选守护 与 Caddy 服务..."
-    ${SYSTEMCTL_CMD} stop aria2.service 2>/dev/null || true
+    svc_stop
     ${SYSTEMCTL_CMD} stop aria2-update-tracker.timer 2>/dev/null || true
     ${SYSTEMCTL_CMD} stop aria2-update-tracker.service 2>/dev/null || true
     ${SYSTEMCTL_CMD} stop aria2-filter.service 2>/dev/null || true
@@ -4024,11 +4975,39 @@ uninstall_all() {
     rm -f "${ARIA2C_BIN}"
     ${SUDO_CMD} rm -f /usr/bin/aria2c /usr/local/bin/aria2c 2>/dev/null || true
 
+    if is_docker_mode; then
+        if docker_ensure; then
+            echo ">> 正在删除 Docker 容器 ${ARIA2_DOCKER_NAME}..."
+            $DOCKER_CMD rm -f "${ARIA2_DOCKER_NAME}" >/dev/null 2>&1 || true
+            read -rp "是否同时删除镜像 ${ARIA2_DOCKER_IMAGE}:${ARIA2_DOCKER_TAG}? [y/N 默认: N]: " DEL_IMAGE
+            DEL_IMAGE="${DEL_IMAGE:-N}"
+            if [[ "$DEL_IMAGE" =~ ^[Yy]$ ]]; then
+                $DOCKER_CMD rmi "${ARIA2_DOCKER_IMAGE}:${ARIA2_DOCKER_TAG}" >/dev/null 2>&1 || true
+                echo "   镜像已删除。"
+            fi
+        else
+            echo ">> 提示: Docker 不可用，请自行清理容器: docker rm -f ${ARIA2_DOCKER_NAME}"
+        fi
+        rm -f "${ARIA2_MODE_FILE}" 2>/dev/null || true
+    fi
+
+    local CUR_STATE_DIR
+    CUR_STATE_DIR=$(get_conf_value "state-dir" "${STATE_DIR}")
     read -rp "是否删除配置及脚本目录 (${ARIA2_CONF_DIR})? [y/N 默认: N]: " DEL_CONFIG
     DEL_CONFIG="${DEL_CONFIG:-N}"
     if [[ "$DEL_CONFIG" =~ ^[Yy]$ ]]; then
         rm -rf "${ARIA2_CONF_DIR}"
         echo "已清理配置目录: ${ARIA2_CONF_DIR}"
+    fi
+
+    # aria2-next 的断点/恢复数据目录可能被自定义到其他路径，需单独确认
+    if [ -n "${CUR_STATE_DIR}" ] && [ -d "${CUR_STATE_DIR}" ] && [ "${CUR_STATE_DIR}" != "${ARIA2_CONF_DIR}" ]; then
+        read -rp "是否同时删除断点/恢复状态目录 (${CUR_STATE_DIR})? [y/N 默认: N]: " DEL_STATE
+        DEL_STATE="${DEL_STATE:-N}"
+        if [[ "$DEL_STATE" =~ ^[Yy]$ ]]; then
+            rm -rf "${CUR_STATE_DIR}"
+            echo "已清理断点状态目录: ${CUR_STATE_DIR}"
+        fi
     fi
 
     read -rp "是否清理下载目录? (强烈建议保留) [y/N 默认: N]: " DEL_DOWNLOADS
@@ -4048,6 +5027,9 @@ uninstall_all() {
 }
 
 # ==================== 主入口循环菜单 ====================
+# 载入持久化的运行方式(systemd / docker)，供状态展示与服务控制使用
+load_run_mode
+
 while true; do
     echo ""
     echo "=========================================="
@@ -4065,15 +5047,21 @@ while true; do
         echo " 下载限速: $([ "$DOWN_LIMIT" == "0" ] && echo "不限制" || echo "$DOWN_LIMIT")    上传限速: $([ "$UP_LIMIT" == "0" ] && echo "不限制" || echo "$UP_LIMIT")"
     fi
     echo "------------------------------------------"
-    echo " 1. $([ -f "${ARIA2C_BIN}" ] && echo "重新配置 Aria2 后端 (自动带入当前设置)" || echo "安装 / 配置 Aria2 后端 (默认启用 Trackers 自动更新)")"
-    echo " 2. Aria2 常用核心设置 (下载目录 / 并发数 / 做种 / 上下载限速 / 占位清理)"
+    MENU_ITEM1=""
+    if [ -f "${ARIA2C_BIN}" ] || (is_docker_mode && docker_container_exists); then
+        MENU_ITEM1="重新配置 Aria2 后端 (自动带入当前设置)"
+    else
+        MENU_ITEM1="安装 / 配置 Aria2 后端 (本机预编译 / 源码编译 / Docker 容器)"
+    fi
+    echo " 1. ${MENU_ITEM1}"
+    echo " 2. Aria2 常用核心设置 (下载目录 / 并发数 / 做种 / 上下载限速 / 断点状态目录 / BT 端口)"
     echo " 3. 手动更新 / 设置 BT Trackers (双源拉取 best/all / 自定义)"
     echo " 4. 启用 / 停用 Trackers 自动更新 (默认每周，可设周期)"
     echo " 5. BT 吸血 Peer 防火墙拦截管理 (ipset+iptables / 默认开启 / 每日更新)"
     echo " 6. 迁移下载任务到新磁盘 (迁移 未完成 / 全部 任务并切换工作路径)"
     echo " 7. 转移已完成下载到新磁盘 (含做种与已暂停任务 / 可清理游离文件)"
     echo " 8. 恢复 / 重试未完成的下载 (扫描种子断点续传 / 一键重试异常停止)"
-    echo " 9. Aria2 实用辅助与清理工具箱 (清理已完成种子 / 碎片清理 / 健康自检)"
+    echo " 9. Aria2 实用辅助与清理工具箱 (清理已完成种子 / 会话刷新 / 健康自检)"
     echo " 10. Aria2 日志排查与故障分析 (实时日志 / 崩溃溯源 / 前台单测)"
     echo " 11. 单独安装 / 更新 AriaNg 前端 (Caddy 反代模式)"
     echo " 12. 单独卸载 AriaNg 前端"
