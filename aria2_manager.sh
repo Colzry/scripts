@@ -199,6 +199,141 @@ docker_apply_container() {
     return 0
 }
 
+# ==================== 分页预览 + 处理前确认 ====================
+# 用法: confirm_paged_list <条目数组名> <标题> [每页条数] [显示数组名]
+#   - 条目数组: 实际要处理的内容(调用方后续使用)
+#   - 显示数组: 可省略；省略时直接显示条目本身 (需与条目数组下标一一对应)
+# 返回 0 = 用户确认处理；1 = 用户取消 / 输入结束
+confirm_paged_list() {
+    local items_name="$1"
+    local title="$2"
+    local page_size="${3:-15}"
+    local display_name="$4"
+    local mode="${5:-}"
+
+    local -n _cpl_items="$items_name"
+    local -n _cpl_disp="${display_name:-$items_name}"
+
+    local total="${#_cpl_items[@]}"
+    if [ "$total" -eq 0 ]; then
+        return 1
+    fi
+
+    local idx=0 line=0 action="" reply=""
+    local page_total=$(( (total + page_size - 1) / page_size ))
+    local page_no=0 end=0
+
+    if [ "$total" -le "$page_size" ]; then
+        echo ""
+        echo "===== ${title} (共 ${total} 项) ====="
+        for ((line=0; line<total; line++)); do
+            printf ' [%d] %s\n' "$((line + 1))" "${_cpl_disp[$line]}"
+        done
+        echo "--------------------------------------------------"
+        if [ "$mode" = "view" ]; then
+            read -rp "已浏览全部 ${total} 项，按 [Enter] 继续..." _cpl_pause || true
+            return 0
+        fi
+        read -rp "确认处理以上 ${total} 项? [Y/n 默认: Y]: " reply || true
+        if [[ "${reply:-Y}" =~ ^[Yy]$ ]]; then
+            return 0
+        fi
+        return 1
+    fi
+
+    # 清单较长: 由用户决定是否翻页预览
+    read -rp ">> 共 ${total} 项，清单较长；是否翻页查看? [Y/n 默认: Y]: " reply || true
+    if [[ "${reply:-Y}" =~ ^[Yy]$ ]]; then
+        while [ "$idx" -lt "$total" ]; do
+            clear 2>/dev/null || true
+            page_no=$(( idx / page_size + 1 ))
+            echo "===== ${title} (第 ${page_no}/${page_total} 页，共 ${total} 项) ====="
+            end=$((idx + page_size))
+            [ "$end" -gt "$total" ] && end="$total"
+            for ((line=idx; line<end; line++)); do
+                printf ' [%d] %s\n' "$((line + 1))" "${_cpl_disp[$line]}"
+            done
+            echo "--------------------------------------------------"
+            idx="$end"
+            if [ "$idx" -lt "$total" ]; then
+                read -rp "按 [Enter] 下一页，输入 [q] 退出预览，输入 [g] 直接进入确认: " action || break
+                case "$action" in
+                    [Qq]) break ;;
+                    [Gg]) break ;;
+                esac
+            fi
+        done
+    else
+        echo ">> 已跳过预览。"
+    fi
+
+    if [ "$mode" = "view" ]; then
+        return 0
+    fi
+
+    echo ""
+    read -rp "确认处理以上 ${total} 项? [Y/n 默认: Y]: " reply || true
+    if [[ "${reply:-Y}" =~ ^[Yy]$ ]]; then
+        return 0
+    fi
+    echo ">> 已取消。"
+    return 1
+}
+
+# ==================== 分页预览任意文本输出 (日志/规则等) ====================
+# 用法: preview_file_paged <标题> <文件> [每页行数]
+#   - 内容不超一页时直接输出；否则分页，按 [Enter] 继续 / [q] 退出
+#   - 输入流结束(Ctrl-D)不会死循环
+preview_file_paged() {
+    local title="$1"
+    local file="$2"
+    local page_size="${3:-20}"
+
+    if [ ! -s "$file" ]; then
+        echo "===== ${title} ====="
+        echo "（无内容）"
+        return 0
+    fi
+
+    local -a _pv_lines=()
+    mapfile -t _pv_lines < "$file" 2>/dev/null || _pv_lines=()
+    local total="${#_pv_lines[@]}"
+    if [ "$total" -eq 0 ]; then
+        echo "===== ${title} ====="
+        echo "（无内容）"
+        return 0
+    fi
+
+    if [ "$total" -le "$page_size" ]; then
+        echo "===== ${title} (共 ${total} 行) ====="
+        printf '%s\n' "${_pv_lines[@]}"
+        echo "--------------------------------------------------"
+        return 0
+    fi
+
+    local idx=0 end=0 i=0 page_no=0 action=""
+    local page_total=$(( (total + page_size - 1) / page_size ))
+    while [ "$idx" -lt "$total" ]; do
+        clear 2>/dev/null || true
+        page_no=$(( idx / page_size + 1 ))
+        echo "===== ${title} (第 ${page_no}/${page_total} 页，共 ${total} 行) ====="
+        end=$((idx + page_size))
+        [ "$end" -gt "$total" ] && end="$total"
+        for ((i=idx; i<end; i++)); do
+            printf '%s\n' "${_pv_lines[$i]}"
+        done
+        echo "--------------------------------------------------"
+        idx="$end"
+        if [ "$idx" -lt "$total" ]; then
+            read -rp "按 [Enter] 下一页，输入 [q] 退出预览: " action || break
+            case "$action" in
+                [Qq]) break ;;
+            esac
+        fi
+    done
+    return 0
+}
+
 # ==================== 服务控制抽象 (systemd / docker 通用) ====================
 svc_is_active() {
     if is_docker_mode; then
@@ -248,18 +383,41 @@ svc_logs() {
 }
 
 # ==================== 基础依赖检测 (仅缺失时安装，不刷源) ====================
+# 包是否真的装好: 注意 dpkg -s 在“已卸载但残留配置”时依然返回 0，不能用它判断
+dpkg_installed() {
+    local pkg="$1"
+    command -v dpkg-query >/dev/null 2>&1 || return 1
+    [ "$(dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null)" = "install ok installed" ]
+}
+
+rpm_installed() {
+    command -v rpm >/dev/null 2>&1 || return 1
+    rpm -q "$1" >/dev/null 2>&1
+}
+
+pkg_installed() {
+    local pkg="$1"
+    if command -v dpkg-query >/dev/null 2>&1; then
+        dpkg_installed "$pkg"
+    elif command -v rpm >/dev/null 2>&1 && { command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1 || command -v zypper >/dev/null 2>&1; }; then
+        rpm_installed "$pkg"
+    elif command -v pacman >/dev/null 2>&1; then
+        pacman -Q "$pkg" >/dev/null 2>&1
+    elif command -v apk >/dev/null 2>&1; then
+        apk info -e "$pkg" >/dev/null 2>&1
+    else
+        # 无包管理器信息时回退为命令探测
+        command -v "$pkg" >/dev/null 2>&1
+    fi
+}
+
 install_packages() {
     local pkgs=("$@")
     local missing_pkgs=()
+    local pkg=""
 
     for pkg in "${pkgs[@]}"; do
-        if command -v apt-get &>/dev/null; then
-            if ! dpkg -s "$pkg" &>/dev/null; then
-                missing_pkgs+=("$pkg")
-            fi
-        elif ! command -v "$pkg" &>/dev/null; then
-            missing_pkgs+=("$pkg")
-        fi
+        pkg_installed "$pkg" || missing_pkgs+=("$pkg")
     done
 
     if [ ${#missing_pkgs[@]} -eq 0 ]; then
@@ -267,7 +425,7 @@ install_packages() {
     fi
 
     echo ">> 发现缺少依赖，正在安装: ${missing_pkgs[*]}..."
-    if command -v apt-get &>/dev/null; then
+    if command -v apt-get >/dev/null 2>&1; then
         # 仅在确实缺包时才刷新一次软件源索引 (安静模式)，日常进入菜单不会触发，避免刷屏
         echo ">> 正在刷新软件源索引 (apt-get update -qq)..."
         ${SUDO_CMD} apt-get update -qq 2>/dev/null || true
@@ -275,11 +433,134 @@ install_packages() {
             echo ">> !! 依赖安装失败: ${missing_pkgs[*]}，请检查网络或软件源后重试。"
             return 1
         fi
-    elif command -v pacman &>/dev/null; then
-        ${SUDO_CMD} pacman -Sy --noconfirm "${missing_pkgs[@]}"
-    elif command -v dnf &>/dev/null; then
-        ${SUDO_CMD} dnf install -y "${missing_pkgs[@]}"
+    elif command -v pacman >/dev/null 2>&1; then
+        ${SUDO_CMD} pacman -Sy --noconfirm "${missing_pkgs[@]}" || return 1
+    elif command -v dnf >/dev/null 2>&1; then
+        ${SUDO_CMD} dnf install -y "${missing_pkgs[@]}" || return 1
+    elif command -v yum >/dev/null 2>&1; then
+        ${SUDO_CMD} yum install -y "${missing_pkgs[@]}" || return 1
+    elif command -v zypper >/dev/null 2>&1; then
+        ${SUDO_CMD} zypper --non-interactive install "${missing_pkgs[@]}" || return 1
+    elif command -v apk >/dev/null 2>&1; then
+        ${SUDO_CMD} apk add "${missing_pkgs[@]}" || return 1
+    else
+        echo ">> !! 未识别到可用的包管理器，无法自动安装: ${missing_pkgs[*]}"
+        echo "   请手动安装后重试。"
+        return 1
     fi
+    return 0
+}
+
+# 校验必需命令是否可用(安装后调用)；缺失时给出可操作的提示并返回 1
+check_cmds() {
+    local missing=() c=""
+    for c in "$@"; do
+        command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo ">> !! 缺少必需命令: ${missing[*]}"
+        echo "   请先安装后重试，例如: sudo apt install ${missing[*]} / sudo dnf install ${missing[*]}"
+        return 1
+    fi
+    return 0
+}
+
+# 是否允许在 rsync 不可用时用 cp 兜底(默认不允许: 优先安装 rsync)
+USE_CP_FALLBACK=0
+
+# 确保 rsync 可用: 不存在则尝试安装；装不上时给出可操作的手动安装命令，
+# 默认中止操作(只有用户明确同意才启用 cp 兜底)
+ensure_rsync() {
+    if command -v rsync >/dev/null 2>&1; then
+        return 0
+    fi
+
+    echo ">> 未检测到 rsync，正在尝试自动安装..."
+    install_packages rsync || true
+    if command -v rsync >/dev/null 2>&1; then
+        echo ">> rsync 已就绪: $(command -v rsync)"
+        return 0
+    fi
+
+    echo ""
+    echo ">> !! 未能自动安装 rsync (安装失败或软件源不可用)。"
+    echo "   请手动安装后重试:"
+    echo "     Debian/Ubuntu  : sudo apt install -y rsync"
+    echo "     RHEL/Rocky/Alma: sudo dnf install -y rsync"
+    echo "     Arch/Manjaro   : sudo pacman -S --noconfirm rsync"
+    local _use_cp=""
+    read -rp "   是否改用 cp -a 复制继续 (无断点续传/无进度，大文件中断后需重跑本功能)? [y/N 默认: N]: " _use_cp || true
+    if [[ "${_use_cp:-N}" =~ ^[Yy]$ ]]; then
+        USE_CP_FALLBACK=1
+        echo ">> 已选择 cp -a 兜底复制。"
+        return 0
+    fi
+    echo ">> 已取消操作：请先安装 rsync 后重试。"
+    return 1
+}
+
+# 复制单个文件/目录，保持 <src>/./<rel> 的相对层级
+#   用法: copy_path "<绝对路径>[/./<相对路径>]" "<目标目录>"
+#   优先使用 rsync --partial(断点续传)；系统无 rsync 时自动退化为 cp -a，
+#   调用方仍会做“目标存在 + 字节数一致”校验，因此退化方案不会导致误删
+copy_path() {
+    local spec="$1"
+    local dest="${2%/}/"
+    [ -n "$spec" ] && [ -n "$2" ] || return 1
+
+    if command -v rsync >/dev/null 2>&1; then
+        case "$spec" in
+            *"/./"*) rsync -avP --partial -R "$spec" "$dest" ;;
+            *)        rsync -avP --partial "$spec" "$dest" ;;
+        esac
+        return $?
+    fi
+
+    if [ "${USE_CP_FALLBACK:-0}" != "1" ]; then
+        echo "   !! 未安装 rsync 且未启用 cp 兜底，无法复制: ${spec}" >&2
+        return 1
+    fi
+    if [ "${COPY_PATH_NOTIFIED:-0}" != "1" ]; then
+        echo "   (提示: 使用 cp -a 复制；大文件中断后需重跑本功能)"
+        COPY_PATH_NOTIFIED=1
+    fi
+
+    local src_leaf="" target_parent="" rel=""
+    case "$spec" in
+        *"/./"*)
+            local base="${spec%%/./*}"
+            rel="${spec#*/./}"
+            src_leaf="${base%/}/${rel}"
+            ;;
+        *)
+            rel="$(basename "$spec")"
+            src_leaf="$spec"
+            ;;
+    esac
+    [ -n "$rel" ] && [ -n "$src_leaf" ] || return 1
+    [ -e "$src_leaf" ] || return 1
+    target_parent="$(dirname "${dest}${rel}")"
+    mkdir -p "$target_parent" || return 1
+    cp -a -- "$src_leaf" "${target_parent}/" || return 1
+    return 0
+}
+
+# 把 <src_dir> 下的全部内容复制进 <dest_dir>
+copy_tree_contents() {
+    local src="${1%/}" dest="${2%/}"
+    [ -d "$src" ] || return 1
+    mkdir -p "$dest" || return 1
+    if command -v rsync >/dev/null 2>&1; then
+        rsync -avP --partial "${src}/" "${dest}/"
+        return $?
+    fi
+    if [ "${USE_CP_FALLBACK:-0}" != "1" ]; then
+        echo "   !! 未安装 rsync 且未启用 cp 兜底，无法复制目录。" >&2
+        return 1
+    fi
+    echo "   (提示: 使用 cp -a 复制目录)"
+    cp -a "${src}/." "${dest}/" || return 1
+    return 0
 }
 
 # ==================== 通用交互辅助 ====================
@@ -521,6 +802,287 @@ PYEOF
 
 rpc_active_managed_names() { _rpc_active_query names; }
 rpc_active_file_paths() { _rpc_active_query paths; }
+
+# ==================== Aria2 RPC 诊断 (模块 6/7/8 复用) ====================
+# 纯 bash + curl 探测 RPC，不依赖 python3；连接失败返回非零
+rpc_diagnose() {
+    echo "---- Aria2 RPC 诊断 ----"
+    if [ ! -f "${CONF_FILE}" ]; then
+        echo "配置文件: ${CONF_FILE} (不存在，请先完成安装)"
+        echo "连接状态: 失败"
+        return 1
+    fi
+
+    local rpc_port rpc_secret
+    rpc_port="$(get_conf_value "rpc-listen-port" "6800")"
+    rpc_secret="$(get_conf_value "rpc-secret" "")"
+    echo "配置文件: ${CONF_FILE}"
+    echo "RPC 端点: http://127.0.0.1:${rpc_port}/jsonrpc (rpc-secret: $([ -n "$rpc_secret" ] && echo 已设置 || echo 未设置))"
+    if command -v python3 >/dev/null 2>&1; then
+        echo "python3 : 可用 ($(command -v python3))"
+    else
+        echo "python3 : !! 未检测到 (模块 6/7/8 依赖它解析 RPC 返回，请先安装 python3)"
+    fi
+
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "连接状态: 无法探测 (缺少 curl)"
+        return 1
+    fi
+
+    # rpc-secret 中的引号/反斜杠会破坏 JSON，这里做最小化剔除
+    local safe_secret="${rpc_secret//\"/}"
+    local token_part=""
+    [ -n "$safe_secret" ] && token_part="\"token:${safe_secret//\\/}\""
+
+    local resp=""
+    resp="$(printf '{"jsonrpc":"2.0","id":"probe","method":"aria2.getVersion","params":[%s]}' "$token_part" \
+        | curl -sS -m 10 --noproxy '*' -X POST -H 'Content-Type: application/json' --data-binary @- \
+            "http://127.0.0.1:${rpc_port}/jsonrpc" 2>&1 || true)"
+
+    if ! printf '%s' "$resp" | grep -q '"result"'; then
+        echo "连接状态: 失败"
+        echo "服务端返回: ${resp:-（无响应）}"
+        if printf '%s' "$resp" | grep -qi 'unauthorized'; then
+            echo "原因: rpc-secret 与运行中的 Aria2 实例不一致。"
+        else
+            echo "原因: Aria2 服务未运行 / 端口不匹配 / RPC 未开启，可在主菜单 9 -> 3 做健康诊断。"
+        fi
+        return 1
+    fi
+
+    local ver
+    ver="$(printf '%s' "$resp" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' | head -n1)"
+    echo "连接状态: 正常${ver:+ (aria2 ${ver})}"
+
+    local method label count tasks
+    for method in aria2.tellActive aria2.tellWaiting aria2.tellStopped; do
+        case "$method" in
+            aria2.tellActive)  label="进行中    " ;;
+            aria2.tellWaiting) label="等待/暂停 ";;
+            *)                 label="已停止    " ;;
+        esac
+        if [ "$method" = "aria2.tellActive" ]; then
+            tasks="$(printf '{"jsonrpc":"2.0","id":"c","method":"%s","params":[%s]}' "$method" "$token_part" \
+                | curl -sS -m 10 --noproxy '*' -X POST -H 'Content-Type: application/json' --data-binary @- \
+                    "http://127.0.0.1:${rpc_port}/jsonrpc" 2>/dev/null || true)"
+        else
+            tasks="$(printf '{"jsonrpc":"2.0","id":"c","method":"%s","params":[%s,0,10000]}' "$method" "$token_part" \
+                | curl -sS -m 10 --noproxy '*' -X POST -H 'Content-Type: application/json' --data-binary @- \
+                    "http://127.0.0.1:${rpc_port}/jsonrpc" 2>/dev/null || true)"
+        fi
+        count="$(printf '%s' "$tasks" | grep -o '"gid"' | wc -l | tr -d ' ')"
+        echo "任务列表 ${label}: ${count} 个"
+    done
+    echo "-----------------------"
+    return 0
+}
+
+# 查询「未完成任务」的数据文件绝对路径(进行中 / 等待 / 暂停 / 未完成已停止)
+#   $1 = 输出文件(NUL 分隔的路径)；stdout 打印诊断；RPC 失败返回非零
+rpc_unfinished_paths_to() {
+    local out_file="$1"
+    ARIA2_CONF_FILE="${CONF_FILE}" ARIA2_OUT_FILE="${out_file}" \
+    ARIA2_SRC_HINT="$(get_current_download_dir)" python3 - <<'PYEOF'
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+CONF_FILE = os.environ.get("ARIA2_CONF_FILE", "")
+OUT_FILE = os.environ.get("ARIA2_OUT_FILE", "")
+SRC_HINT = os.path.realpath(os.environ.get("ARIA2_SRC_HINT", "."))
+RPC_TIMEOUT = 20
+
+
+def read_conf(key, default):
+    try:
+        with open(CONF_FILE, "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                name, value = line.split("=", 1)
+                if name.strip() == key:
+                    return value.strip()
+    except OSError:
+        pass
+    return default
+
+
+def num(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+RPC_PORT = read_conf("rpc-listen-port", "6800") or "6800"
+RPC_SECRET = read_conf("rpc-secret", "")
+RPC_URL = "http://127.0.0.1:" + RPC_PORT + "/jsonrpc"
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def rpc(method, params=None):
+    """返回 (结果, 错误描述)；urllib 失败时回退 curl。"""
+    call_params = ["token:" + RPC_SECRET] if RPC_SECRET else []
+    if params:
+        call_params.extend(params)
+    body = json.dumps({"jsonrpc": "2.0", "id": "unfinished", "method": method, "params": call_params}).encode("utf-8")
+    first_error = ""
+    try:
+        req = urllib.request.Request(RPC_URL, data=body, headers={"Content-Type": "application/json"})
+        with OPENER.open(req, timeout=RPC_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        if isinstance(data, dict) and data.get("error"):
+            info = data["error"] if isinstance(data["error"], dict) else {}
+            return None, "RPC 拒绝请求 [%s] %s" % (info.get("code", "?"), info.get("message", ""))
+        return (data.get("result") if isinstance(data, dict) else None), None
+    except urllib.error.HTTPError as exc:
+        first_error = "HTTP %s" % exc.code
+    except urllib.error.URLError as exc:
+        first_error = "无法连接 127.0.0.1:%s (%s)" % (RPC_PORT, getattr(exc, "reason", exc))
+    except Exception as exc:
+        first_error = "%s: %s" % (type(exc).__name__, exc)
+
+    try:
+        import subprocess
+        proc = subprocess.run(["curl", "-sS", "-m", str(RPC_TIMEOUT), "--noproxy", "*", "-X", "POST",
+                               "-H", "Content-Type: application/json", "--data-binary", "@-", RPC_URL],
+                              input=body, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=RPC_TIMEOUT + 10)
+        if proc.returncode == 0:
+            data = json.loads(proc.stdout.decode("utf-8", "replace"))
+            if isinstance(data, dict) and data.get("error"):
+                info = data["error"] if isinstance(data["error"], dict) else {}
+                return None, "RPC 拒绝请求 [%s] %s" % (info.get("code", "?"), info.get("message", ""))
+            return (data.get("result") if isinstance(data, dict) else None), None
+        return None, "%s；curl 回退失败 (退出码 %s)" % (first_error, proc.returncode)
+    except Exception as exc2:
+        return None, "%s；curl 回退异常: %s" % (first_error, exc2)
+
+
+def is_finished(task):
+    """是否属于「已正常下载完整」: 做种中 / 状态 complete / 进度跑满。"""
+    if task.get("seeder") == "true":
+        return True
+    if (task.get("status") or "").strip() == "complete":
+        return True
+    total = num(task.get("totalLength"))
+    done = num(task.get("completedLength"))
+    return total > 0 and done >= total
+
+
+def task_name(task):
+    bt = task.get("bittorrent")
+    if isinstance(bt, dict):
+        inner = bt.get("info")
+        if isinstance(inner, dict) and inner.get("name"):
+            return inner["name"]
+    files = task.get("files")
+    if isinstance(files, list):
+        for f in files:
+            path = (f or {}).get("path") or ""
+            if path:
+                return os.path.basename(path)
+    return task.get("gid") or "未知任务"
+
+
+version, ver_err = rpc("aria2.getVersion")
+if ver_err:
+    print("!! 无法连接 Aria2 RPC: %s" % ver_err)
+    print("   端点: %s" % RPC_URL)
+    print("   排查: 服务是否运行 / rpc-listen-port 与 rpc-secret 是否与运行实例一致")
+    sys.exit(1)
+version_text = ""
+if isinstance(version, dict):
+    version_text = version.get("version", "")
+print(">> RPC 连接正常: %s%s" % (RPC_URL, (" (aria2 %s)" % version_text) if version_text else ""))
+
+paths = []
+seen = set()
+missing = 0
+outside = 0
+unfinished = []
+for method, params, label in (("aria2.tellActive", None, "进行中"),
+                              ("aria2.tellWaiting", [0, 10000], "等待/暂停"),
+                              ("aria2.tellStopped", [0, 10000], "已停止")):
+    tasks, err = rpc(method, params)
+    if err:
+        print("!! %s 列表查询失败: %s" % (label, err))
+        sys.exit(1)
+    if not isinstance(tasks, list):
+        tasks = []
+    pending = 0
+    for task in tasks:
+        if is_finished(task):
+            continue
+        pending += 1
+        unfinished.append((task_name(task), (task.get("status") or ""), task.get("dir") or ""))
+        task_dir = task.get("dir") or ""
+        files = task.get("files")
+        if not isinstance(files, list):
+            continue
+        for f in files:
+            raw_path = (f or {}).get("path") or ""
+            if not raw_path or raw_path.startswith("[METADATA]"):
+                continue
+            if not os.path.isabs(raw_path):
+                raw_path = os.path.join(task_dir, raw_path) if task_dir else raw_path
+            real = os.path.realpath(raw_path)
+            if real in seen:
+                continue
+            seen.add(real)
+            if real != SRC_HINT and not real.startswith(SRC_HINT + os.sep):
+                outside += 1
+                continue
+            if not os.path.exists(real):
+                missing += 1
+                continue
+            paths.append(real)
+    print(">> %s 列表: 共 %d 个任务，其中未完成 %d 个" % (label, len(tasks), pending))
+
+print(">> 未完成任务合计: %d 个" % len(unfinished))
+for name, status, tdir in unfinished[:10]:
+    print("     - [%s] %s (task dir: %s)" % (status or "?", name, tdir or "?"))
+if len(unfinished) > 10:
+    print("     ... 以及其余 %d 个" % (len(unfinished) - 10))
+print(">> 参照源目录: %s" % SRC_HINT)
+print(">> 可迁移数据文件: %d 个 (磁盘上不存在 %d 个已跳过 / 不在源目录内 %d 个已跳过)"
+      % (len(paths), missing, outside))
+
+with open(OUT_FILE, "wb") as fh:
+    for p in sorted(paths):
+        fh.write(p.encode("utf-8", "surrogateescape") + b"\x00")
+PYEOF
+}
+
+# 校验转移/迁移目标目录: 必须是绝对路径，且不能与源目录相同或位于源目录内部
+check_transfer_dest() {
+    local src="$1" dest="$2" src_real="" dest_real=""
+    case "$dest" in
+        /*) ;;
+        *) echo ">> !! 目标目录必须是绝对路径 (你输入的是: ${dest})"; return 1 ;;
+    esac
+    if ! mkdir -p "$dest" 2>/dev/null; then
+        echo ">> !! 无法创建目标目录: ${dest} (权限不足或路径无效)"
+        return 1
+    fi
+    src_real="$(realpath "$src" 2>/dev/null || true)"
+    [ -n "$src_real" ] || src_real="$src"
+    dest_real="$(realpath "$dest" 2>/dev/null || true)"
+    [ -n "$dest_real" ] || dest_real="$dest"
+    if [ "$dest_real" = "$src_real" ]; then
+        echo ">> !! 目标目录与源目录相同 (${dest_real})，已取消以避免数据丢失。"
+        return 1
+    fi
+    case "${dest_real}/" in
+        "${src_real}/"*)
+            echo ">> !! 目标目录位于源目录内部 (${dest_real})，已取消以避免递归复制与误删。"
+            return 1
+            ;;
+    esac
+    return 0
+}
 
 # ==================== 进程安全停机与等待 ====================
 stop_aria2_safely() {
@@ -1444,10 +2006,10 @@ install_aria2() {
 
     while true; do
         if [ -n "$CURRENT_SECRET" ]; then
-            read -rp "请输入 RPC 密钥 (rpc-secret) [默认保留当前设置]: " INPUT_SECRET
+            read -rp "请输入 RPC 密钥 (rpc-secret) [默认保留当前设置]: " INPUT_SECRET || { echo ""; echo ">> 输入已结束，已取消操作。"; return 1; }
             RPC_SECRET="${INPUT_SECRET:-$CURRENT_SECRET}"
         else
-            read -rp "请输入 RPC 密钥 (rpc-secret，不能为空): " RPC_SECRET
+            read -rp "请输入 RPC 密钥 (rpc-secret，不能为空): " RPC_SECRET || { echo ""; echo ">> 输入已结束，已取消操作。"; return 1; }
         fi
 
         if [ -n "$RPC_SECRET" ]; then
@@ -2209,18 +2771,43 @@ EOF
             bash "${BLOCKER_SCRIPT}"
             ;;
         4)
-            echo "=== iptables 拦截规则 ==="
-            ${SUDO_CMD} iptables -L INPUT -n -v | grep "aria2_ban" || echo "未找到 IPv4 拦截规则"
-            if command -v ip6tables &>/dev/null; then
-                ${SUDO_CMD} ip6tables -L INPUT -n -v | grep "aria2_ban" || echo "未找到 IPv6 拦截规则"
+            local _pb_tmp=""
+            _pb_tmp=$(mktemp -d)
+
+            { ${SUDO_CMD} iptables -L INPUT -n -v 2>/dev/null | grep "aria2_ban" || echo "未找到 IPv4 拦截规则"; } > "${_pb_tmp}/ipt4.txt" 2>&1
+            preview_file_paged "iptables 拦截规则 (IPv4)" "${_pb_tmp}/ipt4.txt" 20
+            if command -v ip6tables >/dev/null 2>&1; then
+                { ${SUDO_CMD} ip6tables -L INPUT -n -v 2>/dev/null | grep "aria2_ban" || echo "未找到 IPv6 拦截规则"; } > "${_pb_tmp}/ipt6.txt" 2>&1
+                preview_file_paged "iptables 拦截规则 (IPv6)" "${_pb_tmp}/ipt6.txt" 20
             fi
+
             echo ""
             echo "=== ipset 集合概况 ==="
             ${SUDO_CMD} ipset list aria2_ban_v4 -terse 2>/dev/null || echo "aria2_ban_v4 集合不存在"
             ${SUDO_CMD} ipset list aria2_ban_v6 -terse 2>/dev/null || echo "aria2_ban_v6 集合不存在"
+
+            # 完整黑名单可能上万条，改为分页查看 (随时可输入 q 退出)
+            local _pb_view=""
+            if ${SUDO_CMD} ipset list aria2_ban_v4 >/dev/null 2>&1; then
+                read -rp "是否分页查看完整 IPv4 黑名单? [y/N 默认: N]: " _pb_view || true
+                if [[ "${_pb_view:-N}" =~ ^[Yy]$ ]]; then
+                    ${SUDO_CMD} ipset list aria2_ban_v4 2>/dev/null > "${_pb_tmp}/ban4.txt"
+                    preview_file_paged "IPv4 黑名单 (完整)" "${_pb_tmp}/ban4.txt" 20
+                fi
+            fi
+            _pb_view=""
+            if ${SUDO_CMD} ipset list aria2_ban_v6 >/dev/null 2>&1; then
+                read -rp "是否分页查看完整 IPv6 黑名单? [y/N 默认: N]: " _pb_view || true
+                if [[ "${_pb_view:-N}" =~ ^[Yy]$ ]]; then
+                    ${SUDO_CMD} ipset list aria2_ban_v6 2>/dev/null > "${_pb_tmp}/ban6.txt"
+                    preview_file_paged "IPv6 黑名单 (完整)" "${_pb_tmp}/ban6.txt" 20
+                fi
+            fi
+
             echo ""
-            echo "=== 定时器运行状态 ==="
-            systemctl list-timers aria2-peer-blocker.timer || true
+            { systemctl list-timers aria2-peer-blocker.timer 2>&1 || true; } > "${_pb_tmp}/timer.txt"
+            preview_file_paged "定时器运行状态" "${_pb_tmp}/timer.txt" 20
+            rm -rf "${_pb_tmp}"
             ;;
         0)
             return 0
@@ -2260,7 +2847,9 @@ migrate_downloads() {
         return 1
     fi
 
-    install_packages rsync findutils python3
+    install_packages findutils python3
+    check_cmds find || return 1
+    ensure_rsync || return 1
 
     FILE_KEYWORD=""
     if [ "$MIGRATE_TYPE" == "3" ]; then
@@ -2284,13 +2873,72 @@ migrate_downloads() {
     fi
 
     while true; do
-        read -rp "请输入目标新磁盘目录绝对路径 (例如: /mnt/disk2/Downloads): " DEST_DIR
-        if [ -n "$DEST_DIR" ]; then
-            DEST_DIR="${DEST_DIR%/}"
+        read -rp "请输入目标新磁盘目录绝对路径 (例如: /mnt/disk2/Downloads): " DEST_DIR || { echo ""; echo ">> 输入已结束，已取消迁移。"; return 1; }
+        DEST_DIR="${DEST_DIR%/}"
+        if [ -z "$DEST_DIR" ]; then
+            echo "目标路径不能为空，请重新输入！"
+            continue
+        fi
+        if check_transfer_dest "${SRC_DIR}" "${DEST_DIR}"; then
             break
         fi
-        echo "目标路径不能为空，请重新输入！"
+        echo "请重新输入目标路径。"
     done
+
+    # ---- 未完成任务清单必须在 Aria2 运行期间查询；且先让用户确认后再停服搬运 ----
+    local pending_tmp="" pending_file=""
+    local SRC_REAL=""
+    SRC_REAL="$(realpath "${SRC_DIR}" 2>/dev/null || true)"
+    [ -n "$SRC_REAL" ] || SRC_REAL="${SRC_DIR}"
+    declare -a PENDING_PATHS=()
+    if [ "$MIGRATE_TYPE" == "1" ]; then
+        echo ">> 正在通过 RPC 检索未完成 (进行中 / 等待 / 暂停 / 未完成已停止) 任务的数据..."
+        # aria2-next 不再生成 .aria2 控制文件，未完成任务只能以 RPC 任务清单为准
+        local scan_rc=0
+        pending_tmp=$(mktemp -d)
+        pending_file="${pending_tmp}/paths.list"
+        rpc_unfinished_paths_to "${pending_file}" || scan_rc=$?
+        if [ "$scan_rc" -ne 0 ]; then
+            echo ""
+            echo ">> [失败] 未能从 Aria2 获取未完成任务清单，未做任何迁移。"
+            echo "   ---- 连接诊断 ----"
+            rpc_diagnose || true
+            rm -rf "${pending_tmp}"
+            return 1
+        fi
+
+        if [ -s "${pending_file}" ]; then
+            mapfile -d '' -t PENDING_PATHS < "${pending_file}" 2>/dev/null || PENDING_PATHS=()
+        fi
+        rm -rf "${pending_tmp}"
+        pending_tmp=""
+
+        if [ ${#PENDING_PATHS[@]} -eq 0 ]; then
+            echo ""
+            echo ">> 未检索到可迁移的未完成任务数据文件。"
+            echo "   说明: 未完成但磁盘上尚无数据(例如刚添加、还没开始下载)的任务无需迁移；"
+            echo "         aria2-next 的断点/恢复数据存于 ${STATE_DIR}，不随下载目录迁移。"
+            echo "   若上方诊断显示任务数与实际不符，请先用主菜单 9 -> 3 做健康诊断。"
+            return 0
+        fi
+
+        # 待处理清单确认 (此时服务仍在运行，取消后无任何副作用)
+        local _disp=""
+        declare -a PENDING_DISPLAY=()
+        for _disp in "${PENDING_PATHS[@]}"; do
+            case "$_disp" in
+                "${SRC_DIR}"/*) _disp="${_disp#"${SRC_DIR}/"}" ;;
+            esac
+            case "$_disp" in
+                "${SRC_REAL}"/*) _disp="${_disp#"${SRC_REAL}/"}" ;;
+            esac
+            PENDING_DISPLAY+=("$_disp")
+        done
+        if ! confirm_paged_list PENDING_PATHS "待迁移的未完成任务数据文件" 15 PENDING_DISPLAY; then
+            echo ">> 已取消迁移 (Aria2 服务未受影响)。"
+            return 0
+        fi
+    fi
 
     stop_aria2_safely
 
@@ -2301,92 +2949,144 @@ migrate_downloads() {
     chmod 755 "${DEST_DIR}" 2>/dev/null || true
 
     declare -a MIGRATED_FILES=()
+    local MIGRATE_OK=0 MIGRATE_FAIL=0
 
     case "$MIGRATE_TYPE" in
         1)
-            echo ">> 正在通过 RPC 检索未完成 (进行中 / 等待中) 任务的本地数据..."
-            # aria2-next 不再生成 .aria2 控制文件，未完成任务只能以 RPC 任务清单为准
-            declare -a PENDING_PATHS=()
-            local _pp=""
-            while IFS= read -r _pp; do
-                [ -n "$_pp" ] || continue
-                [ -e "$_pp" ] || continue   # 跳过 [METADATA] 等尚未落盘的虚拟路径
-                PENDING_PATHS+=("$_pp")
-            done < <(rpc_active_file_paths 2>/dev/null || true)
+            local _pp="" _rel="" _dest_subdir="" _ok=0 _fail=0
 
-            if [ ${#PENDING_PATHS[@]} -eq 0 ]; then
-                echo "提示: 未检索到未完成任务的本地数据文件 (任务可能尚未开始下载，或仅有磁力元数据)。"
-                echo "      aria2-next 的断点/恢复数据存于 ${STATE_DIR}，该目录独立于下载目录，无需随数据迁移。"
-                svc_start
-                return 0
-            fi
-
-            echo ">> 发现 ${#PENDING_PATHS[@]} 个未完成任务数据文件，正在断点同步数据与种子元数据..."
-            local _rel="" _dest_subdir=""
+            echo ""
+            echo ">> 发现 ${#PENDING_PATHS[@]} 个未完成任务数据文件，开始断点同步..."
             for _pp in "${PENDING_PATHS[@]}"; do
                 case "$_pp" in
+                    "${SRC_REAL}"/*) _rel="${_pp#"${SRC_REAL}/"}" ;;
                     "${SRC_DIR}"/*) _rel="${_pp#"${SRC_DIR}/"}" ;;
-                    *) continue ;;
+                    *) echo "   - 跳过 (不在源目录内): ${_pp}"; continue ;;
                 esac
                 _dest_subdir=$(dirname "${DEST_DIR}/${_rel}")
                 mkdir -p "${_dest_subdir}"
 
-                rsync -avP --partial "${_pp}" "${_dest_subdir}/"
-                MIGRATED_FILES+=("${_pp}")
+                if copy_path "${_pp}" "${_dest_subdir}" && [ -e "${_dest_subdir}/$(basename "${_pp}")" ]; then
+                    MIGRATED_FILES+=("${_pp}")
+                    _ok=$((_ok + 1))
+                else
+                    echo "   !! [失败] 同步未确认: ${_pp}"
+                    _fail=$((_fail + 1))
+                fi
 
                 if [ -f "${_pp}.torrent" ]; then
-                    rsync -avP --partial "${_pp}.torrent" "${_dest_subdir}/"
-                    MIGRATED_FILES+=("${_pp}.torrent")
+                    if copy_path "${_pp}.torrent" "${_dest_subdir}" && [ -e "${_dest_subdir}/$(basename "${_pp}").torrent" ]; then
+                        MIGRATED_FILES+=("${_pp}.torrent")
+                    fi
                 fi
             done
+            echo ">> 数据同步结果: 成功 ${_ok} 个 / 失败 ${_fail} 个"
+            MIGRATE_OK=$_ok
+            MIGRATE_FAIL=$_fail
+            if [ "$_fail" -gt 0 ]; then
+                echo "   提示: 失败项未被计入清理清单，源文件会保留在 ${SRC_DIR}。"
+            fi
 
             while IFS= read -r tor; do
                 if [ -f "$tor" ]; then
-                    rsync -avP --partial "$tor" "${DEST_DIR}/"
-                    MIGRATED_FILES+=("$tor")
+                    copy_path "$tor" "${DEST_DIR}" && MIGRATED_FILES+=("$tor")
                 fi
             done < <(find "${SRC_DIR}" -maxdepth 1 -name "*.torrent")
+
             ;;
 
         2)
+            declare -a TOP_ITEMS=()
+            local _t=""
+            while IFS= read -r _t; do
+                [ -n "$_t" ] && TOP_ITEMS+=("$_t")
+            done < <(find "${SRC_DIR}" -mindepth 1 -maxdepth 1)
+
+            if [ ${#TOP_ITEMS[@]} -eq 0 ]; then
+                echo ">> 源目录下没有任何内容，无需迁移。"
+                svc_start
+                return 0
+            fi
+
+            declare -a TOP_DISPLAY=()
+            for _t in "${TOP_ITEMS[@]}"; do
+                TOP_DISPLAY+=("$(basename "$_t")")
+            done
+            if ! confirm_paged_list TOP_ITEMS "将完整同步以下顶层条目(含其全部内容)到 ${DEST_DIR}" 15 TOP_DISPLAY; then
+                echo ">> 已取消迁移，Aria2 服务已恢复。"
+                svc_start
+                return 0
+            fi
+
             echo ">> 正在完整断点同步下载目录下全部数据..."
-            rsync -avP --partial "${SRC_DIR}/" "${DEST_DIR}/"
+            copy_tree_contents "${SRC_DIR}" "${DEST_DIR}" || {
+                echo ">> [失败] 目录同步未成功，已中止后续的路径切换与清理 (源数据保持原样)。"
+                svc_start
+                return 1
+            }
             while IFS= read -r item; do
                 [ -e "$item" ] && MIGRATED_FILES+=("$item")
             done < <(find "${SRC_DIR}" -mindepth 1 -maxdepth 1)
             ;;
 
         3)
-            echo ">> 正在根据关键字 [${FILE_KEYWORD}] 匹配任务并断点同步..."
-            MATCH_FOUND=false
-            while IFS= read -r item; do
-                MATCH_FOUND=true
-                rel_item="${item#"${SRC_DIR}/"}"
-                dest_subdir=$(dirname "${DEST_DIR}/${rel_item}")
-                mkdir -p "${dest_subdir}"
-
-                rsync -avP --partial "${item}" "${dest_subdir}/"
-                MIGRATED_FILES+=("${item}")
-
-                if [ -f "${item}.torrent" ]; then
-                    rsync -avP --partial "${item}.torrent" "${dest_subdir}/"
-                    MIGRATED_FILES+=("${item}.torrent")
-                fi
+            declare -a MATCH_ITEMS=()
+            local _f=""
+            while IFS= read -r _f; do
+                [ -n "$_f" ] && MATCH_ITEMS+=("$_f")
             done < <(find "${SRC_DIR}" -name "*${FILE_KEYWORD}*" ! -name "*.aria2" ! -name "*.torrent")
-
-            while IFS= read -r ext_file; do
-                MATCH_FOUND=true
-                rsync -avP --partial "${ext_file}" "${DEST_DIR}/"
-                MIGRATED_FILES+=("${ext_file}")
+            while IFS= read -r _f; do
+                [ -n "$_f" ] && MATCH_ITEMS+=("$_f")
             done < <(find "${SRC_DIR}" -maxdepth 1 -name "*${FILE_KEYWORD}*.torrent")
 
-            if [ "$MATCH_FOUND" = false ]; then
+            if [ ${#MATCH_ITEMS[@]} -eq 0 ]; then
                 echo "未匹配到任何包含关键字 [${FILE_KEYWORD}] 的文件。"
                 svc_start
                 return 0
             fi
+
+            declare -a MATCH_DISPLAY=()
+            for _f in "${MATCH_ITEMS[@]}"; do
+                MATCH_DISPLAY+=("${_f#"${SRC_DIR}/"}")
+            done
+            if ! confirm_paged_list MATCH_ITEMS "关键字 [${FILE_KEYWORD}] 匹配到的文件" 15 MATCH_DISPLAY; then
+                echo ">> 已取消迁移，Aria2 服务已恢复。"
+                svc_start
+                return 0
+            fi
+
+            echo ">> 正在根据关键字 [${FILE_KEYWORD}] 断点同步..."
+            local _rel3="" _sub3="" _ok3=0 _fail3=0
+            for _f in "${MATCH_ITEMS[@]}"; do
+                _rel3="${_f#"${SRC_DIR}/"}"
+                _sub3=$(dirname "${DEST_DIR}/${_rel3}")
+                mkdir -p "${_sub3}"
+
+                if copy_path "${_f}" "${_sub3}" && [ -e "${_sub3}/$(basename "${_f}")" ]; then
+                    MIGRATED_FILES+=("${_f}")
+                    _ok3=$((_ok3 + 1))
+                else
+                    echo "   !! [失败] 同步未确认: ${_f}"
+                    _fail3=$((_fail3 + 1))
+                fi
+
+                if [ -f "${_f}.torrent" ]; then
+                    copy_path "${_f}.torrent" "${_sub3}" && MIGRATED_FILES+=("${_f}.torrent")
+                fi
+            done
+            echo ">> 数据同步结果: 成功 ${_ok3} 个 / 失败 ${_fail3} 个"
+            MIGRATE_OK=$_ok3
+            MIGRATE_FAIL=$_fail3
             ;;
     esac
+
+    # 全部失败时不要在“没搬成数据”的前提下改写路径/清理，否则会把任务指到空目录
+    if [ "$MIGRATE_TYPE" != "2" ] && [ "$MIGRATE_FAIL" -gt 0 ] && [ "$MIGRATE_OK" -eq 0 ]; then
+        echo ""
+        echo ">> [中止] 没有任何文件同步成功，已放弃后续的路径切换与清理 (源数据保持原样)。"
+        svc_start
+        return 1
+    fi
 
     if [ -f "${SESSION_FILE}" ] && [ -s "${SESSION_FILE}" ]; then
         echo ">> 正在更新会话文件 (${SESSION_FILE}) 中的路径映射..."
@@ -2452,7 +3152,9 @@ archive_completed_files() {
         return 1
     fi
 
-    install_packages rsync findutils python3 curl
+    install_packages findutils python3 curl
+    check_cmds find python3 || return 1
+    ensure_rsync || return 1
 
     if ! svc_is_active; then
         echo ">> 检测到 Aria2 服务未运行，正在启动以调取任务状态..."
@@ -2472,15 +3174,18 @@ archive_completed_files() {
     fi
 
     while true; do
-        read -rp "请输入转移存放的目标新磁盘目录: " DEST_DIR
-        if [ -n "$DEST_DIR" ]; then
-            DEST_DIR="${DEST_DIR%/}"
+        read -rp "请输入转移存放的目标新磁盘目录 (绝对路径，例如 /mnt/disk2/Downloads): " DEST_DIR || { echo ""; echo ">> 输入已结束，已取消操作。"; return 1; }
+        DEST_DIR="${DEST_DIR%/}"
+        if [ -z "$DEST_DIR" ]; then
+            echo "目标目录不能为空，请重新输入！"
+            continue
+        fi
+        if check_transfer_dest "${SRC_DIR}" "${DEST_DIR}"; then
             break
         fi
-        echo "目标目录不能为空，请重新输入！"
+        echo "请重新输入目标目录。"
     done
 
-    mkdir -p "${DEST_DIR}"
     if [ "$IS_ROOT" = false ]; then
         ${SUDO_CMD} chown -R "${CURRENT_USER}:${CURRENT_USER}" "${DEST_DIR}" 2>/dev/null || true
     fi
@@ -2909,20 +3614,10 @@ total_size = 0
 lines.append("")
 lines.append(f">> 源目录: {SRC_DIR}")
 if groups:
-    lines.append(f">> 以下任务已 100% 下载完成，可转移 ({len(groups)} 个):")
-    lines.append("--------------------------------------------------")
-    for index, group in enumerate(groups, start=1):
-        name, status, _gid, picked_files, removable, size, _torrent = group
+    for _name, _status, _gid, picked_files, _removable, _size, _torrent in groups:
         total_files += len(picked_files)
-        total_size += size
-        marker = "  << 做种/暂停中，转移前会先停止它" if removable else ""
-        lines.append(f"   [{index:>2}] [{status_text(status)}] {name}  ({len(picked_files)} 个文件 / {human(size)}){marker}")
-        if index <= FILE_PREVIEW_LIMIT:
-            for path in picked_files[:5]:
-                lines.append(f"         · {os.path.relpath(path, SRC_DIR)}")
-            if len(picked_files) > 5:
-                lines.append(f"         · ... 以及其余 {len(picked_files) - 5} 个文件")
-    lines.append("--------------------------------------------------")
+        total_size += _size
+    lines.append(f">> 以下任务已 100% 下载完成，可转移 ({len(groups)} 个)，明细将分页展示：")
     lines.append(f">> 合计: {len(groups)} 个任务 / {total_files} 个文件 / {human(total_size)}")
 else:
     lines.append(">> 没有找到已完全下载完成的任务数据。")
@@ -2941,6 +3636,14 @@ if incomplete_tasks and not groups:
         lines.append(f"   - [{status_text(status)}] {name}  {percent:.1f}%")
     if len(incomplete_tasks) > 15:
         lines.append(f"   ... 以及其余 {len(incomplete_tasks) - 15} 个任务")
+
+# 每个任务一条展示行(供 bash 侧分页预览)；顺序与 tasks.rec 一致
+with open(os.path.join(OUT_DIR, "tasks.disp"), "w", encoding="utf-8") as fh:
+    for group in groups:
+        name, status, _gid, picked_files, removable, size, _torrent = group
+        marker = "  << 做种/暂停中，转移前会先停止它" if removable else ""
+        fh.write("[%s] %s — %d 个文件 / %s%s\n"
+                 % (status_text(status), name, len(picked_files), human(size), marker))
 
 # 先落盘再输出报告: 即使报告文本出错，也不会影响已确认的转移清单
 with open(os.path.join(OUT_DIR, "files.list"), "wb") as fh:
@@ -2977,6 +3680,8 @@ PYEOF
                 echo "   本机监听端口: ${listen_ports}"
             fi
         fi
+        echo "   ------------------"
+        rpc_diagnose || true
         echo "   ------------------"
         rm -rf "${scan_tmp}"
         return 1
@@ -3026,6 +3731,15 @@ PYEOF
         echo ">> [失败] 任务清单与文件清单数量不一致 (任务记录 ${SUM_FILES} 个文件 / 清单 ${FILE_COUNT} 个文件)，为避免误移已中止。"
         rm -rf "${scan_tmp}"
         return 1
+    fi
+
+    # 分页预览可转移任务清单 (仅预览，随后仍可按编号选择子集)
+    declare -a TASK_DISPLAY=()
+    if [ -s "${scan_tmp}/tasks.disp" ]; then
+        mapfile -t TASK_DISPLAY < "${scan_tmp}/tasks.disp" 2>/dev/null || TASK_DISPLAY=()
+    fi
+    if [ "${#TASK_DISPLAY[@]}" -gt 0 ]; then
+        confirm_paged_list T_NAME "已 100% 下载完成、可转移的任务" 15 TASK_DISPLAY view || true
     fi
 
     echo ""
@@ -3094,13 +3808,8 @@ PYEOF
 
     if [ ${#TORRENT_FILES[@]} -gt 0 ]; then
         echo ""
-        echo ">> 检测到 ${#TORRENT_FILES[@]} 个已选任务带有同名 .torrent 元数据文件:"
-        for torrent_path in "${TORRENT_FILES[@]:0:10}"; do
-            echo "   - ${torrent_path}"
-        done
-        if [ ${#TORRENT_FILES[@]} -gt 10 ]; then
-            echo "   ... 以及其余 $(( ${#TORRENT_FILES[@]} - 10 )) 个"
-        fi
+        echo ">> 检测到 ${#TORRENT_FILES[@]} 个已选任务带有同名 .torrent 元数据文件："
+        confirm_paged_list TORRENT_FILES "同名 .torrent 元数据文件" 15 "" view || true
         read -rp "是否连同这些 .torrent 一并转移到新磁盘? [y/N 默认: N]: " MOVE_TORRENTS
         MOVE_TORRENTS="${MOVE_TORRENTS:-N}"
         if [[ "$MOVE_TORRENTS" =~ ^[Yy]$ ]]; then
@@ -3116,13 +3825,20 @@ PYEOF
     SEL_GB=$(awk "BEGIN {printf \"%.2f\", ${chosen_bytes}/1024/1024/1024}")
     echo ""
     echo ">> 已选择 ${chosen_count} 个任务 / ${SEL_FILES} 个文件 / 约 ${SEL_GB} GB"
+    if [ "$SEL_FILES" -gt 0 ]; then
+        confirm_paged_list COMPLETED_FILES "以下文件将被转移到 ${DEST_DIR} (相对路径)" 15 "" view || true
+    fi
     if [ ${#FORCE_GIDS[@]} -gt 0 ]; then
         echo ">> 其中以下任务仍在做种/暂停中，转移前会先停止它们 (之后需重新添加种子才能继续做种):"
+        local -a FORCE_NAMES=()
         for ((i=0; i<TASK_TOTAL; i++)); do
             if [ -n "${CHOSEN_MAP[$i]}" ] && [ "${T_REMOVABLE[$i]}" = "1" ]; then
-                echo "   - ${T_NAME[$i]}"
+                FORCE_NAMES+=("${T_NAME[$i]}")
             fi
         done
+        if [ "${#FORCE_NAMES[@]}" -gt 0 ]; then
+            confirm_paged_list FORCE_NAMES "做种/暂停中、转移前会被停止的任务" 15 "" view || true
+        fi
     fi
 
     read -rp "确认开始同步移动以上已完成任务的数据到 ${DEST_DIR}? [Y/n 默认: Y]: " CONFIRM_MOVE
@@ -3140,22 +3856,69 @@ PYEOF
     fi
 
     echo ">> 正在同步数据并保持相对目录层级结构..."
-    (
-        cd "${SRC_DIR}"
-        for it in "${COMPLETED_FILES[@]}"; do
-            echo "   -> 正在转移: ${it}..."
-            rsync -avP --partial -R "${it}" "${DEST_DIR}/"
-        done
-    )
+    declare -a VERIFIED_FILES=() FAILED_FILES=()
+    local it dest_path src_size dest_size
+    for it in "${COMPLETED_FILES[@]}"; do
+        echo "   -> 正在转移: ${it}..."
+        # 以 <源目录>/./<相对路径> 传入: -R 会把 ./ 之后的部分作为目标相对路径，
+        # 与当前工作目录无关 (旧实现依赖 cd，一旦目标目录写成相对路径就会把文件复制回源目录)
+        if ! copy_path "${SRC_DIR}/./${it}" "${DEST_DIR}"; then
+            echo "   !! [失败] 复制返回非零"
+            FAILED_FILES+=("$it")
+            continue
+        fi
+        dest_path="${DEST_DIR}/${it}"
+        if [ ! -e "$dest_path" ]; then
+            echo "   !! [失败] 目标位置未找到文件"
+            FAILED_FILES+=("$it")
+            continue
+        fi
+        src_size=$(stat -c %s "${SRC_DIR}/${it}" 2>/dev/null || stat -f %z "${SRC_DIR}/${it}" 2>/dev/null || echo "")
+        dest_size=$(stat -c %s "$dest_path" 2>/dev/null || stat -f %z "$dest_path" 2>/dev/null || echo "")
+        if [ -n "$src_size" ] && [ -n "$dest_size" ] && [ "$src_size" != "$dest_size" ]; then
+            echo "   !! [失败] 大小不一致 (源 ${src_size} / 目标 ${dest_size})"
+            FAILED_FILES+=("$it")
+            continue
+        fi
+        VERIFIED_FILES+=("$it")
+    done
 
     echo ""
-    echo ">> [成功] 已完成任务的数据已全部同步到目标新磁盘！"
-    read -rp "是否彻底删除原路径 (${SRC_DIR}) 上已转移的文件以释放空间? [Y/n 默认: Y]: " CLEAN_SRC
+    echo ">> 同步结果: 已确认 ${#VERIFIED_FILES[@]} 个文件落入 ${DEST_DIR}"
+    if [ ${#FAILED_FILES[@]} -gt 0 ]; then
+        echo ">> [警告] ${#FAILED_FILES[@]} 个文件未能确认同步成功，它们不会被从源磁盘删除:"
+        for it in "${FAILED_FILES[@]:0:10}"; do
+            echo "   - ${it}"
+        done
+        if [ ${#FAILED_FILES[@]} -gt 10 ]; then
+            echo "   ... 以及其余 $(( ${#FAILED_FILES[@]} - 10 )) 个"
+        fi
+    fi
+    if [ ${#VERIFIED_FILES[@]} -eq 0 ]; then
+        echo ""
+        echo ">> [中止] 没有任何文件确认同步成功，已跳过后续清理 (源文件全部保留)。"
+        echo "   请检查目标磁盘是否可写/剩余空间，或上方复制错误信息。"
+        rm -rf "${scan_tmp}"
+        return 1
+    fi
+
+    read -rp "是否彻底删除原路径 (${SRC_DIR}) 上已确认转移的文件以释放空间? [Y/n 默认: Y]: " CLEAN_SRC
     CLEAN_SRC="${CLEAN_SRC:-Y}"
     if [[ "$CLEAN_SRC" =~ ^[Yy]$ ]]; then
-        echo ">> 正在清理原路径上的已转移数据..."
-        for it in "${COMPLETED_FILES[@]}"; do
-            rm -f "${SRC_DIR}/${it}"
+        echo ">> 正在清理原路径上的已转移数据 (仅限已确认同步成功的文件)..."
+        local removed=0 skipped_del=0
+        for it in "${VERIFIED_FILES[@]}"; do
+            if [ ! -e "${DEST_DIR}/${it}" ]; then
+                echo "   - 跳过 (目标侧已不可见，安全起见不删除源): ${it}"
+                skipped_del=$((skipped_del + 1))
+                continue
+            fi
+            if rm -f "${SRC_DIR}/${it}"; then
+                removed=$((removed + 1))
+            else
+                echo "   !! 删除失败: ${it}"
+                skipped_del=$((skipped_del + 1))
+            fi
         done
         find "${SRC_DIR}" -mindepth 1 -type d -empty -delete 2>/dev/null || true
 
@@ -3166,10 +3929,13 @@ PYEOF
             fi
         done < <(find "${SRC_DIR}" -type f -name "*.aria2" 2>/dev/null)
 
-        echo ">> 原磁盘空间已释放！所有正在下载的任务继续正常运行。"
+        echo ">> 已删除源文件 ${removed} 个${skipped_del:+ (跳过 ${skipped_del} 个)}，原磁盘空间已释放。"
 
         # 原文件已删除，Aria2 里的这些记录已失效 (AriaNg 会显示文件缺失)，可选择一并清除
-        if [ ${#ALL_GIDS[@]} -gt 0 ]; then
+        if [ ${#FAILED_FILES[@]} -gt 0 ]; then
+            echo ""
+            echo ">> 提示: 由于有文件未确认同步成功，本次不清除 Aria2 中的任务记录 (避免丢失续传信息)。"
+        elif [ ${#ALL_GIDS[@]} -gt 0 ]; then
             echo ""
             echo ">> 提示: 这些任务的原文件已删除，Aria2 中仍保留其记录 (会显示在 AriaNg 的『已停止』列表且文件缺失)。"
             read -rp "是否同时清除这些任务的下载记录? [Y/n 默认: Y]: " PURGE_RECORDS
@@ -3486,67 +4252,42 @@ PYEOF
         total_bytes=$((total_bytes + ${r_bytes:-0}))
     done
 
-    local total_gb page_size=15
+    local total_gb
     total_gb=$(awk "BEGIN {printf \"%.2f\", ${total_bytes}/1024/1024/1024}")
 
+    # 统一用可翻页的清单一并完成预览与确认
     local i kind
-    if [ "$ORPHAN_TOTAL" -gt "$page_size" ]; then
-        read -rp "匹配到的游离目标较多 (${ORPHAN_TOTAL} 项)，是否翻页查看清单? [Y/n 默认: Y]: " VIEW_PAGER
-        VIEW_PAGER="${VIEW_PAGER:-Y}"
-        if [[ "$VIEW_PAGER" =~ ^[Yy]$ ]]; then
-            local current_idx=0 page_total page_no
-            page_total=$(( (ORPHAN_TOTAL + page_size - 1) / page_size ))
-            while [ "$current_idx" -lt "$ORPHAN_TOTAL" ]; do
-                clear 2>/dev/null || true
-                page_no=$(( current_idx / page_size + 1 ))
-                echo "=== 游离文件/目录清单 (第 ${page_no} / ${page_total} 页，共 ${ORPHAN_TOTAL} 项) ==="
-                for ((i=current_idx; i<current_idx+page_size && i<ORPHAN_TOTAL; i++)); do
-                    if [ "${O_ISDIR[$i]}" = "1" ]; then kind="[目录]"; else kind="[文件]"; fi
-                    printf ' [%d] %s %s (%s)\n' "$((i+1))" "$kind" "${O_NAME[$i]}" "${O_HUMAN[$i]}"
-                done
-                echo "--------------------------------------------------"
-                current_idx=$((current_idx + page_size))
-                if [ "$current_idx" -lt "$ORPHAN_TOTAL" ]; then
-                    read -rp "按 [Enter] 查看下一页，输入 [q] 退出预览，输入 [g] 直接进入同步: " PAGE_ACTION
-                    case "$PAGE_ACTION" in
-                        [Qq]) break ;;
-                        [Gg]) break ;;
-                    esac
-                else
-                    read -rp "已浏览全部游离目标，按 [Enter] 继续..." __dummy_page
-                fi
-            done
-        fi
-    else
-        echo ""
-        echo "---------------- 游离文件/目录清单 ------------------"
-        for ((i=0; i<ORPHAN_TOTAL; i++)); do
-            if [ "${O_ISDIR[$i]}" = "1" ]; then kind="[目录]"; else kind="[文件]"; fi
-            printf ' [%d] %s %s (%s)\n' "$((i+1))" "$kind" "${O_NAME[$i]}" "${O_HUMAN[$i]}"
-        done
-        echo "--------------------------------------------------"
-    fi
+    declare -a O_DISPLAY=()
+    for ((i=0; i<ORPHAN_TOTAL; i++)); do
+        if [ "${O_ISDIR[$i]}" = "1" ]; then kind="[目录]"; else kind="[文件]"; fi
+        O_DISPLAY+=("${kind} ${O_NAME[$i]} (${O_HUMAN[$i]})")
+    done
 
     echo ""
     echo ">> 共发现 ${ORPHAN_TOTAL} 个游离目标 / 约 ${total_gb} GB"
-    read -rp "确认开始将这些游离目标同步到 ${DEST_DIR}? [Y/n 默认: Y]: " CONFIRM_ORPHAN
-    CONFIRM_ORPHAN="${CONFIRM_ORPHAN:-Y}"
-    if [[ ! "$CONFIRM_ORPHAN" =~ ^[Yy]$ ]]; then
+    if ! confirm_paged_list O_NAME "不被 Aria2 任务管理的游离文件/目录 (将同步到 ${DEST_DIR})" 15 O_DISPLAY; then
         echo ">> 操作已取消。"
         rm -rf "${scan_tmp}"
         return 0
     fi
 
     declare -a TRANSFER_FAILED=()
-    local name
+    local name _dest_check
     echo ""
     echo ">> 正在同步游离数据到新磁盘 (保持相对目录层级)..."
     for ((i=0; i<ORPHAN_TOTAL; i++)); do
         name="${O_NAME[$i]}"
         echo "   -> 正在转移: ${name}..."
         # 以 ${SRC_DIR}/./ 形式传入，-R 会以 ./ 之后的部分作为目标相对路径
-        if ! rsync -avP --partial -R "${SRC_DIR}/./${name}" "${DEST_DIR}/"; then
+        if ! copy_path "${SRC_DIR}/./${name}" "${DEST_DIR}"; then
             echo "   !! [失败] 同步出错: ${name}"
+            TRANSFER_FAILED+=("$name")
+            continue
+        fi
+        # 二次确认: 目标侧必须真实存在，否则不进入清理清单
+        _dest_check="${DEST_DIR}/${name}"
+        if [ ! -e "$_dest_check" ]; then
+            echo "   !! [失败] 目标位置未找到: ${name}"
             TRANSFER_FAILED+=("$name")
         fi
     done
@@ -3583,6 +4324,11 @@ PYEOF
             skipped=$((skipped + 1))
             continue
         fi
+        if [ ! -e "${DEST_DIR}/${name}" ]; then
+            echo "   - 跳过 (目标侧已不可见，安全起见不删除源): ${name}"
+            skipped=$((skipped + 1))
+            continue
+        fi
         if rm -rf -- "${SRC_DIR}/${name}"; then
             echo "   - 已删除: ${name}"
             removed=$((removed + 1))
@@ -3614,6 +4360,7 @@ scan_and_resume_torrents() {
         echo "错误: 未检测到 python3，无法解析 Aria2 RPC 状态，请先安装 python3 后重试。"
         return 1
     fi
+    check_cmds curl find || return 1
 
     local RPC_PORT RPC_SECRET
     RPC_PORT=$(grep -E "^rpc-listen-port=" "${CONF_FILE}" | cut -d'=' -f2- | tr -d ' \r')
@@ -3652,6 +4399,9 @@ scan_and_resume_torrents() {
 
 # ==================== 模块 8-1: 扫描目录并重新注入 .torrent 恢复断点 ====================
 resume_torrents_from_dir() {
+    install_packages curl findutils coreutils
+    check_cmds base64 curl find || return 1
+
     local CURRENT_DIR
     CURRENT_DIR=$(get_current_download_dir)
     read -rp "请输入要扫描的种子所在目录 [默认: ${CURRENT_DIR}]: " TARGET_SCAN_DIR
@@ -3663,15 +4413,33 @@ resume_torrents_from_dir() {
         return 1
     fi
 
-    echo ">> 正在扫描 ${TARGET_SCAN_DIR} 下的 .torrent 种子文件..."
-    mapfile -t TORRENT_FILES < <(find "${TARGET_SCAN_DIR}" -maxdepth 2 -name "*.torrent")
+    echo ""
+    rpc_diagnose || true
+    echo ""
+
+    echo ">> 正在扫描 ${TARGET_SCAN_DIR} 下的 .torrent 种子文件 (最多 3 层子目录)..."
+    mapfile -t TORRENT_FILES < <(find "${TARGET_SCAN_DIR}" -maxdepth 3 -type f -name "*.torrent")
 
     if [ ${#TORRENT_FILES[@]} -eq 0 ]; then
-        echo "提示: 在该目录下未找到任何 .torrent 文件。"
+        echo "提示: 在该目录下未找到任何 .torrent 文件，无法按种子重新注入。"
+        echo "   注意: aria2-next 已移除 bt-save-metadata，磁力链任务通常不会再在下载目录留下 .torrent 文件；"
+        echo "         这类未完成任务请改用 本菜单 -> 2『一键继续下载异常停止的任务』(基于 RPC，无需种子文件)。"
         return 0
     fi
 
-    echo ">> 找到 ${#TORRENT_FILES[@]} 个种子文件，正在校验未完成状态并注入 Aria2..."
+    echo ">> 找到 ${#TORRENT_FILES[@]} 个种子文件。"
+
+    declare -a TORRENT_DISPLAY=()
+    local _tor=""
+    for _tor in "${TORRENT_FILES[@]}"; do
+        TORRENT_DISPLAY+=("${_tor#"${TARGET_SCAN_DIR}/"}")
+    done
+    if ! confirm_paged_list TORRENT_FILES "以下种子将被重新注入 Aria2 (先校验后继续下载)" 15 TORRENT_DISPLAY; then
+        echo ">> 已取消注入。"
+        return 0
+    fi
+
+    echo ">> 正在校验未完成状态并注入 Aria2..."
 
     local resumed_count=0
     for tor in "${TORRENT_FILES[@]}"; do
@@ -3713,9 +4481,13 @@ EOF
         
         if echo "$resp" | grep -q '"result"'; then
             echo "   [成功] 任务已载入，已自动在目录 ${TARGET_SCAN_DIR} 开始哈希校验！"
-            ((resumed_count++))
+            resumed_count=$((resumed_count + 1))
         else
-            echo "   [失败] 注入失败，RPC 响应: ${resp}"
+            err_msg=$(printf '%s' "$resp" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p' || true)
+            echo "   [失败] 注入失败: ${err_msg:-$resp}"
+            if [ -z "$resp" ]; then
+                echo "          (无响应: 请确认 Aria2 服务与 RPC 端口正常)"
+            fi
         fi
     done
 
@@ -4093,7 +4865,12 @@ for task, _left in candidates:
         with open(os.path.join(req_dir, gid + ".purge.json"), "w", encoding="utf-8") as fh:
             fh.write(json.dumps({"jsonrpc": "2.0", "id": "purge", "method": "aria2.removeDownloadResult", "params": purge_params}))
         with open(os.path.join(req_dir, gid + ".meta"), "w", encoding="utf-8") as fh:
-            fh.write("%s|%s" % (task_name(task), desc))
+            status_text = STATUS_TEXT.get(task.get("status") or "", task.get("status") or "?")
+            note = (task.get("errorMessage") or "").strip()
+            if (task.get("status") or "") == "removed":
+                note = (note + " " if note else "") + "该任务是被移除的(可能由手动操作或转移脚本触发)"
+            fh.write("\x1f".join([task_name(task), desc, status_text,
+                                   (human(_left) if _left > 0 else "未知"), note]))
     except OSError:
         pass
 
@@ -4109,25 +4886,11 @@ if not candidates:
     sys.exit(0)
 
 print("")
-print(">> 以下任务已停止但并未下载完整，可尝试重新加入下载队列:")
-print("   " + "-" * 76)
-for index, item in enumerate(candidates, start=1):
-    task = item[0]
-    left = item[1]
-    status = STATUS_TEXT.get(task.get("status") or "", task.get("status") or "?")
-    kind = "BT  " if task.get("infoHash") else "HTTP"
-    print("   [%2d] [%s] %s %s" % (index, status, kind, task_name(task)))
-    print("        剩余约 %s / 目录 %s" % (human(left) if left > 0 else "未知", task.get("dir") or "?"))
-    message = (task.get("errorMessage") or "").strip()
-    code = (task.get("errorCode") or "").strip()
-    if message:
-        print("        错误: %s%s" % (message, (" (code %s)" % code) if code else ""))
-    if (task.get("status") or "") == "removed":
-        print("        %s注意: 该任务是被移除的(可能由手动操作或转移脚本触发)%s" % (YELLOW, NC))
-    _gid = task.get("gid") or ""
-    if not _gid or not os.path.isfile(os.path.join(req_dir, _gid + ".add.json")):
-        print("        %s无法自动重试: 缺少种子 / 链接信息%s" % (YELLOW, NC))
-print("   " + "-" * 76)
+print(">> 以下任务已停止但并未下载完整，可尝试重新加入下载队列 (清单较长时会分页展示)。")
+for _gid in [t.get("gid") or "" for t, _left in candidates]:
+    if _gid and not os.path.isfile(os.path.join(req_dir, _gid + ".add.json")):
+        print("   提示: 部分任务缺少种子/链接信息，无法自动重试，详情见下方清单。")
+        break
 
 
 PYEOF
@@ -4135,6 +4898,8 @@ PYEOF
     if [ "$scan_rc" -ne 0 ]; then
         echo ""
         echo ">> [失败] 任务扫描未完成 (请查看上方 Python 报错信息) 或无法连接 Aria2，未做任何变更。"
+        echo "   ---- 连接诊断 ----"
+        rpc_diagnose || true
         rm -rf "${scan_tmp}"
         return 1
     fi
@@ -4152,6 +4917,27 @@ PYEOF
         rm -rf "${scan_tmp}"
         return 0
     fi
+
+    # 分页预览候选清单 (仅查看，不在此处确认)
+    declare -a CAND_DISPLAY=()
+    local _g="" _m="" _n="" _d="" _st="" _lf="" _nt=""
+    for _g in "${CAND_GIDS[@]}"; do
+        _m=""
+        _n=""; _d=""; _st=""; _lf=""; _nt=""
+        [ -f "${scan_tmp}/req/${_g}.meta" ] && _m="$(cat "${scan_tmp}/req/${_g}.meta" 2>/dev/null || true)"
+        if [ -n "$_m" ]; then
+            IFS=$'\x1f' read -r _n _d _st _lf _nt <<< "$_m"
+        fi
+        [ -n "$_n" ] || _n="$_g"
+        [ -n "$_d" ] || _d="未知来源"
+        [ -n "$_lf" ] || _lf="未知"
+        _lf="${_lf#剩余 }"
+        if [ -z "$_m" ]; then
+            _nt="缺少种子/链接信息，无法自动重试"
+        fi
+        CAND_DISPLAY+=("[${_st:-?}] ${_n} — 剩余 ${_lf}${_nt:+ · ${_nt}} (${_d})")
+    done
+    confirm_paged_list CAND_GIDS "异常停止且未下载完整的任务" 15 CAND_DISPLAY view || true
 
     local SELECTION
     read -rp "请输入要重试的任务编号 (空格或逗号分隔；直接回车 = 全部 ${total} 个；输入 0 取消): " SELECTION || true
@@ -4200,16 +4986,15 @@ PYEOF
     echo ""
     echo ">> 正在重新加入任务 (已下载的数据会断点续传保留，不会从头重新下载)..."
     local ok_count=0 fail_count=0
-    local gid meta name desc add_body purge_body resp new_gid err_msg
+    local gid meta name desc tstatus tleft tnote add_body purge_body resp new_gid err_msg
     for gid in "${CHOSEN_GIDS[@]}"; do
         meta="$(cat "${scan_tmp}/req/${gid}.meta" 2>/dev/null || true)"
+        name=""; desc=""; tstatus=""; tleft=""; tnote=""
         if [ -n "$meta" ]; then
-            name="${meta%%|*}"
-            desc="${meta#*|}"
-        else
-            name="$gid"
-            desc="未知来源"
+            IFS=$'\x1f' read -r name desc tstatus tleft tnote <<< "$meta"
         fi
+        [ -n "$name" ] || name="$gid"
+        [ -n "$desc" ] || desc="未知来源"
 
         add_body="${scan_tmp}/req/${gid}.add.json"
         if [ ! -f "${add_body}" ]; then
@@ -4270,6 +5055,8 @@ manage_utils_menu() {
 
         case "$UTIL_CHOICE" in
             1)
+                install_packages findutils coreutils
+                check_cmds find || continue
                 DEFAULT_CLEAN_DIR=$(get_current_download_dir)
                 read -rp "请输入要清理的下载目录路径 [默认: ${DEFAULT_CLEAN_DIR}]: " SCAN_DIR
                 SCAN_DIR="${SCAN_DIR:-$DEFAULT_CLEAN_DIR}"
@@ -4326,15 +5113,12 @@ manage_utils_menu() {
                     continue
                 fi
 
-                echo ""
-                echo ">> 找到以下 ${#SAFE_TO_DELETE[@]} 个已下载完成/无活跃下载任务的种子文件:"
-                for item in "${SAFE_TO_DELETE[@]}"; do
-                    echo "   - $(basename "$item")"
+                declare -a DEL_DISPLAY=()
+                local _it=""
+                for _it in "${SAFE_TO_DELETE[@]}"; do
+                    DEL_DISPLAY+=("${_it#"${SCAN_DIR}/"}")
                 done
-                echo ""
-                read -rp "确认彻底删除这些已完成的种子文件? [Y/n 默认: Y]: " CONFIRM_DEL
-                CONFIRM_DEL="${CONFIRM_DEL:-Y}"
-                if [[ "$CONFIRM_DEL" =~ ^[Yy]$ ]]; then
+                if confirm_paged_list SAFE_TO_DELETE "已下载完成 / 无活跃下载任务的种子文件 (将被删除)" 15 DEL_DISPLAY; then
                     for item in "${SAFE_TO_DELETE[@]}"; do
                         rm -f "$item"
                     done
@@ -4440,21 +5224,35 @@ manage_logs_menu() {
                 if [ ! -f "${LOG_FILE}" ]; then
                     echo "提示: 当前未检测到日志文件: ${LOG_FILE} (可能尚未产生日志或未完成安装)"
                 else
-                    echo ">> 正在输出 aria2.log (按 Ctrl+C 退出跟踪):"
-                    tail -n 50 -f "${LOG_FILE}" || true
+                    local _lt="" _follow=""
+                    _lt=$(mktemp)
+                    tail -n 200 "${LOG_FILE}" > "${_lt}" 2>&1 || true
+                    preview_file_paged "aria2.log 最近 200 行" "${_lt}" 30
+                    rm -f "${_lt}"
+                    read -rp "是否继续实时跟踪日志 (按 Ctrl+C 退出跟踪)? [y/N 默认: N]: " _follow || true
+                    if [[ "${_follow:-N}" =~ ^[Yy]$ ]]; then
+                        echo ">> 正在实时跟踪 ${LOG_FILE} (按 Ctrl+C 退出)..."
+                        tail -n 0 -f "${LOG_FILE}" || true
+                    fi
                 fi
                 ;;
             2)
                 echo ""
-                echo ">> 正在调取 Aria2 服务最近日志 ($(is_docker_mode && echo "容器 ${ARIA2_DOCKER_NAME}" || echo "systemd")):"
+                local _lt2=""
+                _lt2=$(mktemp)
                 if is_docker_mode; then
-                    svc_logs || true
+                    { svc_logs 2>&1 || true; } > "${_lt2}"
+                    preview_file_paged "容器 ${ARIA2_DOCKER_NAME} 最近日志" "${_lt2}" 30
                 else
-                    ${SYSTEMCTL_CMD} status aria2.service --no-pager -l || true
-                    echo ""
-                    echo ">> 正在输出 journalctl 最近 40 行错误信息:"
-                    svc_logs || true
+                    {
+                        ${SYSTEMCTL_CMD} status aria2.service --no-pager -l 2>&1 || true
+                        echo ""
+                        echo ">> journalctl 最近 40 行错误信息:"
+                        svc_logs 2>&1 || true
+                    } > "${_lt2}"
+                    preview_file_paged "Aria2 服务状态与最近日志" "${_lt2}" 30
                 fi
+                rm -f "${_lt2}"
                 ;;
             3)
                 echo ""
@@ -4483,31 +5281,47 @@ manage_logs_menu() {
                 fi
                 ;;
             4)
-                echo ""
-                echo ">> 最近一次 Tracker 更新服务运行记录:"
+                local _lt4=""
+                _lt4=$(mktemp)
                 if [ "$IS_ROOT" = true ]; then
-                    journalctl -u aria2-update-tracker.service -n 30 --no-pager
+                    { journalctl -u aria2-update-tracker.service -n 60 --no-pager 2>&1 || true; } > "${_lt4}"
                 else
-                    journalctl --user -u aria2-update-tracker.service -n 30 --no-pager
+                    { journalctl --user -u aria2-update-tracker.service -n 60 --no-pager 2>&1 || true; } > "${_lt4}"
                 fi
+                preview_file_paged "Tracker 更新服务最近记录" "${_lt4}" 30
+                rm -f "${_lt4}"
                 ;;
             5)
-                echo ""
-                echo ">> 最近一次吸血 Peer 防火墙更新记录:"
-                ${SUDO_CMD} journalctl -u aria2-peer-blocker.service -n 30 --no-pager 2>/dev/null || echo "尚未配置或未运行该服务"
+                local _lt5=""
+                _lt5=$(mktemp)
+                { ${SUDO_CMD} journalctl -u aria2-peer-blocker.service -n 60 --no-pager 2>/dev/null || echo "尚未配置或未运行该服务"; } > "${_lt5}"
+                preview_file_paged "吸血 Peer 防火墙更新记录" "${_lt5}" 30
+                rm -f "${_lt5}"
                 ;;
             6)
-                echo ""
-                echo ">> 最近一次 Caddy 服务日志:"
-                ${SUDO_CMD} journalctl -u caddy -n 30 --no-pager 2>/dev/null || echo "尚未安装 Caddy 服务"
+                local _lt6=""
+                _lt6=$(mktemp)
+                { ${SUDO_CMD} journalctl -u caddy -n 60 --no-pager 2>/dev/null || echo "尚未安装 Caddy 服务"; } > "${_lt6}"
+                preview_file_paged "Caddy 服务日志" "${_lt6}" 30
+                rm -f "${_lt6}"
                 ;;
             7)
-                echo ""
-                echo ">> BT 自动筛选守护进程日志:"
+                local _lt7="" _follow7=""
+                _lt7=$(mktemp)
                 if [ "$IS_ROOT" = true ]; then
-                    journalctl -u aria2-filter.service -n 40 -f
+                    { journalctl -u aria2-filter.service -n 40 --no-pager 2>&1 || true; } > "${_lt7}"
                 else
-                    journalctl --user -u aria2-filter.service -n 40 -f
+                    { journalctl --user -u aria2-filter.service -n 40 --no-pager 2>&1 || true; } > "${_lt7}"
+                fi
+                preview_file_paged "BT 自动筛选守护进程日志" "${_lt7}" 30
+                rm -f "${_lt7}"
+                read -rp "是否继续实时跟踪该日志 (按 Ctrl+C 退出跟踪)? [y/N 默认: N]: " _follow7 || true
+                if [[ "${_follow7:-N}" =~ ^[Yy]$ ]]; then
+                    if [ "$IS_ROOT" = true ]; then
+                        journalctl -u aria2-filter.service -n 0 -f
+                    else
+                        journalctl --user -u aria2-filter.service -n 0 -f
+                    fi
                 fi
                 ;;
             0)
@@ -4756,11 +5570,23 @@ EOF
             echo ">> 自动筛选服务已关闭。"
             ;;
         3)
-            echo ">> 正在调取筛选守护进程实时日志 (按 Ctrl+C 退出):"
+            local _fv="" _follow_fv=""
+            _fv=$(mktemp)
             if [ "$IS_ROOT" = true ]; then
-                journalctl -u aria2-filter.service -n 40 -f
+                { journalctl -u aria2-filter.service -n 60 --no-pager 2>&1 || true; } > "${_fv}"
             else
-                journalctl --user -u aria2-filter.service -n 40 -f
+                { journalctl --user -u aria2-filter.service -n 60 --no-pager 2>&1 || true; } > "${_fv}"
+            fi
+            preview_file_paged "BT 自动筛选守护进程日志" "${_fv}" 30
+            rm -f "${_fv}"
+            read -rp "是否继续实时跟踪日志 (按 Ctrl+C 退出跟踪)? [y/N 默认: N]: " _follow_fv || true
+            if [[ "${_follow_fv:-N}" =~ ^[Yy]$ ]]; then
+                echo ">> 正在实时跟踪 (按 Ctrl+C 退出)..."
+                if [ "$IS_ROOT" = true ]; then
+                    journalctl -u aria2-filter.service -n 0 -f
+                else
+                    journalctl --user -u aria2-filter.service -n 0 -f
+                fi
             fi
             ;;
         0)
@@ -4780,6 +5606,8 @@ clean_small_files_menu() {
     echo "=========================================="
 
     local DEF_CLEAN_DIR
+    install_packages findutils coreutils
+    check_cmds find stat || return 1
     DEF_CLEAN_DIR=$(get_current_download_dir)
 
     read -rp "请输入要扫描清理的目录路径 [默认: ${DEF_CLEAN_DIR}]: " TARGET_DIR
@@ -4862,43 +5690,8 @@ clean_small_files_menu() {
     echo ""
     echo ">> 扫描完成！共找到 ${FILE_COUNT} 个符合条件的文件 (总计约 ${TOTAL_HUMAN} MB)。"
 
-    if [ "$FILE_COUNT" -gt 20 ]; then
-        read -rp "匹配到的文件较多 (${FILE_COUNT} 个)，是否翻页查看清单? [y/N 默认: N]: " VIEW_PAGER
-        VIEW_PAGER="${VIEW_PAGER:-N}"
-        if [[ "$VIEW_PAGER" =~ ^[Yy]$ ]]; then
-            local page_size=20
-            local current_idx=0
-            while [ $current_idx -lt "$FILE_COUNT" ]; do
-                clear || true
-                echo "=== 待清理文件清单 (第 $((current_idx / page_size + 1)) 页 / 共 $(((FILE_COUNT + page_size - 1) / page_size)) 页) ==="
-                for ((i=current_idx; i<current_idx+page_size && i<FILE_COUNT; i++)); do
-                    echo " [$((i+1))] ${FILES_TO_DELETE[$i]}"
-                done
-                echo "--------------------------------------------------"
-                current_idx=$((current_idx + page_size))
-                if [ $current_idx -lt "$FILE_COUNT" ]; then
-                    read -rp "按 [Enter] 查看下一页，或输入 [q] 退出预览: " PAGER_ACTION
-                    if [[ "$PAGER_ACTION" =~ ^[Qq]$ ]]; then
-                        break
-                    fi
-                else
-                    read -rp "已浏览全部文件，按 [Enter] 继续..." _
-                fi
-            done
-        fi
-    else
-        echo "---------------- 待清理文件列表 ------------------"
-        for ((i=0; i<FILE_COUNT; i++)); do
-            echo " [$((i+1))] ${FILES_TO_DELETE[$i]}"
-        done
-        echo "--------------------------------------------------"
-    fi
-
-    echo ""
-    read -rp "确认彻底删除以上 ${FILE_COUNT} 个严格小于 ${SIZE_MB}MB (${SIZE_BYTES} 字节) 的文件以释放空间? [y/N 默认: N]: " CONFIRM_DEL
-    CONFIRM_DEL="${CONFIRM_DEL:-N}"
-
-    if [[ ! "$CONFIRM_DEL" =~ ^[Yy]$ ]]; then
+    # 统一用可翻页清单预览并确认 (条目本身即绝对路径)
+    if ! confirm_paged_list FILES_TO_DELETE "严格小于 ${SIZE_MB}MB (${SIZE_BYTES} 字节) 的文件 (将被删除)" 15 ""; then
         echo ">> 操作已取消，未删除任何文件。"
         return 0
     fi
