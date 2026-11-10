@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # ===========================================================================
-#  FileBrowser Quantum 管理脚本 (基于开源项目 gtsteffaniak/filebrowser)
-#  功能: 安装/更新、配置(全局设置 + 源目录增删改)、账号管理、停用/启用、
-#        状态查看、卸载
+#  FileBrowser Quantum 管理脚本 (适配 v2.0.0+ / gtsteffaniak/filebrowser)
+#  功能: 安装/更新、v1->v2自动迁移、配置(全局设置 + 源目录增删改)、
+#        账号管理、停用/启用、状态查看、卸载
 #  项目地址: https://github.com/gtsteffaniak/filebrowser
 #  官方文档: https://filebrowserquantum.com
 # ===========================================================================
@@ -23,7 +23,6 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 # ---------------------------- 环境模式与路径判定 ----------------------------
-# 当前执行用户（精简环境下可能不存在 USER 变量）
 CURRENT_USER="${USER:-$(id -un 2>/dev/null || printf 'user')}"
 
 if [[ $EUID -eq 0 ]]; then
@@ -63,6 +62,10 @@ SETTINGS_FILE="${CONF_DIR}/settings.conf"
 SOURCES_FILE="${CONF_DIR}/sources.conf"
 SERVICE_FILE="${SYSTEMD_DIR}/${SERVICE_NAME}.service"
 
+DEFAULT_DB_PATH="${WORK_DIR}/filebrowser.sqlite"
+LEGACY_DB_PATH="${WORK_DIR}/database.db"
+LEGACY_DB_OLD="${WORK_DIR}/database.db.old"
+
 RUN_MODE_TEXT="$([ "$IS_ROOT" = true ] && echo "Root (系统级服务)" || echo "普通用户 ${CURRENT_USER} (用户级服务)")"
 
 # 本脚本通过 systemd 托管服务
@@ -78,7 +81,6 @@ fi
 #                              通用交互辅助
 # ===========================================================================
 
-# 读取一行输入（失败即退出，避免 EOF 造成死循环），用法: prompt "提示" 变量名
 prompt() {
     local __text="$1" __var="$2" __val=""
     if ! read -rp "$__text" __val; then
@@ -89,7 +91,6 @@ prompt() {
     printf -v "$__var" '%s' "$__val"
 }
 
-# 读取密码（不回显），用法: prompt_secret "提示" 变量名
 prompt_secret() {
     local __text="$1" __var="$2" __val=""
     if ! read -rsp "$__text" __val; then
@@ -101,7 +102,6 @@ prompt_secret() {
     printf -v "$__var" '%s' "$__val"
 }
 
-# 暂停并等待用户回车
 pause_menu() {
     local __dummy=""
     read -rp "按回车键返回菜单..." __dummy || exit 0
@@ -123,7 +123,6 @@ download_file() {
     fi
 }
 
-# YAML 双引号转义
 yaml_quote() {
     local s="$1"
     s="${s//\\/\\\\}"
@@ -131,7 +130,6 @@ yaml_quote() {
     printf '"%s"' "$s"
 }
 
-# 将用户输入转换为 YAML 布尔值
 yaml_bool() {
     case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
         1|true|yes|on|y) printf 'true\n' ;;
@@ -139,7 +137,6 @@ yaml_bool() {
     esac
 }
 
-# 文件大小（字节）
 file_size() {
     local f="$1"
     if stat -c%s "$f" >/dev/null 2>&1; then
@@ -149,7 +146,6 @@ file_size() {
     fi
 }
 
-# 探测 HTTP 状态码，失败输出 000
 http_status() {
     local url="$1" code=""
     if command_exists curl; then
@@ -177,7 +173,6 @@ is_service_enabled() {
     $SYSTEMCTL_CMD is-enabled --quiet "${SERVICE_NAME}.service" 2>/dev/null
 }
 
-# 已安装的二进制版本号，未安装或读取失败时返回非 0
 installed_version() {
     is_installed || return 1
     local out=""
@@ -197,7 +192,6 @@ installed_version_text() {
     fi
 }
 
-# 运行状态（带颜色）
 service_state_text() {
     if ! is_installed; then
         printf '%b' "${YELLOW}未安装${NC}"
@@ -208,7 +202,6 @@ service_state_text() {
     fi
 }
 
-# 开机自启状态（带颜色）
 service_boot_text() {
     if ! is_installed; then
         printf '%b' "${YELLOW}未安装${NC}"
@@ -219,7 +212,6 @@ service_boot_text() {
     fi
 }
 
-# 检测端口是否已处于监听状态（无法检测时视为成功）
 check_port_listening() {
     local port="$1"
     [[ -n "$port" ]] || return 0
@@ -237,17 +229,29 @@ check_port_listening() {
     return 0
 }
 
-# 检查 HTTP 服务是否可访问
 check_http_service() {
-    local port="$1" base="$2" code=""
+    local port="$1" base="$2" code="" proto="http"
     [[ -n "$port" ]] || return 0
-    code=$(http_status "http://127.0.0.1:${port}${base}")
+    if [[ "$(yaml_bool "$(get_setting tls false)")" == "true" ]]; then
+        proto="https"
+    fi
+    code=$(http_status "${proto}://127.0.0.1:${port}${base}")
     if [[ "$code" =~ ^(200|30[0-9]|40[0-9])$ ]]; then
-        echo -e "${GREEN}[✓] HTTP 自检通过 (状态码 ${code})${NC}"
+        echo -e "${GREEN}[✓] HTTP(S) 自检通过 (状态码 ${code})${NC}"
         return 0
     fi
-    echo -e "${YELLOW}[!] HTTP 自检异常 (状态码 ${code})，请查看日志排查。${NC}"
+    echo -e "${YELLOW}[!] HTTP(S) 自检异常 (状态码 ${code})，请查看日志排查。${NC}"
     return 1
+}
+
+# 从日志中提取 v2.0+ 自动生成的初始随机密码
+extract_bootstrap_password() {
+    command_exists journalctl || return 1
+    local pass=""
+    pass=$($JOURNALCTL_CMD --no-pager -n 50 -u "${SERVICE_NAME}.service" 2>/dev/null \
+        | grep -oE '[a-z]+-[a-z0-9]{5}-[a-z0-9]{2}' | tail -n 1) || true
+    [[ -n "$pass" ]] || return 1
+    printf '%s' "$pass"
 }
 
 # ===========================================================================
@@ -287,7 +291,6 @@ set_setting() {
     fi
 }
 
-# 配置是否已初始化
 config_exists() {
     [[ -f "$SETTINGS_FILE" ]]
 }
@@ -319,21 +322,18 @@ parse_source_line() {
     SRC_ENABLED="${rest#*|}"
 }
 
-# 源名称是否已存在
 source_exists() {
     local name="$1"
     [[ -f "$SOURCES_FILE" ]] || return 1
     awk -F'|' -v n="$name" '$1 == n { found = 1 } END { exit found ? 0 : 1 }' "$SOURCES_FILE"
 }
 
-# 路径是否已被添加
 source_path_exists() {
     local path="$1"
     [[ -f "$SOURCES_FILE" ]] || return 1
     awk -F'|' -v p="$path" '$2 == p { found = 1 } END { exit found ? 0 : 1 }' "$SOURCES_FILE"
 }
 
-# 按行号（从 1 开始）替换源记录
 update_source_line() {
     local idx="$1" newline="$2" tmp=""
     tmp=$(mktemp)
@@ -348,7 +348,6 @@ update_source_line() {
     fi
 }
 
-# 按行号（从 1 开始）删除源记录
 delete_source_line() {
     local idx="$1" tmp=""
     tmp=$(mktemp)
@@ -360,7 +359,6 @@ delete_source_line() {
     fi
 }
 
-# 列出所有源目录（带颜色与编号）
 list_sources_detail() {
     local line="" i=0 flags=""
     if [[ "$(sources_count)" -eq 0 ]]; then
@@ -372,12 +370,15 @@ list_sources_detail() {
         [[ -z "$line" ]] && continue
         i=$((i + 1))
         parse_source_line "$line"
-        flags=""
-        [[ "$SRC_READONLY" == "true" ]] && flags="${CYAN}只读${NC}"
-        if [[ "$SRC_ENABLED" == "true" ]]; then
-            flags="${flags:+${flags} / }${GREEN}新用户默认可见${NC}"
+        if [[ "$SRC_READONLY" == "true" ]]; then
+            flags="${CYAN}默认只读${NC}"
         else
-            flags="${flags:+${flags} / }${YELLOW}新用户默认不可见${NC}"
+            flags="${GREEN}默认可读写${NC}"
+        fi
+        if [[ "$SRC_ENABLED" == "true" ]]; then
+            flags="${flags} / ${GREEN}新用户默认可见${NC}"
+        else
+            flags="${flags} / ${YELLOW}新用户默认不可见${NC}"
         fi
         echo -e " [${CYAN}${i}${NC}] 名称: ${GREEN}${SRC_NAME}${NC}    属性: ${flags}"
         echo -e "      路径: ${SRC_PATH}"
@@ -391,7 +392,6 @@ list_sources_detail() {
     return 0
 }
 
-# 交互选择源编号，结果写入 SELECTED_SOURCE_INDEX
 SELECTED_SOURCE_INDEX=0
 select_source_index() {
     list_sources_detail || return 1
@@ -409,7 +409,6 @@ select_source_index() {
     return 0
 }
 
-# 校验源名称与路径，结果写入 SRC_NAME / SRC_PATH
 ask_source_name_path() {
     local default_name="$1" default_path="$2" input=""
     while true; do
@@ -422,6 +421,9 @@ ask_source_name_path() {
         if [[ "$SRC_PATH" != /* ]]; then
             echo -e "${RED}请填写绝对路径 (以 / 开头)。${NC}"
             continue
+        fi
+        if [[ "$SRC_PATH" == "/" || "$SRC_PATH" == "/var" || "$SRC_PATH" == /var/* ]]; then
+            echo -e "${YELLOW}警告: 官方文档不建议直接使用根目录 / 或 /var 目录作为源！${NC}"
         fi
         break
     done
@@ -438,7 +440,7 @@ ask_source_name_path() {
 }
 
 # ===========================================================================
-#                        生成 config.yaml 配置文件
+#                    生成 config.yaml 配置文件 (v2.0.0+ 规范)
 # ===========================================================================
 
 render_config() {
@@ -447,43 +449,80 @@ render_config() {
         cp -f "$CONFIG_FILE" "${CONFIG_FILE}.bak" 2>/dev/null || true
     fi
 
-    local listen="" port="" base_url="" database="" cache_dir="" site_name="" log_levels="" ffmpeg_path=""
-    local cert="" key="" y_tls="" y_update_check=""
+    local listen="" port="" base_url="" database="" migrate_from="" cache_dir=""
+    local site_name="" log_levels="" ffmpeg_path="" admin_user=""
+    local cert="" key="" y_tls="" y_update_check="" y_trust_proxy=""
 
     listen=$(get_setting listen "0.0.0.0")
     port=$(get_setting port "8080")
     base_url=$(get_setting baseURL "/")
-    database=$(get_setting database "${WORK_DIR}/database.db")
+    database=$(get_setting database "$DEFAULT_DB_PATH")
+    migrate_from=$(get_setting migrateFrom "")
     cache_dir=$(get_setting cacheDir "${WORK_DIR}/cache")
     site_name=$(get_setting siteName "FileBrowser Quantum")
     log_levels=$(get_setting logLevels "info|warning|error")
     ffmpeg_path=$(get_setting ffmpegPath "")
+    admin_user=$(get_setting adminUsername "admin")
     cert=$(get_setting tlsCert "${WORK_DIR}/cert.pem")
     key=$(get_setting tlsKey "${WORK_DIR}/key.pem")
     y_tls=$(yaml_bool "$(get_setting tls false)")
     y_update_check=$(yaml_bool "$(get_setting disableUpdateCheck false)")
+    y_trust_proxy=$(yaml_bool "$(get_setting trustProxyHeaders false)")
+
+    # 防呆保护: v2.0.0 严禁数据库文件名为 database.db
+    if [[ "$(basename "$database")" == "database.db" ]]; then
+        database="$DEFAULT_DB_PATH"
+        set_setting database "$database"
+    fi
+
+    # 若工作目录仍遗留未重命名的旧版 BoltDB (database.db)，必须移走，否则 v2 拒绝启动
+    if [[ -f "$LEGACY_DB_PATH" ]]; then
+        if [[ ! -f "$LEGACY_DB_OLD" ]]; then
+            mv -f "$LEGACY_DB_PATH" "$LEGACY_DB_OLD" 2>/dev/null || true
+            echo -e "${YELLOW}[!] 检测到旧版 BoltDB (database.db)，已重命名为 ${LEGACY_DB_OLD}${NC}"
+        else
+            mv -f "$LEGACY_DB_PATH" "${LEGACY_DB_PATH}.bak.$(date +%s)" 2>/dev/null || true
+        fi
+    fi
+
+    # 当新 SQLite 尚未生成且存在旧版 database.db.old 时，自动挂载 migrateFrom
+    if [[ -z "$migrate_from" && ! -s "$database" && -s "$LEGACY_DB_OLD" ]]; then
+        migrate_from="$LEGACY_DB_OLD"
+    fi
+    # 若新 SQLite 已经成功生成并有数据，且旧库文件不存在时清除失效的 migrateFrom
+    if [[ -n "$migrate_from" && ! -f "$migrate_from" ]]; then
+        migrate_from=""
+        set_setting migrateFrom ""
+    fi
 
     mkdir -p "$cache_dir" 2>/dev/null || true
     mkdir -p "$(dirname "$database")" 2>/dev/null || true
 
     {
         echo "# ==============================================================="
-        echo "# FileBrowser Quantum 配置文件"
+        echo "# FileBrowser Quantum 配置文件 (v2.0.0+ 标准格式)"
         echo "# 由 filebrowser_manager.sh 于 $(date '+%Y-%m-%d %H:%M:%S') 自动生成"
         echo "# 手工修改的内容可能在下次执行管理脚本时被覆盖"
         echo "# 文档: https://filebrowserquantum.com"
         echo "# ==============================================================="
-        echo "server:"
+        echo "http:"
         echo "  listen: $(yaml_quote "$listen")"
         echo "  port: ${port}"
         echo "  baseURL: $(yaml_quote "$base_url")"
-        echo "  database: $(yaml_quote "$database")"
-        echo "  cacheDir: $(yaml_quote "$cache_dir")"
-        echo "  disableUpdateCheck: ${y_update_check}"
+        echo "  trustProxyHeaders: ${y_trust_proxy}"
         if [[ "$y_tls" == "true" ]]; then
             echo "  tlsCert: $(yaml_quote "$cert")"
             echo "  tlsKey: $(yaml_quote "$key")"
         fi
+        echo ""
+        echo "server:"
+        echo "  database:"
+        echo "    path: $(yaml_quote "$database")"
+        if [[ -n "$migrate_from" && -f "$migrate_from" ]]; then
+            echo "    migrateFrom: $(yaml_quote "$migrate_from")"
+        fi
+        echo "  cacheDir: $(yaml_quote "$cache_dir")"
+        echo "  disableUpdateCheck: ${y_update_check}"
         echo "  logging:"
         echo "    - levels: $(yaml_quote "$log_levels")"
         echo "      output: \"stdout\""
@@ -498,24 +537,36 @@ render_config() {
                 echo "    - name: $(yaml_quote "$SRC_NAME")"
                 echo "      path: $(yaml_quote "$SRC_PATH")"
                 echo "      config:"
-                if [[ "$SRC_READONLY" == "true" ]]; then
-                    echo "        readOnly: true"
-                fi
                 if [[ "$SRC_ENABLED" == "true" ]]; then
                     echo "        defaultEnabled: true"
+                else
+                    echo "        defaultEnabled: false"
                 fi
-                if [[ "$SRC_READONLY" != "true" && "$SRC_ENABLED" != "true" ]]; then
-                    echo "        denyByDefault: false"
+                echo "        defaultPermissions:"
+                echo "          view: true"
+                echo "          download: true"
+                if [[ "$SRC_READONLY" == "true" ]]; then
+                    echo "          modify: false"
+                    echo "          create: false"
+                    echo "          delete: false"
+                else
+                    echo "          modify: true"
+                    echo "          create: true"
+                    echo "          delete: true"
                 fi
             done < "$SOURCES_FILE"
         fi
+        echo ""
         echo "auth:"
+        echo "  adminUsername: $(yaml_quote "$admin_user")"
         echo "  methods:"
         echo "    password:"
         echo "      enabled: true"
+        echo ""
         echo "frontend:"
         echo "  name: $(yaml_quote "$site_name")"
         if [[ -n "$ffmpeg_path" ]]; then
+            echo ""
             echo "integrations:"
             echo "  media:"
             echo "    ffmpegPath: $(yaml_quote "$ffmpeg_path")"
@@ -524,11 +575,10 @@ render_config() {
         fi
     } > "$CONFIG_FILE"
 
-    echo -e "${GREEN}[✓] 配置文件已生成: ${CONFIG_FILE}${NC}"
+    echo -e "${GREEN}[✓] 配置文件已生成 (v2.0.0+ 格式): ${CONFIG_FILE}${NC}"
     warn_if_no_source
 }
 
-# 重启服务使配置生效（服务未安装时静默跳过）
 restart_service_if_possible() {
     if ! is_installed || [[ ! -f "$SERVICE_FILE" ]]; then
         return 0
@@ -542,7 +592,6 @@ restart_service_if_possible() {
     return 0
 }
 
-# 配置变更后询问是否重启服务
 ask_restart_service() {
     if ! is_installed || [[ ! -f "$SERVICE_FILE" ]]; then
         return 0
@@ -556,7 +605,6 @@ ask_restart_service() {
     restart_service_if_possible || true
 }
 
-# 提示没有源目录的风险
 warn_if_no_source() {
     if [[ "$(sources_count)" -eq 0 ]]; then
         echo -e "${RED}警告: 当前没有任何源目录，FileBrowser 将无法启动！${NC}"
@@ -567,7 +615,6 @@ warn_if_no_source() {
 #                          平台识别与版本查询
 # ===========================================================================
 
-# 输出形如 linux-amd64 / linux-armv7 的产物标识
 detect_platform() {
     local os="" arch=""
     os=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -584,15 +631,15 @@ detect_platform() {
         aarch64|arm64)           arch="arm64" ;;
         armv6*)                  arch="armv6" ;;
         armv7*|armv8l)           arch="armv7" ;;
+        riscv64)                 arch="riscv64" ;;
         *)
             echo -e "${RED}[-] 无法识别 CPU 架构: $(uname -m)${NC}" >&2
             return 1
             ;;
     esac
 
-    # 官方仅提供以下平台产物
     case "${os}-${arch}" in
-        linux-amd64|linux-arm64|linux-armv6|linux-armv7|darwin-amd64|darwin-arm64) ;;
+        linux-amd64|linux-arm64|linux-armv6|linux-armv7|linux-riscv64|darwin-amd64|darwin-arm64) ;;
         *)
             echo -e "${RED}[-] 官方未提供 ${os}-${arch} 的二进制产物，请参考官方文档手动部署。${NC}" >&2
             return 1
@@ -602,27 +649,21 @@ detect_platform() {
     printf '%s-%s' "$os" "$arch"
 }
 
-# 查询最新 Release 标签，失败返回非 0
-# 注意: 下载代理通常只代理 github.com / raw.githubusercontent.com，
-#      不代理 api.github.com，因此优先从 releases 页面重定向中解析版本号。
 fetch_latest_tag() {
     local tag="" effective="" \
         page_url="https://github.com/${GITHUB_REPO}/releases/latest" \
         api_url="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
 
-    # 1) 经代理访问 releases/latest，从重定向后的地址中提取标签
     effective=$(curl -sIL --connect-timeout 10 -m 30 -o /dev/null -w '%{url_effective}' \
         "${DOWNLOAD_PROXY}${page_url}" 2>/dev/null) || effective=""
     tag=$(printf '%s' "$effective" | sed -nE 's#.*/releases/tag/([^/?#]+).*#\1#p')
 
-    # 2) 直连 GitHub API
     if [[ -z "$tag" ]]; then
         tag=$(curl -fsSL --connect-timeout 10 -m 30 "$api_url" 2>/dev/null \
             | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' \
             | sed -nE 's/.*"([^"]*)"$/\1/p;q') || tag=""
     fi
 
-    # 3) 直连 releases 页面
     if [[ -z "$tag" ]]; then
         effective=$(curl -sIL --connect-timeout 10 -m 30 -o /dev/null -w '%{url_effective}' \
             "$page_url" 2>/dev/null) || effective=""
@@ -669,7 +710,7 @@ install_ffmpeg() {
             fedora)
                 $SUDO_CMD dnf install -y ffmpeg
                 ;;
-            arch|manjaro)
+            arch|manjaro|cachyos)
                 $SUDO_CMD pacman -Sy --noconfirm ffmpeg
                 ;;
             alpine)
@@ -706,7 +747,7 @@ download_and_install_binary() {
     archive_url="${DOWNLOAD_PROXY}https://github.com/${GITHUB_REPO}/releases/latest/download/${platform}-filebrowser"
     direct_url="https://github.com/${GITHUB_REPO}/releases/latest/download/${platform}-filebrowser"
 
-    echo "[*] 正在下载 ${platform} 二进制 (约 25MB，经代理: ${DOWNLOAD_PROXY})..."
+    echo "[*] 正在下载 ${platform} 二进制 (经代理: ${DOWNLOAD_PROXY})..."
     if ! download_file "$archive_url" "$tmp"; then
         echo -e "${YELLOW}[!] 代理下载失败，尝试直连 GitHub...${NC}"
         rm -f "$tmp"
@@ -718,7 +759,6 @@ download_and_install_binary() {
         fi
     fi
 
-    # 代理异常时可能返回 HTML 错误页，这里做基本校验
     size=$(file_size "$tmp")
     if [[ -z "$size" || "$size" -lt 1000000 ]]; then
         echo -e "${RED}[-] 下载内容异常 (大小 ${size} 字节)，安装包可能无效。${NC}"
@@ -740,7 +780,7 @@ initial_config_wizard() {
     echo "------------------------------------------"
     echo "工作目录: ${WORK_DIR}"
 
-    local listen="" port="" base_url="" src_path="" site_name="" enable_ff=""
+    local listen="" port="" base_url="" site_name="" trust_proxy="" enable_ff=""
     prompt "监听地址 [默认: 0.0.0.0]: " listen
     listen="${listen:-0.0.0.0}"
 
@@ -756,6 +796,8 @@ initial_config_wizard() {
     prompt "URL 前缀 (反代子路径时填写，如 /files) [默认: /]: " base_url
     base_url="${base_url:-/}"
 
+    prompt "是否运行在反向代理后端 (开启 trustProxyHeaders)? [y/N 默认: N]: " trust_proxy
+
     prompt "站点名称 (浏览器标题/PWA 名称) [默认: FileBrowser Quantum]: " site_name
     site_name="${site_name:-FileBrowser Quantum}"
 
@@ -763,7 +805,9 @@ initial_config_wizard() {
     set_setting port "$port"
     set_setting baseURL "$base_url"
     set_setting siteName "$site_name"
-    set_setting database "$(get_setting database "${WORK_DIR}/database.db")"
+    set_setting trustProxyHeaders "$(yaml_bool "${trust_proxy:-false}")"
+    set_setting adminUsername "$(get_setting adminUsername "admin")"
+    set_setting database "$(get_setting database "$DEFAULT_DB_PATH")"
     set_setting cacheDir "$(get_setting cacheDir "${WORK_DIR}/cache")"
     set_setting logLevels "$(get_setting logLevels "info|warning|error")"
     set_setting disableUpdateCheck "$(get_setting disableUpdateCheck false)"
@@ -780,7 +824,7 @@ initial_config_wizard() {
     if [[ "$(sources_count)" -eq 0 ]]; then
         ask_source_name_path "$(basename "${DEFAULT_DATA_DIR%/}")" "$DEFAULT_DATA_DIR"
         local ro="" en=""
-        prompt "该源是否只读 (不允许修改/上传)? [y/N 默认: N]: " ro
+        prompt "该源默认是否只读 (新用户无上传/修改/删除权限)? [y/N 默认: N]: " ro
         prompt "新用户默认是否可见该源? [Y/n 默认: Y]: " en
         local src_ro="false" src_en="true"
         [[ "$ro" =~ ^[Yy]$ ]] && src_ro="true"
@@ -866,6 +910,10 @@ install_or_update_filebrowser() {
     echo "[1/4] 准备目录与二进制程序..."
     mkdir -p "$WORK_DIR" "$CONF_DIR"
     if [[ "$need_download" == true ]]; then
+        if is_service_active; then
+            echo "[*] 停止运行中的服务以更新二进制文件..."
+            $SYSTEMCTL_CMD stop "${SERVICE_NAME}.service" 2>/dev/null || true
+        fi
         download_and_install_binary "$platform" || return 1
     elif [[ "$skip_download" == true ]]; then
         echo "[-] 保留现有二进制: ${BIN_PATH}"
@@ -905,11 +953,8 @@ install_or_update_filebrowser() {
     if ! $SYSTEMCTL_CMD enable "${SERVICE_NAME}.service" 2>/dev/null; then
         echo -e "${YELLOW}[!] 设置开机自启失败，请检查 systemd 环境。${NC}"
     fi
-    if ! $SYSTEMCTL_CMD start "${SERVICE_NAME}.service" 2>/dev/null; then
-        $SYSTEMCTL_CMD restart "${SERVICE_NAME}.service" 2>/dev/null || true
-    fi
+    $SYSTEMCTL_CMD restart "${SERVICE_NAME}.service" 2>/dev/null || true
 
-    # 普通用户需要常驻会话支持，否则退出 SSH 后服务会被终止
     if [[ "$IS_ROOT" == false ]] && command_exists loginctl; then
         echo "提示: 启用用户常驻进程 (Linger)，保证退出 SSH 后服务继续运行..."
         loginctl enable-linger "$CURRENT_USER" 2>/dev/null \
@@ -917,9 +962,24 @@ install_or_update_filebrowser() {
     fi
 
     sleep 2
-    local port="" base_url=""
+
+    # 若触发了 v1 -> v2 数据库自动迁移，待新库生成后自动清理 migrateFrom
+    local db_file="" mig_file=""
+    db_file=$(get_setting database "$DEFAULT_DB_PATH")
+    mig_file=$(get_setting migrateFrom "")
+    if [[ -n "$mig_file" && -s "$db_file" ]] && is_service_active; then
+        echo -e "${GREEN}[✓] 检测到 SQLite 数据库已生成 (${db_file})，正在移除一次性 migrateFrom 配置...${NC}"
+        set_setting migrateFrom ""
+        render_config >/dev/null
+        $SYSTEMCTL_CMD restart "${SERVICE_NAME}.service" 2>/dev/null || true
+        sleep 1
+    fi
+
+    local port="" base_url="" admin_user="" boot_pass=""
     port=$(get_setting port "8080")
     base_url=$(get_setting baseURL "/")
+    admin_user=$(get_setting adminUsername "admin")
+
     echo ""
     echo "=========================================="
     echo -e "       ${GREEN}FileBrowser 安装/更新完成！${NC}"
@@ -934,7 +994,7 @@ install_or_update_filebrowser() {
 
     echo " 可执行文件: ${BIN_PATH}"
     echo " 配置文件:   ${CONFIG_FILE}"
-    echo " 数据目录:   ${WORK_DIR} (conf/ 配置 + 数据库 + 缓存)"
+    echo " 数据库文件: ${db_file}"
     echo " 访问地址:   http://<服务器IP>:${port}${base_url}"
     local i=0 line=""
     while IFS= read -r line; do
@@ -943,7 +1003,14 @@ install_or_update_filebrowser() {
         parse_source_line "$line"
         echo " 源目录 ${i}:   ${SRC_NAME} -> ${SRC_PATH}"
     done < "$SOURCES_FILE"
-    echo -e " 初始账号:   ${YELLOW}admin / admin${NC} (首次启动自动创建，请登录后立即修改)"
+
+    if boot_pass=$(extract_bootstrap_password); then
+        echo -e " 初始账号:   ${YELLOW}${admin_user}${NC}"
+        echo -e " 初始密码:   ${YELLOW}${boot_pass}${NC} (从启动日志提取，首次登录需修改)"
+    else
+        echo -e " 管理员账号: ${YELLOW}${admin_user}${NC} (若忘记密码可在主菜单 [5. 账号管理] 中直接重置)"
+    fi
+
     echo " 管理命令:"
     if [[ "$IS_ROOT" == true ]]; then
         echo "   查看状态: systemctl status ${SERVICE_NAME}"
@@ -972,6 +1039,26 @@ edit_setting() {
     return 0
 }
 
+edit_database_setting() {
+    local current="" input=""
+    current=$(get_setting database "$DEFAULT_DB_PATH")
+    while true; do
+        prompt "SQLite 数据库文件路径 (.sqlite) [当前: ${current}] (留空保持不变): " input
+        if [[ -z "$input" ]]; then
+            echo -e "${YELLOW}[-] 未修改。${NC}"
+            return 1
+        fi
+        if [[ "$(basename "$input")" == "database.db" ]]; then
+            echo -e "${RED}错误: v2.0.0 禁止将数据库命名为 database.db，请使用 filebrowser.sqlite 等名称。${NC}"
+            continue
+        fi
+        break
+    done
+    set_setting database "$input"
+    echo -e "${GREEN}[✓] 已更新 database = ${input}${NC}"
+    return 0
+}
+
 edit_port_setting() {
     local current="" input=""
     current=$(get_setting port "8080")
@@ -991,7 +1078,6 @@ edit_port_setting() {
     return 0
 }
 
-# 交互切换某个布尔配置项（留空保持不变）
 toggle_setting() {
     local key="$1" desc="$2" current="" input=""
     current=$(yaml_bool "$(get_setting "$key" false)")
@@ -1050,7 +1136,7 @@ show_config_file() {
     echo "------------------------------------------"
     cat "$CONFIG_FILE"
     echo "------------------------------------------"
-    echo "备注: 账号与权限信息保存在数据库 ${WORK_DIR} 中，不在本文件内。"
+    echo "备注: 账号与权限信息保存在 SQLite 数据库 $(get_setting database "$DEFAULT_DB_PATH") 中。"
     return 0
 }
 
@@ -1064,37 +1150,39 @@ configure_filebrowser() {
     while true; do
         echo ""
         echo "=========================================="
-        echo -e "      ${BOLD}FileBrowser 全局配置${NC}"
+        echo -e "      ${BOLD}FileBrowser 全局配置 (v2.0+)${NC}"
         echo "=========================================="
-        echo "  1. 监听地址 (listen)      : $(get_setting listen "0.0.0.0")"
-        echo "  2. 访问端口 (port)        : $(get_setting port "8080")"
-        echo "  3. URL 前缀 (baseURL)     : $(get_setting baseURL "/")"
-        echo "  4. 站点名称 (name)        : $(get_setting siteName "FileBrowser Quantum")"
-        echo "  5. 数据库路径 (database)  : $(get_setting database "${WORK_DIR}/database.db")"
-        echo "  6. 缓存目录 (cacheDir)    : $(get_setting cacheDir "${WORK_DIR}/cache")"
-        echo "  7. 日志级别 (levels)      : $(get_setting logLevels "info|warning|error")"
-        echo "  8. HTTPS/TLS (tls)        : $(yaml_bool "$(get_setting tls false)")"
-        echo "  9. 关闭更新检查           : $(yaml_bool "$(get_setting disableUpdateCheck false)")"
-        echo " 10. FFmpeg 路径 (ffmpegPath): $(get_setting ffmpegPath "<未启用>")"
-        echo " 11. 查看当前配置文件"
-        echo " 12. 重新生成配置文件"
+        echo "  1. 监听地址 (http.listen)         : $(get_setting listen "0.0.0.0")"
+        echo "  2. 访问端口 (http.port)           : $(get_setting port "8080")"
+        echo "  3. URL 前缀 (http.baseURL)        : $(get_setting baseURL "/")"
+        echo "  4. 信任反代头 (trustProxyHeaders) : $(yaml_bool "$(get_setting trustProxyHeaders false)")"
+        echo "  5. 站点名称 (frontend.name)       : $(get_setting siteName "FileBrowser Quantum")"
+        echo "  6. 数据库路径 (database.path)     : $(get_setting database "$DEFAULT_DB_PATH")"
+        echo "  7. 缓存目录 (server.cacheDir)     : $(get_setting cacheDir "${WORK_DIR}/cache")"
+        echo "  8. 日志级别 (logging.levels)      : $(get_setting logLevels "info|warning|error")"
+        echo "  9. HTTPS/TLS (http.tlsCert/Key)   : $(yaml_bool "$(get_setting tls false)")"
+        echo " 10. 关闭更新检查                   : $(yaml_bool "$(get_setting disableUpdateCheck false)")"
+        echo " 11. FFmpeg 路径 (ffmpegPath)       : $(get_setting ffmpegPath "<未启用>")"
+        echo " 12. 查看当前配置文件"
+        echo " 13. 重新生成配置文件"
         echo "  0. 返回上级菜单"
         echo "=========================================="
-        prompt "请输入操作编号 [0-12 默认: 0]: " choice
+        prompt "请输入操作编号 [0-13 默认: 0]: " choice
         choice="${choice:-0}"
 
         local changed=true
         case "$choice" in
-            1) edit_setting listen "监听地址 (0.0.0.0 表示全部网卡)" "$(get_setting listen "0.0.0.0")" || changed=false ;;
+            1) edit_setting listen "监听地址 (0.0.0.0 表示全部网卡，反代本机建议 127.0.0.1)" "$(get_setting listen "0.0.0.0")" || changed=false ;;
             2) edit_port_setting || changed=false ;;
             3) edit_setting baseURL "URL 前缀 (如 / 或 /files)" "$(get_setting baseURL "/")" || changed=false ;;
-            4) edit_setting siteName "站点名称" "$(get_setting siteName "FileBrowser Quantum")" || changed=false ;;
-            5) edit_setting database "数据库文件路径 (.db)" "$(get_setting database "${WORK_DIR}/database.db")" || changed=false ;;
-            6) edit_setting cacheDir "缓存目录路径" "$(get_setting cacheDir "${WORK_DIR}/cache")" || changed=false ;;
-            7) edit_setting logLevels "日志级别 (info|warning|error|debug 组合)" "$(get_setting logLevels "info|warning|error")" || changed=false ;;
-            8) edit_tls_setting || changed=false ;;
-            9) toggle_setting disableUpdateCheck "关闭版本更新检查" || changed=false ;;
-            10)
+            4) toggle_setting trustProxyHeaders "信任反向代理转发头 (X-Forwarded-*)" || changed=false ;;
+            5) edit_setting siteName "站点名称" "$(get_setting siteName "FileBrowser Quantum")" || changed=false ;;
+            6) edit_database_setting || changed=false ;;
+            7) edit_setting cacheDir "缓存目录路径" "$(get_setting cacheDir "${WORK_DIR}/cache")" || changed=false ;;
+            8) edit_setting logLevels "日志级别 (info|warning|error|debug 组合)" "$(get_setting logLevels "info|warning|error")" || changed=false ;;
+            9) edit_tls_setting || changed=false ;;
+            10) toggle_setting disableUpdateCheck "关闭版本更新检查" || changed=false ;;
+            11)
                 local ff_path="" current_ff=""
                 current_ff=$(get_setting ffmpegPath "")
                 prompt "FFmpeg 所在目录 (留空表示不启用) [当前: ${current_ff:-<未启用>}]: " ff_path
@@ -1109,8 +1197,8 @@ configure_filebrowser() {
                     changed=false
                 fi
                 ;;
-            11) show_config_file ;;
-            12)
+            12) show_config_file; changed=false ;;
+            13)
                 render_config
                 changed=false
                 ;;
@@ -1121,7 +1209,7 @@ configure_filebrowser() {
                 ;;
         esac
 
-        if [[ "$changed" == true && "$choice" != "11" ]]; then
+        if [[ "$changed" == true ]]; then
             render_config >/dev/null
             ask_restart_service
         fi
@@ -1135,7 +1223,6 @@ configure_filebrowser() {
 #                          源目录管理（增 / 改 / 删）
 # ===========================================================================
 
-# 新增源目录（供安装流程与源目录管理共用）
 add_source_interactive() {
     local default_name="" default_path="" ro="" en=""
     default_name=$(basename "${DEFAULT_DATA_DIR%/}")
@@ -1152,7 +1239,7 @@ add_source_interactive() {
         return 1
     fi
 
-    prompt "该源是否只读 (不允许修改/上传)? [y/N 默认: N]: " ro
+    prompt "该源默认是否只读 (新用户无上传/修改/删除权限)? [y/N 默认: N]: " ro
     prompt "新用户默认是否可见该源? [Y/n 默认: Y]: " en
 
     local src_ro="false" src_en="true"
@@ -1204,7 +1291,7 @@ modify_source_interactive() {
     fi
 
     local new_ro="$cur_ro" new_en="$cur_en"
-    prompt "只读模式 [当前: ${cur_ro}] (y=只读 / n=可写 / 留空保持): " input
+    prompt "默认只读模式 [当前: ${cur_ro}] (y=只读 / n=可读写 / 留空保持): " input
     if [[ "$input" =~ ^[Yy]$ ]]; then
         new_ro="true"
     elif [[ "$input" =~ ^[Nn]$ ]]; then
@@ -1287,12 +1374,9 @@ manage_sources() {
 }
 
 # ===========================================================================
-#                     账号管理（官方 CLI: set -u）
-#  说明: 用户可在 Web UI 中完整管理；此处提供创建用户 / 重置密码的快捷方式，
-#        执行前会临时停止服务，避免数据库被占用。
+#                 账号管理（官方 v2.0+ CLI: user set --password）
 # ===========================================================================
 
-# 运行 CLI 用户操作: $1=用户名 $2=密码 $3=是否管理员(y/n)
 run_cli_user_op() {
     local username="$1" password="$2" as_admin="$3"
     local was_active=false rc=0 out=""
@@ -1308,21 +1392,32 @@ run_cli_user_op() {
 
     if is_service_active; then
         was_active=true
-        echo "[*] 临时停止服务，避免数据库被占用..."
+        echo "[*] 临时停止服务，避免数据库被锁定..."
         $SYSTEMCTL_CMD stop "${SERVICE_NAME}.service" 2>/dev/null || true
         sleep 1
     fi
 
-    local args=("set" "-u" "${username},${password}" "-c" "$CONFIG_FILE")
+    # 优先使用 v2.0.0 标准命令: filebrowser user set <username> --password <pw> [-a] -c <config>
+    local args=("user" "set" "$username" "--password" "$password" "-c" "$CONFIG_FILE")
     if [[ "$as_admin" =~ ^[Yy]$ ]]; then
-        args=("set" "-u" "${username},${password}" "-a" "-c" "$CONFIG_FILE")
+        args=("user" "set" "$username" "--password" "$password" "-a" "-c" "$CONFIG_FILE")
     fi
 
     out=$("$BIN_PATH" "${args[@]}" 2>&1) || rc=$?
-    # 过滤程序自身打印的日志行，只保留关键结果
+
+    # 兼容旧版 1.x 二进制回退
+    if [[ $rc -ne 0 ]] && printf '%s' "$out" | grep -qiE 'unknown command|flag'; then
+        rc=0
+        local legacy_args=("set" "-u" "${username},${password}" "-c" "$CONFIG_FILE")
+        if [[ "$as_admin" =~ ^[Yy]$ ]]; then
+            legacy_args=("set" "-u" "${username},${password}" "-a" "-c" "$CONFIG_FILE")
+        fi
+        out=$("$BIN_PATH" "${legacy_args[@]}" 2>&1) || rc=$?
+    fi
+
     printf '%s\n' "$out" | grep -Ev '^\[(DEBUG|INFO|WARN)\]|^[0-9]{4}/[0-9]{2}/[0-9]{2}' || true
 
-    if [[ $rc -eq 0 ]] && printf '%s' "$out" | grep -qiE 'successfully'; then
+    if [[ $rc -eq 0 ]]; then
         echo -e "${GREEN}[✓] 账号操作完成: ${username}${NC}"
     else
         echo -e "${RED}[-] 账号操作失败 (退出码 ${rc})，请检查上方输出。${NC}"
@@ -1350,10 +1445,10 @@ manage_accounts() {
         echo "=========================================="
         echo "  1. 创建 / 更新普通用户"
         echo "  2. 创建 / 更新管理员用户"
-        echo "  3. 重置管理员密码"
+        echo "  3. 重置管理员密码 (同时清除 2FA 锁定)"
         echo "  0. 返回上级菜单"
         echo "------------------------------------------"
-        echo -e "${YELLOW}提示: 用户列表、权限、删除等请在 Web UI 的“设置 → 用户”中完成。${NC}"
+        echo -e "${YELLOW}提示: 细粒度目录权限、用户删除等请在 Web UI 的“设置 → 用户管理”中完成。${NC}"
         echo "=========================================="
         prompt "请输入操作编号 [0-3 默认: 0]: " choice
         choice="${choice:-0}"
@@ -1369,8 +1464,8 @@ manage_accounts() {
                     while true; do
                         prompt "用户名 [默认: admin]: " username
                         username="${username:-admin}"
-                        if [[ -z "$username" || "$username" == *","* ]]; then
-                            echo -e "${RED}用户名不能为空且不能包含英文逗号。${NC}"
+                        if [[ -z "$username" || "$username" == *","* || "$username" == *" "* ]]; then
+                            echo -e "${RED}用户名不能为空且不能包含空格或英文逗号。${NC}"
                             continue
                         fi
                         break
@@ -1422,6 +1517,11 @@ enable_filebrowser() {
     if ! is_installed || [[ ! -f "$SERVICE_FILE" ]]; then
         echo -e "${RED}[-] 未检测到完整安装 (缺少二进制或服务文件)，请先执行安装。${NC}"
         return 0
+    fi
+
+    # 启动前确保配置是 v2 格式且没有遗留 database.db 阻塞启动
+    if config_exists; then
+        render_config >/dev/null
     fi
 
     $SYSTEMCTL_CMD daemon-reload 2>/dev/null || true
@@ -1502,10 +1602,11 @@ view_status() {
     echo -e " 可执行文件: ${BIN_PATH}"
     echo -e " 配置文件:   ${CONFIG_FILE}"
     echo -e " 数据目录:   ${WORK_DIR}"
-    echo -e " 数据库:     $(get_setting database "${WORK_DIR}/database.db")"
+    echo -e " 数据库:     $(get_setting database "$DEFAULT_DB_PATH")"
     echo -e " 缓存目录:   $(get_setting cacheDir "${WORK_DIR}/cache")"
     echo -e " 监听地址:   $(get_setting listen "0.0.0.0"):$(get_setting port "8080")"
     echo -e " 前缀路径:   $(get_setting baseURL "/")"
+    echo -e " 信任反代头: $(yaml_bool "$(get_setting trustProxyHeaders false)")"
     echo -e " 源目录数量: $(sources_count)"
     echo -e " FFmpeg:     $(get_setting ffmpegPath "<未启用>")"
     echo -e " TLS:        $(yaml_bool "$(get_setting tls false)")"
@@ -1516,11 +1617,12 @@ view_status() {
         return 0
     fi
 
-    local port="" base_url="" code=""
+    local port="" base_url="" code="" proto="http"
     port=$(get_setting port "8080")
     base_url=$(get_setting baseURL "/")
-    code=$(http_status "http://127.0.0.1:${port}${base_url}")
-    echo -e " HTTP 自检:  http://127.0.0.1:${port}${base_url} -> ${code}"
+    [[ "$(yaml_bool "$(get_setting tls false)")" == "true" ]] && proto="https"
+    code=$(http_status "${proto}://127.0.0.1:${port}${base_url}")
+    echo -e " HTTP 自检:  ${proto}://127.0.0.1:${port}${base_url} -> ${code}"
 
     echo ""
     echo "----- systemd 服务详情 -----"
@@ -1628,9 +1730,10 @@ uninstall_filebrowser() {
 }
 
 # ===========================================================================
-#                  旧版扁平配置自动迁移 (WORK_DIR -> conf/)
+#            旧版扁平配置与 v1.x -> v2.0.0 自动无缝迁移
 # ===========================================================================
 FB_MIGRATED_COUNT=0
+
 migrate_flat_fb_configs() {
     local name="" f="" dest=""
     mkdir -p "$CONF_DIR" 2>/dev/null || true
@@ -1655,17 +1758,67 @@ migrate_flat_fb_configs() {
     fi
 }
 
-# 迁移后刷新服务文件并重启服务，使新的配置路径生效
+# 自动检测并修复 v1.x 配置与 database.db 为 v2.0.0 格式
+migrate_v1_to_v2_schema() {
+    [[ -f "$SETTINGS_FILE" ]] || return 0
+    local need_render=false cur_db=""
+
+    cur_db=$(get_setting database "$DEFAULT_DB_PATH")
+    # 1. 检测 settings.conf 中是否仍指向旧版 database.db
+    if [[ "$(basename "$cur_db")" == "database.db" ]]; then
+        echo -e "${CYAN}>> 检测到旧版数据库配置 (${cur_db})，正在升级为 v2.0 SQLite 配置...${NC}"
+        if [[ -f "$cur_db" && ! -f "$LEGACY_DB_OLD" ]]; then
+            if is_service_active; then
+                $SYSTEMCTL_CMD stop "${SERVICE_NAME}.service" 2>/dev/null || true
+            fi
+            cp -f "$cur_db" "${cur_db}.v1.backup" 2>/dev/null || true
+            mv -f "$cur_db" "$LEGACY_DB_OLD" 2>/dev/null || true
+            echo -e "${GREEN}✓ 已备份旧数据库至 ${cur_db}.v1.backup，并重命名为 ${LEGACY_DB_OLD}${NC}"
+        fi
+        set_setting database "$DEFAULT_DB_PATH"
+        if [[ -s "$LEGACY_DB_OLD" && ! -s "$DEFAULT_DB_PATH" ]]; then
+            set_setting migrateFrom "$LEGACY_DB_OLD"
+        fi
+        need_render=true
+    fi
+
+    # 2. 检测工作目录下是否仍有遗留的 database.db 文件阻塞 v2 启动
+    if [[ -f "$LEGACY_DB_PATH" ]]; then
+        if is_service_active; then
+            $SYSTEMCTL_CMD stop "${SERVICE_NAME}.service" 2>/dev/null || true
+        fi
+        if [[ ! -f "$LEGACY_DB_OLD" ]]; then
+            mv -f "$LEGACY_DB_PATH" "$LEGACY_DB_OLD" 2>/dev/null || true
+            [[ ! -s "$DEFAULT_DB_PATH" ]] && set_setting migrateFrom "$LEGACY_DB_OLD"
+        else
+            mv -f "$LEGACY_DB_PATH" "${LEGACY_DB_PATH}.bak.$(date +%s)" 2>/dev/null || true
+        fi
+        need_render=true
+    fi
+
+    # 3. 检测现有 config.yaml 是否缺少顶层 http: 节点或包含已废弃的 readOnly 字段
+    if [[ -f "$CONFIG_FILE" ]]; then
+        if ! grep -qE '^http:' "$CONFIG_FILE" 2>/dev/null || grep -qE 'readOnly:|denyByDefault:' "$CONFIG_FILE" 2>/dev/null; then
+            echo -e "${CYAN}>> 检测到旧版 v1 格式的 config.yaml，正在自动重写为 v2.0.0 标准格式...${NC}"
+            need_render=true
+        fi
+    fi
+
+    if [[ "$need_render" == true ]]; then
+        render_config >/dev/null
+        echo -e "${GREEN}✓ 已自动升级配置文件为 v2.0.0 格式${NC}"
+        FB_MIGRATED_COUNT=$(( FB_MIGRATED_COUNT + 1 ))
+    fi
+}
+
 refresh_service_after_migration() {
     [[ "$FB_MIGRATED_COUNT" -gt 0 ]] || return 0
     [[ -f "$SERVICE_FILE" ]] || return 0
     write_service_file
     $SYSTEMCTL_CMD daemon-reload 2>/dev/null || true
-    local state=""
-    state=$($SYSTEMCTL_CMD is-active "${SERVICE_NAME}.service" 2>/dev/null | head -n 1 | tr -d ' \r\n' || true)
-    if [[ "$state" == "active" ]]; then
+    if is_service_enabled || is_service_active; then
         $SYSTEMCTL_CMD restart "${SERVICE_NAME}.service" 2>/dev/null || true
-        echo -e "${GREEN}✓ 已重启 ${SERVICE_NAME}.service 以加载新的配置路径${NC}"
+        echo -e "${GREEN}✓ 已重启 ${SERVICE_NAME}.service 以应用 v2.0 新配置${NC}"
     fi
 }
 
@@ -1723,5 +1876,6 @@ main_menu() {
 }
 
 migrate_flat_fb_configs
+migrate_v1_to_v2_schema
 refresh_service_after_migration
 main_menu
