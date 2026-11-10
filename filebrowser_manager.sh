@@ -149,9 +149,9 @@ file_size() {
 http_status() {
     local url="$1" code=""
     if command_exists curl; then
-        code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$url" 2>/dev/null) || code=""
+        code=$(curl -ks -o /dev/null -m 3 -w '%{http_code}' "$url" 2>/dev/null) || code=""
     elif command_exists wget; then
-        code=$(wget -q -S -O /dev/null -T 5 "$url" 2>&1 | awk '/HTTP\//{c=$2} END{print c}') || code=""
+        code=$(wget --no-check-certificate -q -S -O /dev/null -T 3 "$url" 2>&1 | awk '/HTTP\//{c=$2} END{print c}') || code=""
     fi
     [[ "$code" =~ ^[0-9]{3}$ ]] || code="000"
     printf '%s' "$code"
@@ -212,35 +212,125 @@ service_boot_text() {
     fi
 }
 
+# 检测端口是否处于监听状态（避免 grep -q 触发 SIGPIPE，兼容 ss/netstat/lsof//proc/net/tcp）
 check_port_listening() {
-    local port="$1"
+    local port="$1" hex_port=""
     [[ -n "$port" ]] || return 0
+
+    # 1) ss 检测 (全字段匹配 [:lub.]port$)
     if command_exists ss; then
-        if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}$"; then
+        if ss -ltn 2>/dev/null | awk -v p="$port" '
+            NR > 1 {
+                for (i = 1; i <= NF; i++) {
+                    if ($i ~ ("[:.]" p "$")) { found = 1; exit 0 }
+                }
+            }
+            END { exit(found ? 0 : 1) }
+        '; then
             return 0
         fi
-        return 1
-    elif command_exists netstat; then
-        if netstat -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}$"; then
-            return 0
-        fi
-        return 1
     fi
-    return 0
+
+    # 2) netstat 检测
+    if command_exists netstat; then
+        if netstat -ltn 2>/dev/null | awk -v p="$port" '
+            NR > 2 {
+                for (i = 1; i <= NF; i++) {
+                    if ($i ~ ("[:.]" p "$")) { found = 1; exit 0 }
+                }
+            }
+            END { exit(found ? 0 : 1) }
+        '; then
+            return 0
+        fi
+    fi
+
+    # 3) lsof 检测
+    if command_exists lsof; then
+        if lsof -iTCP:"${port}" -sTCP:LISTEN -P -n >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+
+    # 4) /proc/net/tcp 与 /proc/net/tcp6 内核表直接检测 (状态 0A 表示 LISTEN)
+    if [[ -r /proc/net/tcp || -r /proc/net/tcp6 ]]; then
+        hex_port=$(printf '%04X' "$port" 2>/dev/null || true)
+        if [[ -n "$hex_port" ]]; then
+            if awk -v hp=":${hex_port}" '
+                $4 == "0A" && index(toupper($2), hp) > 0 { found = 1; exit 0 }
+                END { exit(found ? 0 : 1) }
+            ' /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
+                return 0
+            fi
+        fi
+    fi
+
+    return 1
 }
 
-check_http_service() {
-    local port="$1" base="$2" code="" proto="http"
-    [[ -n "$port" ]] || return 0
+# 构造本地自检 URL 列表（兼顾监听 127.0.0.1 或指定网卡 IP 的情况）
+get_probe_url() {
+    local port="$1" base="$2" listen="" host="127.0.0.1" proto="http"
+    listen=$(get_setting listen "0.0.0.0")
+    if [[ -n "$listen" && "$listen" != "0.0.0.0" && "$listen" != "::" && "$listen" != "[::]" ]]; then
+        host="$listen"
+    fi
     if [[ "$(yaml_bool "$(get_setting tls false)")" == "true" ]]; then
         proto="https"
     fi
-    code=$(http_status "${proto}://127.0.0.1:${port}${base}")
-    if [[ "$code" =~ ^(200|30[0-9]|40[0-9])$ ]]; then
-        echo -e "${GREEN}[✓] HTTP(S) 自检通过 (状态码 ${code})${NC}"
+    [[ "$base" == /* ]] || base="/${base}"
+    printf '%s://%s:%s%s' "$proto" "$host" "$port" "$base"
+}
+
+# 轮询等待服务完成初始化并监听端口（v2.0+ 启动时需先做 SQLite 检查与索引初始化）
+# 参数: $1=port $2=baseURL $3=最大等待秒数(默认15)
+wait_for_service_ready() {
+    local port="$1" base="$2" max_wait="${3:-15}"
+    local url="" code="" i=0 max_ticks=$((max_wait * 2))
+    url=$(get_probe_url "$port" "$base")
+
+    while (( i < max_ticks )); do
+        # 如果进程已经退出，无需继续等待
+        if ! is_service_active; then
+            sleep 0.5
+            if ! is_service_active; then
+                return 1
+            fi
+        fi
+
+        # 端口已在监听 或 HTTP 自检已通 均视为就绪
+        if check_port_listening "$port"; then
+            return 0
+        fi
+        code=$(http_status "$url")
+        if [[ "$code" =~ ^(200|30[0-9]|40[0-9])$ ]]; then
+            return 0
+        fi
+
+        sleep 0.5
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# 检查并打印服务端口与 HTTP 自检状态
+verify_service_connectivity() {
+    local port="$1" base="$2" url="" code=""
+    [[ -n "$port" ]] || return 0
+    url=$(get_probe_url "$port" "$base")
+
+    if wait_for_service_ready "$port" "$base" 15; then
+        # 再做一次 HTTP 状态码获取用于展示
+        code=$(http_status "$url")
+        if [[ "$code" =~ ^(200|30[0-9]|40[0-9])$ ]]; then
+            echo -e "${GREEN}[✓] 端口 ${port} 已监听，HTTP(S) 自检通过 (状态码 ${code})${NC}"
+        else
+            echo -e "${GREEN}[✓] 端口 ${port} 已处于监听状态${NC}"
+        fi
         return 0
     fi
-    echo -e "${YELLOW}[!] HTTP(S) 自检异常 (状态码 ${code})，请查看日志排查。${NC}"
+
+    echo -e "${YELLOW}[!] 等待 15 秒后仍未检测到端口 ${port} 响应，请执行菜单 [6] 查看日志排查。${NC}"
     return 1
 }
 
@@ -489,7 +579,7 @@ render_config() {
     if [[ -z "$migrate_from" && ! -s "$database" && -s "$LEGACY_DB_OLD" ]]; then
         migrate_from="$LEGACY_DB_OLD"
     fi
-    # 若新 SQLite 已经成功生成并有数据，且旧库文件不存在时清除失效的 migrateFrom
+    # 若旧库文件不存在，清除失效的 migrateFrom
     if [[ -n "$migrate_from" && ! -f "$migrate_from" ]]; then
         migrate_from=""
         set_setting migrateFrom ""
@@ -588,7 +678,11 @@ restart_service_if_possible() {
         echo -e "${YELLOW}[!] 服务重启失败，请检查配置后执行: ${SYSTEMCTL_CMD} status ${SERVICE_NAME}${NC}"
         return 1
     fi
-    echo -e "${GREEN}[✓] 服务已重启以应用新配置。${NC}"
+    local port="" base_url=""
+    port=$(get_setting port "8080")
+    base_url=$(get_setting baseURL "/")
+    echo -e "${GREEN}[✓] 服务已重启，正在等待端口就绪...${NC}"
+    verify_service_connectivity "$port" "$base_url" || true
     return 0
 }
 
@@ -961,24 +1055,24 @@ install_or_update_filebrowser() {
             || echo -e "${YELLOW}注意: 未能自动开启 linger，可联系管理员执行: sudo ${LINGER_HINT}${NC}"
     fi
 
-    sleep 2
-
-    # 若触发了 v1 -> v2 数据库自动迁移，待新库生成后自动清理 migrateFrom
-    local db_file="" mig_file=""
-    db_file=$(get_setting database "$DEFAULT_DB_PATH")
-    mig_file=$(get_setting migrateFrom "")
-    if [[ -n "$mig_file" && -s "$db_file" ]] && is_service_active; then
-        echo -e "${GREEN}[✓] 检测到 SQLite 数据库已生成 (${db_file})，正在移除一次性 migrateFrom 配置...${NC}"
-        set_setting migrateFrom ""
-        render_config >/dev/null
-        $SYSTEMCTL_CMD restart "${SERVICE_NAME}.service" 2>/dev/null || true
-        sleep 1
-    fi
-
-    local port="" base_url="" admin_user="" boot_pass=""
+    local port="" base_url="" admin_user="" boot_pass="" db_file="" mig_file=""
     port=$(get_setting port "8080")
     base_url=$(get_setting baseURL "/")
     admin_user=$(get_setting adminUsername "admin")
+    db_file=$(get_setting database "$DEFAULT_DB_PATH")
+    mig_file=$(get_setting migrateFrom "")
+
+    echo "[*] 正在等待 FileBrowser 初始化并监听端口 ${port}..."
+    wait_for_service_ready "$port" "$base_url" 15 || true
+
+    # 若触发了 v1 -> v2 数据库自动迁移，待新库生成后自动清理 migrateFrom
+    if [[ -n "$mig_file" && -s "$db_file" ]] && is_service_active; then
+        echo -e "${GREEN}[✓] 检测到 SQLite 数据库已迁移生成 (${db_file})，正在移除一次性 migrateFrom 配置...${NC}"
+        set_setting migrateFrom ""
+        render_config >/dev/null
+        $SYSTEMCTL_CMD restart "${SERVICE_NAME}.service" 2>/dev/null || true
+        wait_for_service_ready "$port" "$base_url" 15 || true
+    fi
 
     echo ""
     echo "=========================================="
@@ -986,11 +1080,7 @@ install_or_update_filebrowser() {
     echo "=========================================="
     echo -e " 服务状态: $(service_state_text)    开机自启: $(service_boot_text)"
 
-    if ! check_port_listening "$port"; then
-        echo -e "${YELLOW}[!] 未检测到端口 ${port} 处于监听状态，请查看日志排查。${NC}"
-    else
-        check_http_service "$port" "$base_url" || true
-    fi
+    verify_service_connectivity "$port" "$base_url" || true
 
     echo " 可执行文件: ${BIN_PATH}"
     echo " 配置文件:   ${CONFIG_FILE}"
@@ -1536,18 +1626,13 @@ enable_filebrowser() {
         loginctl enable-linger "$CURRENT_USER" 2>/dev/null || true
     fi
 
-    sleep 2
     local port="" base_url=""
     port=$(get_setting port "8080")
     base_url=$(get_setting baseURL "/")
-    echo -e "${GREEN}[✓] 服务已启用开机自启并尝试启动。${NC}"
-    echo -e " 服务状态: $(service_state_text)    开机自启: $(service_boot_text)"
+    echo -e "${GREEN}[✓] 服务已启用开机自启，正在等待端口 ${port} 就绪...${NC}"
 
-    if ! check_port_listening "$port"; then
-        echo -e "${YELLOW}[!] 未检测到端口 ${port} 处于监听状态，请查看日志排查。${NC}"
-    else
-        check_http_service "$port" "$base_url" || true
-    fi
+    verify_service_connectivity "$port" "$base_url" || true
+    echo -e " 服务状态: $(service_state_text)    开机自启: $(service_boot_text)"
     echo "=========================================="
     return 0
 }
@@ -1617,12 +1702,12 @@ view_status() {
         return 0
     fi
 
-    local port="" base_url="" code="" proto="http"
+    local port="" base_url="" url="" code=""
     port=$(get_setting port "8080")
     base_url=$(get_setting baseURL "/")
-    [[ "$(yaml_bool "$(get_setting tls false)")" == "true" ]] && proto="https"
-    code=$(http_status "${proto}://127.0.0.1:${port}${base_url}")
-    echo -e " HTTP 自检:  ${proto}://127.0.0.1:${port}${base_url} -> ${code}"
+    url=$(get_probe_url "$port" "$base_url")
+    code=$(http_status "$url")
+    echo -e " HTTP 自检:  ${url} -> ${code}"
 
     echo ""
     echo "----- systemd 服务详情 -----"
